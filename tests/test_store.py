@@ -96,3 +96,30 @@ def test_save_creates_parent_directories(data_dir):
     store.save(store.load("deep"))
     assert paths.store_path("deep").exists()
     assert json.loads(paths.store_path("deep").read_text())["session_id"] == "deep"
+
+
+# Regression: plan review focus 4 says a corrupt store is treated as fresh
+# *and the corruption logged*; load() used to reset silently.
+
+def _log_rows(session_id):
+    return [json.loads(line) for line in paths.log_path(session_id).read_text().splitlines()]
+
+
+def test_corrupt_file_is_logged(data_dir):
+    p = paths.store_path("s1"); p.parent.mkdir(parents=True); p.write_text("{not json")
+    assert store.load("s1").tasks == []
+    row = _log_rows("s1")[-1]
+    assert row["event"] == "store_corrupt" and row["path"] == str(p)
+    assert row["error"].startswith("JSONDecodeError")
+
+
+def test_wrong_shape_is_logged(data_dir):
+    p = paths.store_path("s1"); p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"session_id": "s1", "tasks": [{"id": "p1"}]}))
+    assert store.load("s1").tasks == []
+    assert _log_rows("s1")[-1]["event"] == "store_corrupt"
+
+
+def test_missing_file_is_not_logged(data_dir):
+    assert store.load("s1").tasks == []
+    assert not paths.log_path("s1").exists()

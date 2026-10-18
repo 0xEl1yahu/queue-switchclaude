@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from . import paths
+from . import log, paths
 
 TASK_STATUSES = ("queued", "running", "done", "interrupted", "dropped")
 STORE_STATES = ("idle", "running")
@@ -96,13 +96,25 @@ def _from_dict(session_id: str, data: object) -> Store:
 
 
 def load(session_id: str) -> Store:
-    """Read the session's store; a missing or unreadable file yields a fresh Store."""
+    """Read the session's store; a missing or unreadable file yields a fresh Store.
+
+    A file that exists but cannot be parsed or has the wrong shape is also
+    treated as fresh, and the corruption is written to the decision log so
+    the silent reset is visible (plan review focus 4).
+    """
     path = paths.store_path(session_id)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         return _from_dict(session_id, data)
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+    except FileNotFoundError:
+        return Store(session_id=session_id)
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        log.record(
+            session_id, "store_corrupt",
+            path=str(path),
+            error=f"{type(exc).__name__}: {exc}",
+        )
         return Store(session_id=session_id)
 
 
