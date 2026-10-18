@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fake `claude` CLI for tests. Sleeps when FAKE_CLAUDE_SLEEP is set,
+# otherwise prints FAKE_CLAUDE_OUTPUT and exits 0.
+if [ -n "$FAKE_CLAUDE_SLEEP" ]; then
+  sleep "$FAKE_CLAUDE_SLEEP"
+  exit 0
+fi
+printf '%s\n' "$FAKE_CLAUDE_OUTPUT"
