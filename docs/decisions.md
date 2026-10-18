@@ -45,3 +45,9 @@ That is 3 to 5 s per classified message, against the plan's 1 to 2 s hope, so th
 Rejected: Anthropic API key direct (sub-second, but a key on every machine and separate billing); Ollama on the lab PC (latency and quality unproven, server must be reachable).
 
 Open: measure what fraction of the golden set the rules alone decide, and whether `claude -p` start-up can be trimmed (a warm daemon is not available to hooks).
+
+## D3. Dispatch default: approve each plan
+
+When a task becomes ready, the Stop hook writes `plans/pN.md`, has Claude present it, and ends the turn with state `awaiting_approval`. "lgtm" runs it; "looks good but do X first" revises it without approving (golden cases g44 to g47). A task can opt out per message ("run it without asking") or be marked `auto` in the queue.
+
+Rejected: auto-run by default (errors in dependency inference compound before the user sees them; the Stop-hook continuation cap of 8 only bounds runaway chains, it does not prevent wrong work). Rejected: size-based auto-run (an extra judgement the golden set does not cover).
