@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/intake.py"], "timeout": 25, "statusMessage": "queue-switchclaude: sorting your message"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.py"], "timeout": 30}]}],
+    "PreToolUse": [{"hooks": [{"type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/interrupt.py"], "timeout": 5}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/interrupt.py"], "timeout": 5}]}]
+  }
+}

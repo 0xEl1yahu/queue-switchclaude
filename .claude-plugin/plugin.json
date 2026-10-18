@@ -1,0 +1,16 @@
+{
+  "name": "queue-switchclaude",
+  "version": "0.1.0",
+  "description": "Sorts messages typed mid-run into steer / queue / interrupt, runs queued tasks after the current one finishes, and stops the turn when you say stop.",
+  "author": {
+    "name": "0xEl1yahu"
+  },
+  "userConfig": {
+    "shadow": {
+      "type": "boolean",
+      "title": "Shadow mode",
+      "description": "Log what the harness would do without acting",
+      "default": false
+    }
+  }
+}
