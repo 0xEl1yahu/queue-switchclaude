@@ -51,3 +51,9 @@ Open: measure what fraction of the golden set the rules alone decide, and whethe
 When a task becomes ready, the Stop hook writes `plans/pN.md`, has Claude present it, and ends the turn with state `awaiting_approval`. "lgtm" runs it; "looks good but do X first" revises it without approving (golden cases g44 to g47). A task can opt out per message ("run it without asking") or be marked `auto` in the queue.
 
 Rejected: auto-run by default (errors in dependency inference compound before the user sees them; the Stop-hook continuation cap of 8 only bounds runaway chains, it does not prevent wrong work). Rejected: size-based auto-run (an extra judgement the golden set does not cover).
+
+## D4. Done detection: verify command if set, else judge
+
+A task may carry a verify command; if it exits 0 on Stop, the task is done. Otherwise the Stop hook runs a haiku judge through `claude -p` over `last_assistant_message` (and the plan), answering done / not done / asked a question. The user's next message can also confirm: "ok, merge" marks the previous task done. The judge runs inline: the Stop hook has a 600 s default timeout and the call takes about 4 s, so no detached process.
+
+Rejected: judge only (a passing closing message is not a passing test). Rejected: verify command only (every untested task would wait on the user).
