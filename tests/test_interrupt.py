@@ -1,8 +1,11 @@
 import json
+from pathlib import Path
 import subprocess
 import sys
 
 from qsc import interrupt, paths, store
+
+SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "interrupt.py"
 
 
 def test_interrupt_flag_stops_and_resets(data_dir):
@@ -39,14 +42,14 @@ def test_interrupt_flag_with_no_running_task_still_stops(data_dir):
 
 
 def test_script_swallows_bad_stdin():
-    r = subprocess.run([sys.executable, "scripts/interrupt.py"], input="not json", capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(SCRIPT)], input="not json", capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout == ""
 
 
 def test_script_ignores_other_events(data_dir):
     with store.locked("s1") as s:
         s.interrupt = True
-    r = subprocess.run([sys.executable, "scripts/interrupt.py"], input=json.dumps({"hook_event_name": "Stop", "session_id": "s1"}), capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps({"hook_event_name": "Stop", "session_id": "s1"}), capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout == ""
     assert store.load("s1").interrupt is True
 
@@ -54,5 +57,14 @@ def test_script_ignores_other_events(data_dir):
 def test_script_emits_stop_on_flag(data_dir):
     with store.locked("s1") as s:
         s.interrupt = True
-    r = subprocess.run([sys.executable, "scripts/interrupt.py"], input=json.dumps({"hook_event_name": "PostToolUse", "session_id": "s1"}), capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps({"hook_event_name": "PostToolUse", "session_id": "s1"}), capture_output=True, text=True)
     assert r.returncode == 0 and json.loads(r.stdout)["continue"] is False
+
+
+def test_interrupt_drops_queued_tasks_and_says_so(data_dir):
+    with store.locked("s1") as s:
+        t = s.new_task("x", [], "pid"); t.status = "running"; s.running_task = "p1"; s.state = "running"; s.interrupt = True
+        s.new_task("write tests", ["p1"], "pid")
+    out = interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1"})
+    assert out["continue"] is False and "dropped queued tasks: p2 (write tests)" in out["stopReason"]
+    s = store.load("s1"); assert s.get("p2").status == "dropped" and s.ready() == []

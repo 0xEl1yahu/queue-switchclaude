@@ -10,3 +10,9 @@ def test_data_dir_uses_env(data_dir):
 def test_data_dir_fallback(monkeypatch):
     monkeypatch.delenv("CLAUDE_PLUGIN_DATA", raising=False)
     assert paths.data_dir().name == "queue-switchclaude"
+
+
+def test_session_id_cannot_escape_data_dir(data_dir):
+    p = paths.store_path("../evil")
+    assert p.parent == data_dir / "sessions" and p.name == ".._evil.json"
+    assert paths.log_path("a b/c").name == "a_b_c.jsonl"

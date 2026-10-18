@@ -29,7 +29,7 @@ def handle(event: dict, shadow: bool = False) -> dict | None:
             # The user asked to stop but no tool call came after the flag was
             # set; the turn is ending now, so apply the same reset and dispatch
             # nothing.
-            task_id = reset_after_interrupt(s)
+            task_id, _dropped = reset_after_interrupt(s)
             log.record(session_id, "interrupt", task=task_id, via=event.get("hook_event_name"))
             return None
 

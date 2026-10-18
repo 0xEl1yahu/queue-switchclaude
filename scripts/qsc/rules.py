@@ -52,8 +52,8 @@ _QUEUE_MARKER_RES = (
         r"(done|finished|in|through)[,:]?\s*(.+)$",
         re.IGNORECASE | re.DOTALL,
     ),
-    re.compile(r"^after that[,:]?\s*(.+)$", re.IGNORECASE | re.DOTALL),
-    re.compile(r"^then[,:]?\s*(.+)$", re.IGNORECASE | re.DOTALL),
+    re.compile(r"^after that\b[,:]?\s*(.+)$", re.IGNORECASE | re.DOTALL),
+    re.compile(r"^then\b[,:]?\s*(.+)$", re.IGNORECASE | re.DOTALL),
 )
 
 

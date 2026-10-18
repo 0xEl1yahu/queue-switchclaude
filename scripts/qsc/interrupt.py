@@ -13,20 +13,33 @@ from . import log, store
 STOP_REASON = "queue-switchclaude: stopped as requested"
 
 
-def reset_after_interrupt(s: store.Store) -> str | None:
-    """Clear the flag and put the store back to idle; returns the interrupted task id.
+def reset_after_interrupt(s: store.Store) -> tuple[str | None, list[store.Task]]:
+    """Clear the flag and put the store back to idle.
 
-    Shared with dispatch, which can see the flag when the turn ended without
-    another tool call (a text-only tail has no tool boundary).
+    Returns the interrupted task id and the queued tasks that were dropped.
+    An explicit "stop" is the user's Esc, so decision D5 applies: queued and
+    ready tasks are dropped rather than left stranded behind an interrupted
+    dependency; parked and done items survive. Shared with dispatch, which
+    can see the flag when the turn ended without another tool call.
     """
     task_id = s.running_task
     task = s.get(task_id) if task_id else None
     if task is not None:
         task.status = "interrupted"
+    dropped = [t for t in s.tasks if t.status == "queued"]
+    for t in dropped:
+        t.status = "dropped"
     s.interrupt = False
     s.state = "idle"
     s.running_task = None
-    return task_id
+    return task_id, dropped
+
+
+def stop_reason(dropped: list[store.Task]) -> str:
+    if not dropped:
+        return STOP_REASON
+    listed = ", ".join(f"{t.id} ({t.text})" for t in dropped)
+    return f"{STOP_REASON}; dropped queued tasks: {listed}"
 
 
 def handle(event: dict) -> dict | None:
@@ -41,6 +54,7 @@ def handle(event: dict) -> dict | None:
     with store.locked(session_id) as s:
         if not s.interrupt:
             return None
-        task_id = reset_after_interrupt(s)
-    log.record(session_id, "interrupt", task=task_id, via=event.get("hook_event_name"))
-    return {"continue": False, "stopReason": STOP_REASON}
+        task_id, dropped = reset_after_interrupt(s)
+    log.record(session_id, "interrupt", task=task_id, dropped=[t.id for t in dropped],
+               via=event.get("hook_event_name"))
+    return {"continue": False, "stopReason": stop_reason(dropped)}

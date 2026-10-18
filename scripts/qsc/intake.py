@@ -141,7 +141,7 @@ def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = Fa
 
         if label == "interrupt":
             s.interrupt = True
-            return {"decision": "block", "reason": f"{PREFIX}: stopping at the next tool call"}
+            return {"decision": "block", "reason": f"{PREFIX}: stopping {s.running_task or 'the current turn'} at the next tool call"}
 
         if label == "queue":
             deps = _chain_deps(s)

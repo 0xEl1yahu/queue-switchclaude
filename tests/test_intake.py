@@ -1,8 +1,11 @@
 import json
+from pathlib import Path
 import subprocess
 import sys
 
 from qsc import classify, intake, paths, store
+
+SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "intake.py"
 
 
 def ev(prompt, prompt_id="pid-1", sid="s1"):
@@ -61,7 +64,7 @@ def test_pass_rule_never_touches_store(data_dir):
 
 
 def test_script_swallows_bad_stdin():
-    r = subprocess.run([sys.executable, "scripts/intake.py"], input="not json", capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(SCRIPT)], input="not json", capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout == ""
 
 
@@ -124,7 +127,7 @@ def test_log_records_classifier_null_on_failure(data_dir):
 
 def test_script_end_to_end_queues_via_stdin(data_dir):
     def run(prompt, pid="pid-1"):
-        return subprocess.run([sys.executable, "scripts/intake.py"], input=json.dumps(ev(prompt, pid)),
+        return subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(ev(prompt, pid)),
                               capture_output=True, text=True)
 
     r1 = run("add a user model")
@@ -136,8 +139,13 @@ def test_script_end_to_end_queues_via_stdin(data_dir):
 
 def test_script_shadow_env_does_not_block(data_dir, monkeypatch):
     monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW", "true")
-    run = lambda p: subprocess.run([sys.executable, "scripts/intake.py"], input=json.dumps(ev(p)), capture_output=True, text=True)
+    run = lambda p: subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(ev(p)), capture_output=True, text=True)
     run("add a user model")
     r = run("later: email verification")
     assert r.returncode == 0 and r.stdout == ""
     assert store.load("s1").tasks[-1].id == "p1"
+
+
+def test_interrupt_reason_names_running_task(data_dir):
+    intake.handle(ev("add a user model"))
+    assert "p1" in intake.handle(ev("stop"))["reason"]

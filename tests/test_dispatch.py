@@ -1,8 +1,11 @@
 import json
+from pathlib import Path
 import subprocess
 import sys
 
 from qsc import dispatch, paths, store
+
+SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "dispatch.py"
 
 
 def test_dispatch_marks_done_and_hands_over_next(data_dir):
@@ -94,14 +97,14 @@ def test_dispatch_after_interrupt_resets_running_task(data_dir):
 
 
 def test_script_swallows_bad_stdin():
-    r = subprocess.run([sys.executable, "scripts/dispatch.py"], input="not json", capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(SCRIPT)], input="not json", capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout == ""
 
 
 def test_script_ignores_other_events(data_dir):
     with store.locked("s1") as s:
         s.new_task("b", [], "pid")
-    r = subprocess.run([sys.executable, "scripts/dispatch.py"], input=json.dumps({"hook_event_name": "PreToolUse", "session_id": "s1"}), capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps({"hook_event_name": "PreToolUse", "session_id": "s1"}), capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout == ""
     assert store.load("s1").get("p1").status == "queued"
 
@@ -109,7 +112,7 @@ def test_script_ignores_other_events(data_dir):
 def test_script_dispatches_next(data_dir):
     with store.locked("s1") as s:
         s.new_task("b", [], "pid")
-    r = subprocess.run([sys.executable, "scripts/dispatch.py"], input=json.dumps({"hook_event_name": "Stop", "session_id": "s1"}), capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps({"hook_event_name": "Stop", "session_id": "s1"}), capture_output=True, text=True)
     assert r.returncode == 0 and "p1" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
     assert store.load("s1").get("p1").status == "running"
 
@@ -118,7 +121,7 @@ def test_script_shadow_env_does_not_dispatch(data_dir, monkeypatch):
     monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW", "true")
     with store.locked("s1") as s:
         s.new_task("b", [], "pid")
-    r = subprocess.run([sys.executable, "scripts/dispatch.py"], input=json.dumps({"hook_event_name": "Stop", "session_id": "s1"}), capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps({"hook_event_name": "Stop", "session_id": "s1"}), capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout == ""
     assert store.load("s1").get("p1").status == "queued"
     assert '"shadow": true' in paths.log_path("s1").read_text()

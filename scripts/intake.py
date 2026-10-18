@@ -4,6 +4,11 @@
 Any failure, malformed stdin or foreign event exits 0 with no output, so a
 broken plugin looks like no plugin.
 """
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 try:
     from qsc import hookio, intake
 

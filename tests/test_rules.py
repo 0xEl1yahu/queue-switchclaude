@@ -27,3 +27,9 @@ def test_queue_marker_strips_prefix():
 def test_paste_guard_never_queues():
     big = "\n".join(f"{i}) later: thing {i}" for i in range(13))
     assert rules.decide(big).label == "undecided"
+
+
+def test_bare_markers_need_a_word_boundary():
+    assert rules.decide("thenceforth we ride").label == "undecided"
+    assert rules.decide("after thatcher resigned").label == "undecided"
+    assert rules.decide("then: run the tests").text == "run the tests"
