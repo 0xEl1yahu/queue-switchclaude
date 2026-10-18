@@ -17,6 +17,9 @@ Design decided, no code yet. The five open decisions were made on 2026-10-18: bu
 
 ## Next
 
-1. Build M0: the plugin skeleton and a hooks-only shadow logger (log record schema first).
-2. Write the eval runner over the golden set and measure the rules-first classifier (M1).
-3. Queue, dispatch, interrupt (M2), then plan flow (M3).
+Working product first (spec §10):
+
+1. **M0 vertical slice**: steer / queue / interrupt end to end in one session, chain dependencies, dispatch on Stop, rules-first classification via `claude -p`, a shadow switch.
+2. **M1 trustworthy**: golden-set eval, amend and split, parked, Esc handling, `/queue` command.
+3. **M2 plan flow**: just-in-time plans, approval gate, handoffs, verify-or-judge.
+4. **M3 hardening**.

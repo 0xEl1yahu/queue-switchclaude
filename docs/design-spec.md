@@ -151,23 +151,36 @@ All five are made; the record with evidence and rejected options is [decisions.m
 | D4 | Verify command if set, else haiku judge; user confirmation also counts. |
 | D5 | Esc drops queued and ready tasks with a notice; parked and done survive. |
 
-## 10. Milestones
+## 10. Milestones (working product first)
 
-- **M0 Shadow logger.** Hooks only, no model. Log every prompt with `prompt_id`, mid-turn flag, transcript tail and harness-traffic filter. Run for days, harvest real messages into the golden set. Hand-written spec: the log record schema.
-- **M1 Classifier + eval.** Runner over the golden set and one backend from D2. Hand-written spec: the classifier's input/output contract.
-- **M2 Queue + dispatch.** Task store, Stop-hook handover, interrupt, spin guard, Esc policy. Hand-written spec: the state machine.
-- **M3 Plan flow.** `plans/pN.md`, approval gate, `handoffs/pN.md`, re-planning stale children.
+Decided 2026-10-18: the first milestone is a thin end-to-end slice a real session can use, not a logger. Shadow mode is a switch inside it.
 
-## 11. Libraries
+- **M0 Vertical slice.** One session, the full loop on the unambiguous cases. Classes: `steer`, `queue`, `interrupt` only. Dependencies: a plain chain (each new task depends on the last queued one, or on the running one). Dispatch: when Claude stops, the next ready task is handed over as `additionalContext`; no plans, no approval gate, done means Claude stopped. Interrupt: flag on intake, `continue: false` on the next tool call. Classification: rules first, then `claude -p`; a message is queued only when a rule matches (`pN:`, `later:`, "after that", "once that's done", "when you're done") or the model answers `queue` with confidence ≥ 0.9. Everything else passes through. A `shadow` setting logs decisions without acting. Store: one JSON file per session with a lock and atomic writes. Deliverable: install the plugin, type a task mid-run, watch it run after the current one, say "stop" and see the turn end.
+- **M1 Make it trustworthy.** Eval runner over the golden set with the asymmetric dependency score; the Decision contract tightened with the rationales as worked examples; `amend` (rapidfuzz, then embeddings, then the model picks the target) and `split` with the fake-split guard; the `parked` list and promotion; mixed-intent cases g09, g27, g46; Esc detection and the drop-with-notice policy; a `/queue` command to list, cancel and promote. Gate: zero missed hard dependencies, every interrupt case correct, shadow-mode disagreement rate reviewed.
+- **M2 Plan flow.** Just-in-time `plans/pN.md` from the previous task's handoff, the approval gate as the default with the `auto` override, `handoffs/pN.md`, re-planning a stale child, and done detection by verify command or the haiku judge.
+- **M3 Hardening.** Multi-session store hygiene and id scoping, the spin guard, harness-traffic edge cases, the Stop-hook continuation cap, and whatever the M0 to M2 usage logs show.
+
+## 11. Inference
+
+- **Who runs the model.** Claude Code itself, through `claude -p`, on the user's own auth. No API key, no third-party service, no local server (decision D2b).
+- **Which model.** The `haiku` alias for intake and for the done judge. If the M1 eval shows haiku missing the hard amend and split cases, raising the model is an M1 decision made with numbers.
+- **What the model sees.** A fixed system prompt holding the class definitions and rules from §3 (written once, cached by the API), then one JSON payload: harness state, the running task, the queue with ids and intents, the last few turns from the transcript tail, and the message. The golden set's `rationale` fields are the prompt's worked examples.
+- **What it returns.** JSON validated against the Decision schema via `--json-schema`: label, interrupt and parked flags, `depends_on`, amend `target`, split `parts`, confidence. The intake script re-validates it before acting.
+- **Isolation.** `--setting-sources "" --strict-mcp-config --tools ""` plus the custom system prompt: no project context, no MCP servers, no tools, so the call cannot answer the message instead of classifying it or trigger hooks recursively.
+- **When it is called.** Only when the rules in §4.1 cannot decide. Harness traffic, non-tasks, idle with an empty queue, and explicit markers never reach it. Measured 3.6 to 5.5 s wall-clock and about $0.0004 per call.
+- **When it fails.** Timeout (15 s), parse error, schema mismatch or confidence below the threshold all mean `steer`: the message goes through as if the plugin were not installed, and the log marks the classifier field null so the miss is visible.
+- **Call sites.** Intake on `UserPromptSubmit` for routing (M0), and the judge on `Stop` for done detection (M2). One wrapper, two prompts, two schemas.
+
+## 12. Libraries
 
 Per problem area, with code sketches: [libraries.md](libraries.md). After D2b the classifier section there is superseded by `claude -p`; the store, DAG, matching and eval picks stand.
 
-## 12. Reference projects
+## 13. Reference projects
 
 - **Jev_steer_or_queue**: router, ~300 lines. Source of the hook plumbing, `prompt_id` detection, interrupt path, shadow mode and `docs/test-results.md`.
 - **claude-task-manager**: queue, ~1,200 lines, `pending_tasks.py`. Source of the transcript-tail reader, detached Haiku judge, harness-traffic filter and store-hygiene lessons.
 
-## 13. What was lost and needs rebuilding
+## 14. What was lost and needs rebuilding
 
 1. The original wording of the design beyond what the plan and the golden set pin down.
 2. The M0 log record schema, if it had been drafted.
