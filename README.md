@@ -9,12 +9,13 @@ Today Claude Code injects any mid-run message into the running turn. "When you'r
 Design only. No code yet.
 
 - [`docs/design-spec.md`](docs/design-spec.md): the design, reconstructed on 2026-10-18 after the original session was lost.
+- [`docs/flows.md`](docs/flows.md): diagrams of the user flow, the intake decision logic, the task lifecycle, dispatch and interrupt.
+- [`docs/libraries.md`](docs/libraries.md): Python libraries per problem area (store, DAG, classifier, matching, eval), with sketches.
 - [`queue-harness-plan.md`](queue-harness-plan.md): the surviving side plan. Answers to the open questions, lessons borrowed from two prior projects, risks, and the M0–M3 milestones.
-
-The 47-case golden set (`golden_queue_intake.jsonl`) was lost with the original session and has to be rebuilt. Milestone M0 (a shadow logger) exists partly to harvest real messages for it.
+- [`eval/golden_queue_intake.jsonl`](eval/golden_queue_intake.jsonl): 47 labelled intake cases across five scenarios, with rationales and acceptable alternatives. The schema is in the spec, section 8.
 
 ## Next
 
 1. Decide D1–D5 in the spec (base, classifier backend, dispatch default, done detection, Esc policy).
 2. Build M0: hooks-only shadow logger.
-3. Rebuild the golden set and the eval runner (M1).
+3. Write the eval runner over the golden set and pick a classifier backend (M1).
