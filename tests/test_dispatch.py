@@ -87,13 +87,14 @@ def test_dispatch_logs(data_dir):
     assert rows[0]["next"] == "p1" and rows[0]["shadow"] is False and rows[1]["next"] is None
 
 
-def test_dispatch_after_interrupt_resets_running_task(data_dir):
+def test_dispatch_after_interrupt_resets_running_task_and_drops_queue(data_dir):
     with store.locked("s1") as s:
         a = s.new_task("a", [], "pid"); a.status = "running"; s.running_task = "p1"; s.state = "running"
         s.new_task("b", ["p1"], "pid"); s.interrupt = True
     assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"}) is None
     s = store.load("s1")
-    assert s.get("p1").status == "interrupted" and s.state == "idle" and s.running_task is None and s.get("p2").status == "queued"
+    # D5 applied to an explicit stop: the queued dependant is dropped, not stranded.
+    assert s.get("p1").status == "interrupted" and s.state == "idle" and s.running_task is None and s.get("p2").status == "dropped"
 
 
 def test_script_swallows_bad_stdin():

@@ -14,5 +14,5 @@ def test_data_dir_fallback(monkeypatch):
 
 def test_session_id_cannot_escape_data_dir(data_dir):
     p = paths.store_path("../evil")
-    assert p.parent == data_dir / "sessions" and p.name == ".._evil.json"
+    assert p.parent == data_dir / "sessions" and p.name == "___evil.json"
     assert paths.log_path("a b/c").name == "a_b_c.jsonl"
