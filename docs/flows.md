@@ -78,8 +78,10 @@ flowchart TD
     ST --> CTX[Build context:<br/>state, current task, queue,<br/>last assistant text from transcript tail]
     CTX --> PG{Paste guard?<br/>150+ words or 12+ lines}
     PG -- yes --> ONE[Treat as one ask,<br/>never split]
-    PG -- no --> CL
-    ONE --> CL[[Classifier call<br/>2 s timeout]]
+    PG -- no --> RL{Rules decide?<br/>stop, pN:, later:,<br/>maybe later, numbered list, lone dot}
+    ONE --> RL
+    RL -- yes --> R
+    RL -- no --> CL[[claude -p haiku<br/>--json-schema, 15 s timeout<br/>measured 3.6 to 5.5 s]]
     CL -- "error or timeout" --> FO[Fail open: steer<br/>log classifier=null]
     CL --> R{Result}
     R -- unclear --> FO
@@ -145,8 +147,13 @@ stateDiagram-v2
     awaiting_approval --> running: user approves
     awaiting_approval --> planned: user revises
     running --> done: verify command passes, or judge says done (D4)
-    running --> paused: user says do something else first (g27) or presses Esc (D5)
+    running --> paused: user says do something else first (g27)
     paused --> ready: user resumes
+    running --> interrupted: Esc detected on next prompt (D5)
+    queued --> dropped: Esc detected (D5), notice lists them
+    ready --> dropped: Esc detected (D5)
+    interrupted --> [*]
+    dropped --> [*]
     queued --> cancelled: amend with note cancel (g16, g43)
     ready --> cancelled: amend with note cancel
     done --> [*]
@@ -231,7 +238,7 @@ The naive "depend on the previous task" rule gets this wrong (p4 would depend on
 
 ## 9. Shadow mode
 
-Milestone M0 runs the whole intake path but acts on nothing. Every decision goes to the log; messages pass through untouched. Flip one flag to go active.
+Milestone M0 runs the whole intake path but acts on nothing. The classifier is `claude -p` (decision D2b), so M0 also measures how often the rules decide without it. Every decision goes to the log; messages pass through untouched. Flip one flag to go active.
 
 ```mermaid
 flowchart LR

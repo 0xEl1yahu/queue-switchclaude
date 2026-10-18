@@ -1,5 +1,7 @@
 # Python libraries by problem area
 
+> **After decision D2b (2026-10-18):** the classifier is called through `claude -p --model haiku --json-schema`, not the `anthropic` SDK, Ollama or the Agent SDK. Those three rows and their sketches below are kept as the rejected alternatives. The hook plumbing, store, DAG, matching and eval rows stand. The mod section at the end is the documented upgrade path if classic hooks prove too limiting.
+
 Checked against PyPI on 2026-10-18. Local interpreter is Python 3.14, so every stdlib item below is available. Versions are the current releases on that date; pin at install time.
 
 The rule for choosing: stdlib first, one small dependency per problem, nothing heavy on the inline hook path (intake has a ~1–2 s budget and runs on every message).
@@ -170,6 +172,28 @@ async for msg in query(prompt=handoff_text, options=opts):
 ```
 
 `setting_sources=[]` skips user, project and local settings. It still launches the CLI, so this belongs in the detached planner, never on the inline path.
+
+## Chosen classifier caller: `claude -p`
+
+```python
+import json, subprocess
+
+def classify(payload: dict, schema: dict, system: str, timeout=15) -> dict | None:
+    cmd = ["claude", "-p", "--model", "haiku", "--setting-sources", "", "--strict-mcp-config",
+           "--tools", "", "--output-format", "json", "--json-schema", json.dumps(schema),
+           "--system-prompt", system, json.dumps(payload)]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True).stdout
+        return json.loads(out).get("structured_output")      # None on any miss: fail open
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+```
+
+Measured 3.6 to 5.5 s wall-clock; see [decisions.md](decisions.md) D2b. Validate `structured_output` with the Pydantic `Decision` model before acting on it.
+
+## Mod route (not chosen, kept as the upgrade path)
+
+A mod is a plugin with an in-process JavaScript hooks module. It would replace most of this page: `prompt.submit` carries `turnId` (mid-turn flag) and `wait`; `$.model.classify` and `$.model.complete` call the model on the session's auth with no CLI start-up; `$.turn.abort` interrupts immediately; `$.prompt.submit` starts the next task's turn when idle; `turn.complete` gives the closing text and `isAborted` (Esc); `$.store` is a per-plugin JSON store; a `Pane` render site draws the queue. Early-access surface. Reference: `mods/types/claude-code.d.ts` in the claude-code repository, and https://code.claude.com/docs/en/plugins/mods/reference.
 
 ## Not recommended
 

@@ -57,3 +57,9 @@ Rejected: auto-run by default (errors in dependency inference compound before th
 A task may carry a verify command; if it exits 0 on Stop, the task is done. Otherwise the Stop hook runs a haiku judge through `claude -p` over `last_assistant_message` (and the plan), answering done / not done / asked a question. The user's next message can also confirm: "ok, merge" marks the previous task done. The judge runs inline: the Stop hook has a 600 s default timeout and the call takes about 4 s, so no detached process.
 
 Rejected: judge only (a passing closing message is not a passing test). Rejected: verify command only (every untested task would wait on the user).
+
+## D5. Esc: drop with a notice
+
+When the next message arrives with a new `prompt_id` while state still says `running` and no Stop fired for that task, the harness treats the turn as interrupted: the interrupted task is marked `interrupted`, every `queued` and `ready` task is dropped, and a notice is attached to the next prompt as `additionalContext` listing what was dropped (ids and intents) so the user can re-queue by pasting. Assumption, not yet confirmed: `parked` items survive, because they never dispatch on their own; `done` history survives.
+
+Rejected (my recommendation): pause and keep everything. Rejected: ask on the next message. The user chose drop for simplicity and predictability: Esc means "stop the plan".

@@ -6,16 +6,17 @@ Today Claude Code injects any mid-run message into the running turn. "When you'r
 
 ## Status
 
-Design only. No code yet.
+Design decided, no code yet. The five open decisions were made on 2026-10-18: build fresh, classic hooks in Python packaged as a plugin, classifier through `claude -p` with rules first, approve each plan, verify-or-judge for done, Esc drops the queue with a notice. See [`docs/decisions.md`](docs/decisions.md).
 
 - [`docs/design-spec.md`](docs/design-spec.md): the design, reconstructed on 2026-10-18 after the original session was lost.
 - [`docs/flows.md`](docs/flows.md): diagrams of the user flow, the intake decision logic, the task lifecycle, dispatch and interrupt.
+- [`docs/decisions.md`](docs/decisions.md): D1 to D5, with the evidence and the rejected options.
 - [`docs/libraries.md`](docs/libraries.md): Python libraries per problem area (store, DAG, classifier, matching, eval), with sketches.
 - [`queue-harness-plan.md`](queue-harness-plan.md): the surviving side plan. Answers to the open questions, lessons borrowed from two prior projects, risks, and the M0–M3 milestones.
 - [`eval/golden_queue_intake.jsonl`](eval/golden_queue_intake.jsonl): 47 labelled intake cases across five scenarios, with rationales and acceptable alternatives. The schema is in the spec, section 8.
 
 ## Next
 
-1. Decide D1–D5 in the spec (base, classifier backend, dispatch default, done detection, Esc policy).
-2. Build M0: hooks-only shadow logger.
-3. Write the eval runner over the golden set and pick a classifier backend (M1).
+1. Build M0: the plugin skeleton and a hooks-only shadow logger (log record schema first).
+2. Write the eval runner over the golden set and measure the rules-first classifier (M1).
+3. Queue, dispatch, interrupt (M2), then plan flow (M3).

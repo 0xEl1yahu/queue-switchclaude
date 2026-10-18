@@ -1,5 +1,7 @@
 # Queue harness: design spec (reconstructed)
 
+> **Status.** Decisions D1 to D5 were made on 2026-10-18; see [decisions.md](decisions.md). Sections below that said "open" now state the decision and keep the alternatives for the record.
+>
 > **Provenance.** The Claude Code session that produced the original design and the 47-case golden set was deleted on 2026-10-18 before anything was committed. The only file that survived is [`queue-harness-plan.md`](../queue-harness-plan.md) (the "side plan", written 2026-10-18 17:50). This spec is rebuilt from that file. Everything below is either stated there, taken from the golden set, or marked **(inferred)**. The golden set was recovered separately on 2026-10-18 and lives at [`eval/golden_queue_intake.jsonl`](../eval/golden_queue_intake.jsonl) (47 cases). Diagrams of the flows are in [flows.md](flows.md).
 
 ## 1. Problem
@@ -49,7 +51,7 @@ Claude stops ─▶ Stop: DISPATCH (check → handoff → plan next → approve)
 any tool call ─▶ Pre/PostToolUse: INTERRUPT check
 ```
 
-Three hooks, one store. See [flows.md](flows.md) for the diagrams.
+Three hooks, one store, all Python, packaged as a Claude Code plugin (`hooks/hooks.json` with `command` hooks under `${CLAUDE_PLUGIN_ROOT}`; decision D2). See [flows.md](flows.md) for the diagrams.
 
 ### 4.1 Intake (`UserPromptSubmit`)
 
@@ -57,8 +59,9 @@ Three hooks, one store. See [flows.md](flows.md) for the diagrams.
 2. Mid-turn vs new turn: compare `prompt_id`. A mid-turn message carries the running turn's id; a new turn gets a fresh one. Messages sent during a Stop-hook continuation keep the original id.
 3. Drop harness traffic and non-tasks.
 4. Read the transcript tail from the hook payload's `transcript_path` for the recent turns (the `recent` field in the golden set). The docs warn the transcript "may lag the in-memory conversation", so treat it as best-effort context.
-5. Call the classifier with a 2 s timeout. Any error or timeout **fails open**: the message passes through as `steer`, and the log records a null classifier field so silent failure is visible.
-6. Act on the class: steer passes through; queue/amend/parked/split write to the store and block the message; interrupt sets the flag and blocks.
+5. Apply the deterministic rules (decision D2b): harness traffic and non-tasks pass through; idle with an empty queue passes through and records; explicit markers decide alone ("stop", `pN:`, `later:`, "maybe later", a numbered list, a lone `.`). Only what the rules cannot decide goes to the model.
+6. Call the classifier: `claude -p --model haiku --json-schema <Decision>` with full isolation flags, 15 s timeout (measured 3.6 to 5.5 s wall-clock). Any error or timeout **fails open**: the message passes through as `steer`, and the log records a null classifier field so silent failure is visible.
+7. Act on the class: steer passes through; queue/amend/parked/split write to the store and block the message; interrupt sets the flag and blocks.
 
 ### 4.2 Interrupt (`PreToolUse` / `PostToolUse`)
 
@@ -69,7 +72,7 @@ If the interrupt flag is set, return `{"continue": false}`. The Stop hook does n
 1. **Check** whether the task that was running is done (see §7). The closing message comes from the hook's `last_assistant_message` field, which the docs recommend over reading the transcript.
 2. **Handoff**: file that closing message against the finished task, and write `handoffs/pN.md`.
 3. **Plan next**: pick the next ready task (all `depends_on` satisfied), write `plans/pN.md` from the handoff note just in time. If a child's plan was written earlier and the parent's outcome changed, re-plan it.
-4. **Approve**: gate on the plan (see decision D3).
+4. **Approve** (decision D3): the gate is on by default. Claude presents the plan and the turn ends with state `awaiting_approval`; "lgtm" runs it, "looks good but X first" revises it. A task marked `auto`, or a message like "run it without asking", skips the gate.
 5. Hand the task to Claude via `hookSpecificOutput.additionalContext`. `decision: "block"` also works but shows as "Stop hook error" in the UI, so it is not used.
 6. **Spin guard**: if the queue looks identical across two consecutive stops, do not push again.
 
@@ -89,22 +92,22 @@ Any model call made from a hook runs isolated:
 claude -p --setting-sources "" --strict-mcp-config --exclude-dynamic-system-prompt-sections
 ```
 
-with its own system prompt (or the Python Agent SDK with `setting_sources=[]`, see [libraries.md](libraries.md)). Otherwise the model answers the message instead of classifying it, and can trigger hooks recursively. `claude -p` is too slow for inline intake, so anything on the inline path uses a direct API call; anything slower runs detached. Note: the official hooks reference gives command hooks a 600 s default timeout (30 s on `UserPromptSubmit`), so the "Stop hook has 5 s" figure from claude-task-manager is not a current constraint. The 2 s budget is about the user waiting, not the hook dying.
+with its own system prompt and `--json-schema` for the Decision contract. Otherwise the model answers the message instead of classifying it, and can trigger hooks recursively. This is the chosen classifier caller (decision D2b): it uses the user's Claude Code auth and costs 3 to 5 s per call, which the rules-first intake keeps rare. The judge on Stop uses the same call. Note: the official hooks reference gives command hooks a 600 s default timeout (30 s on `UserPromptSubmit`), so the "Stop hook has 5 s" figure from claude-task-manager is not a current constraint. The 2 s budget is about the user waiting, not the hook dying.
 
 ## 5. Latency budget
 
-Inline classification must answer in ~1–2 s. Reference numbers: 438–660 ms typical, occasionally ~1.5 s, 2 s timeout that fails open.
+Measured, not hoped: `claude -p` on haiku with isolation flags takes 3.6 to 5.5 s wall-clock on the development machine (2 to 4 s of it model time). The `UserPromptSubmit` hook timeout is 30 s, so the budget is about perceived delay, not failure. The rules in §4.1 step 5 exist to keep most messages off the model path; M0 measures what fraction they catch. The plan's original 1 to 2 s target came from a direct API call, which decision D2b rejected.
 
 ## 6. Policies
 
 - **Shadow mode first.** Log decisions without acting on them, then switch to active.
-- **Esc fires no hook.** Policy: pause the queue on Esc, do not drop it.
+- **Esc fires no hook.** Policy (decision D5): drop. The next message with a new `prompt_id` while state is `running` means the turn was interrupted: the task is marked `interrupted`, queued and ready tasks are dropped, and a notice listing them is attached to that prompt. Parked and done items survive.
 - **Automatic continuation** can annoy. Continuation into the next task is configurable per task or per queue; the approval gate is the default protection.
 - **Keep the answer, not just the ask.** The closing message is filed against the finished task and seeds the handoff note.
 
-## 7. Done detection (open, D4)
+## 7. Done detection (decision D4)
 
-Options: a verify command per task; a detached Haiku "judge" that reads Claude's closing message plus the user's next message, marks tasks done conservatively ("ok, merge" counts as confirmation) and detects replies to a question; or both (run the command if present, judge otherwise).
+Verify command if the task has one (done means exit 0); otherwise a haiku judge via `claude -p` over `last_assistant_message` and the plan, answering done / not done / asked a question, conservative. The user's next message can also confirm ("ok, merge"). The judge runs inline in the Stop hook (600 s budget, about 4 s).
 
 ## 8. Evaluation
 
@@ -135,15 +138,18 @@ Scoring:
 
 Baseline from the plan: word-overlap matching got amend right in 2 of 4 and split in 1 of 5, and folded g12 into the wrong task. Amend and split need a semantic classifier.
 
-## 9. Decisions still open
+## 9. Decisions
 
-| | Decision | Options |
-|---|---|---|
-| D1 | Base | (a) fork the Jev router skeleton (hook plumbing, `prompt_id`, shadow mode, interrupt path); (b) build fresh; (c) extend claude-task-manager (4× larger, different philosophy) |
-| D2 | Classifier backend, ~1–2 s | Anthropic API with Haiku; local model via Ollama on the lab PC; TypeSafe Jev (fastest to try, third-party, sends message text off-machine) |
-| D3 | Dispatch default | run the next ready task automatically, or approve each plan |
-| D4 | Done detection | verify command, model judge, or both |
-| D5 | Esc | pause the queue (preferred), or drop with a notice |
+All five are made; the record with evidence and rejected options is [decisions.md](decisions.md).
+
+| | Decision |
+|---|---|
+| D1 | Build fresh. |
+| D2 | Classic hooks, all Python, packaged as a plugin. Mod route kept as the upgrade path. |
+| D2b | Classifier via `claude -p --model haiku --json-schema`, rules first. |
+| D3 | Approve each plan; per-task `auto` override. |
+| D4 | Verify command if set, else haiku judge; user confirmation also counts. |
+| D5 | Esc drops queued and ready tasks with a notice; parked and done survive. |
 
 ## 10. Milestones
 
@@ -154,7 +160,7 @@ Baseline from the plan: word-overlap matching got amend right in 2 of 4 and spli
 
 ## 11. Libraries
 
-Per problem area, with code sketches: [libraries.md](libraries.md).
+Per problem area, with code sketches: [libraries.md](libraries.md). After D2b the classifier section there is superseded by `claude -p`; the store, DAG, matching and eval picks stand.
 
 ## 12. Reference projects
 
