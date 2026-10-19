@@ -60,9 +60,13 @@ ACTIONABLE_LABELS = ("queue", "amend", "split")
 DEDUPE_WINDOW_SECONDS = 600
 # Statuses a duplicate is reported against. Dropped and cancelled tasks are
 # excluded by Store.find_recent itself; interrupted tasks are gone too.
-DEDUPE_STATUSES = (
-    "queued", "running", "done", "parked", "paused", "shadow_queued", "shadow_dispatched",
-)
+DEDUPE_STATUSES = ("queued", "running", "parked", "paused", "shadow_queued")
+# A finished task only counts as a duplicate when the resend carries a queue
+# marker: "later: x" sent again after x ran is the held text coming back
+# (docs/m0-acceptance.md issue 1), but a plain "run the tests" typed twice is
+# the user asking for it again.
+DEDUPE_FINISHED_STATUSES = ("done", "shadow_dispatched")
+DEDUPE_MARKER_RULES = ("queue_marker", "parked_marker")
 
 Classifier = Callable[[dict], Optional[classify.Decision]]
 
@@ -218,7 +222,12 @@ def _find_duplicate(s: store.Store, v: rules.Verdict, mid_turn: bool) -> store.T
     if v.label == "interrupt":
         return None
     dup = s.find_recent(store.normalise(v.text), DEDUPE_WINDOW_SECONDS)
-    if dup is None or dup.status not in DEDUPE_STATUSES:
+    if dup is None:
+        return None
+    if dup.status in DEDUPE_FINISHED_STATUSES:
+        if v.rule not in DEDUPE_MARKER_RULES:
+            return None
+    elif dup.status not in DEDUPE_STATUSES:
         return None
     if not mid_turn and dup.status == "running" and dup.id == s.running_task:
         return None
@@ -309,6 +318,28 @@ def _amend(
 
     target.notes.append(text)
     return f"noted on {target.id}: {text}", target.id
+
+
+def _pause(s: store.Store, named: str | None) -> tuple[str | None, str | None]:
+    """Apply a steer's ``note: "pause"``: the named live task, else the running one.
+
+    The golden set's g27 ("actually do the webhook first, refactor can wait")
+    is a steer part with note pause and an amend part that rewires. Dispatch
+    leaves a paused running task paused instead of marking it done, and
+    ``queue: resume pN`` or ``promote pN`` brings it back.
+    """
+    target = None
+    if named:
+        for t in s.candidates():
+            if t.id == named:
+                target = t
+                break
+    if target is None and s.running_task:
+        target = s.get(s.running_task)
+    if target is None or target.status not in ("running", "queued"):
+        return None, None
+    target.status = "paused"
+    return f"paused {target.id} (send 'queue: resume {target.id}' to run it again)", target.id
 
 
 def _clean_parts(parts: list[classify.Part]) -> list[classify.Part]:
@@ -431,6 +462,8 @@ def _mid_turn(
         if decision is not None and _confident(decision):
             if decision.label == "steer" and decision.interrupt:
                 label = "interrupt"
+            elif decision.label == "steer" and decision.note == "pause":
+                label = "pause"
             elif decision.label in ACTIONABLE_LABELS:
                 label = decision.label
                 parked = decision.label == "queue" and decision.parked
@@ -451,6 +484,13 @@ def _mid_turn(
         if not shadow:
             s.interrupt = True
             output = _block(f"{PREFIX}: stopping {s.running_task or 'the current turn'} at the next tool call")
+
+    elif label == "pause":
+        assert decision is not None
+        confirmation, target_id = (None, None) if shadow else _pause(s, decision.target)
+        # The message still reaches Claude: it says what to do instead.
+        output = _context(f"{PREFIX}: {confirmation}") if confirmation else None
+        label = "pause" if confirmation else "steer"
 
     elif label == "queue":
         deps = list(decision.depends_on) if decision is not None else []
@@ -526,10 +566,15 @@ def _split(
                 target_id = target_id or tid
         else:
             steer_texts.append(p.text)
+            if p.note == "pause" and not shadow:
+                confirmation, tid = _pause(s, p.target)
+                if confirmation:
+                    confirmations.append(confirmation)
+                    target_id = target_id or tid
 
     if not confirmations:
         return None, "steer", None
-    if len(parts) == 1:
+    if len(parts) == 1 and labels[0] in ("queue", "amend"):
         # One real part: the decision is that part's label, answered as a standalone.
         acted = labels[0]
         output = None if shadow else _block(f"{PREFIX}: {confirmations[0]}")

@@ -51,10 +51,13 @@ _TRAILING_PUNCT = ".,;:!?"
 # `queue: list`, `/queue cancel p2`, `/queue-switchclaude:queue promote p3`.
 # The remainder is the command; empty means `list`. The word boundary keeps
 # "queued ..." and "queues ..." out of the control channel.
-_CONTROL_RE = re.compile(
-    r"^(queue|/queue(-switchclaude:queue)?)\b\s*:?\s*(.*)$",
-    re.IGNORECASE | re.DOTALL,
-)
+# Three forms are control: the slash command, `queue:` with a colon, and a
+# bare `queue <command>` whose first word is a known command. Prose that
+# merely starts with "queue" ("queue the login endpoint first") is a task.
+CONTROL_WORDS = ("list", "cancel", "promote", "park", "drop", "pause", "resume", "help")
+_CONTROL_SLASH_RE = re.compile(r"^/queue(-switchclaude:queue)?\b\s*:?\s*(.*)$", re.IGNORECASE | re.DOTALL)
+_CONTROL_COLON_RE = re.compile(r"^queue\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
+_CONTROL_BARE_RE = re.compile(r"^queue\s+([A-Za-z]+)\b(.*)$", re.IGNORECASE | re.DOTALL)
 
 # Tentative markers: the item is recorded as `parked`, never dispatched
 # until promoted (spec section 3, g33).
@@ -118,10 +121,16 @@ def _is_harness_traffic(message: str) -> bool:
 
 
 def _control_command(message: str) -> Optional[str]:
-    m = _CONTROL_RE.match(message.strip())
-    if m is None:
-        return None
-    return m.group(m.lastindex).strip()
+    text = message.strip()
+    m = _CONTROL_SLASH_RE.match(text) or _CONTROL_COLON_RE.match(text)
+    if m is not None:
+        return m.group(m.lastindex).strip()
+    if text.lower() == "queue":
+        return ""
+    m = _CONTROL_BARE_RE.match(text)
+    if m is not None and m.group(1).lower() in CONTROL_WORDS:
+        return (m.group(1) + m.group(2)).strip()
+    return None
 
 
 def _is_non_task(message: str) -> bool:

@@ -148,3 +148,16 @@ def test_golden_undecided_cases_keep_their_text():
         v = rules.decide(r["message"])
         if v.rule in (None, "numbered_split", "paste_guard"):
             assert v.text == r["message"], r["id"]
+
+
+@pytest.mark.parametrize("msg,label,control", [
+    ("queue the login endpoint first", "undecided", None),
+    ("Queue up a migration after this", "undecided", None),
+    ("queue list", "control", "list"),
+    ("queue cancel p2", "control", "cancel p2"),
+    ("queue", "control", ""),
+    ("queue: the login endpoint first", "control", "the login endpoint first"),
+])
+def test_control_rule_requires_colon_slash_or_command_word(msg, label, control):
+    v = rules.decide(msg)
+    assert v.label == label and v.control == control

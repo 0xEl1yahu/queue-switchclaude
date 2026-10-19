@@ -507,3 +507,38 @@ def test_plugin_manifest_declares_shadow_compare():
     m = json.load(open(Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"))
     opt = m["userConfig"]["shadow_compare"]
     assert opt["type"] == "boolean" and opt["default"] is False and opt["title"] == "Shadow: also ask the model"
+
+
+def test_steer_pause_note_pauses_running_task_and_passes_through(data_dir):
+    intake.handle(ev("refactor billing"))
+    out = intake.handle(ev("hold the refactor, something came up"), classifier=lambda p: dec(label="steer", note="pause", target="p1"))
+    assert "decision" not in out and "paused p1" in out["hookSpecificOutput"]["additionalContext"]
+    assert store.load("s1").get("p1").status == "paused"
+
+
+def test_split_g27_pauses_running_and_rewires_queued(data_dir):
+    intake.handle(ev("refactor the billing service")); intake.handle(ev("later: add a Stripe webhook handler"))
+    d = dec(label="split", parts=[part(label="steer", text="refactor can wait", note="pause", target="p1"),
+                                  part(label="amend", text="actually do the webhook first", target="p2", depends_on=[])])
+    out = intake.handle(ev("actually do the webhook first, refactor can wait"), classifier=lambda p: d)
+    s = store.load("s1")
+    assert s.get("p1").status == "paused" and s.get("p2").depends_on == [] and s.ready()[0].id == "p2"
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "paused p1" in ctx and "p2 now depends on nothing" in ctx and "act only on: refactor can wait" in ctx
+
+
+def test_dedupe_lets_a_plain_prompt_run_again_after_it_finished(data_dir):
+    intake.handle(ev("run the tests"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.state = "idle"; s.running_task = None
+    assert intake.handle(ev("Run the tests.", prompt_id="pid-2")) is None
+    assert store.load("s1").get("p2").status == "running"
+
+
+def test_dedupe_still_catches_held_marker_text_after_it_finished(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: email verification"))
+    with store.locked("s1") as s:
+        for t in s.tasks: t.status = "done"
+        s.state = "idle"; s.running_task = None
+    out = intake.handle(ev("later: email verification", prompt_id="pid-2"))
+    assert "already p2 (done)" in out["systemMessage"] and store.load("s1").next_id == 3

@@ -251,3 +251,10 @@ def test_wrong_shape_still_corrupt_after_key_filtering(data_dir):
     p.write_text(json.dumps({"tasks": [{"id": "p1", "future": True}]}))
     assert store.load("s1").tasks == []
     assert _log_rows("s1")[-1]["event"] == "store_corrupt"
+
+
+def test_promote_accepts_paused(data_dir):
+    s = store.load("s1"); t = s.new_task("a", [], None); t.status = "paused"
+    assert s.promote("p1").status == "queued"
+    t.status = "done"
+    assert s.promote("p1") is None

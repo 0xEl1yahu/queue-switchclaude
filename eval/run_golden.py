@@ -177,6 +177,7 @@ class _Case:
     def amend(self, d: object, text: str) -> dict | None:
         """Resolve the target as intake does; None when it cannot (the caller steers)."""
         target = self.task(_field(d, "target", None))
+        named = target is not None
         if target is None and match is not None:
             target = match.pick(text, self.candidates())
         if target is None:
@@ -188,7 +189,8 @@ class _Case:
             out["note"] = "cancel"
         elif note == "pause":
             out["note"] = "pause"
-        elif new_deps != list(target.depends_on):
+        elif named and new_deps != list(target.depends_on):
+            # intake rewires only when the model named the target itself
             removed = [x for x in target.depends_on if x not in new_deps]
             added = [x for x in new_deps if x not in target.depends_on]
             out["depends_on"] = new_deps
@@ -202,6 +204,9 @@ class _Case:
 
     def part(self, p: object, text: str) -> dict:
         label = _field(p, "label", "steer")
+        confidence = _field(p, "confidence", 1.0)
+        if label in ("queue", "amend") and (not isinstance(confidence, (int, float)) or confidence < THRESHOLD):
+            label = "steer"  # intake._part_label: an unsure part is Claude's
         if label == "interrupt":
             return _steer(True)
         if label == "queue":

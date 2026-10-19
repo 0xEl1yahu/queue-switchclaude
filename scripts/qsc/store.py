@@ -169,9 +169,13 @@ class Store:
         return task
 
     def promote(self, task_id: str) -> Task | None:
-        """Move a parked task back to the queue; ``None`` unless it was parked."""
+        """Move a parked or paused task back to the queue; ``None`` otherwise.
+
+        A paused task (amend note ``pause``, or the running task left paused
+        by dispatch) has no other way back into ``ready()``.
+        """
         task = self.get(task_id)
-        if task is None or task.status != "parked":
+        if task is None or task.status not in ("parked", "paused"):
             return None
         task.status = "queued"
         return task

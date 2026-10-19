@@ -9,13 +9,15 @@ to sit above the input box.
 
 Commands (first word, case-insensitive):
 
-    list          one line per running, queued, parked or paused task
+    list          the running, queued, parked and paused tasks, on ONE line
+                  (the mid-run notification shows a single line)
     cancel pN     a queued, parked or paused task becomes ``cancelled``
-    promote pN    a parked task becomes ``queued``
+    promote pN    a parked or paused task becomes ``queued``
     park pN       a queued task becomes ``parked``
     drop          every queued and parked task becomes ``dropped``
     pause         ``Store.paused = True``: dispatch runs nothing
     resume        ``Store.paused = False``
+    resume pN     a paused task becomes ``queued`` (same as promote)
     help          this list; so does any unknown word
 """
 from __future__ import annotations
@@ -23,17 +25,12 @@ from __future__ import annotations
 from . import store
 
 TEXT_WIDTH = 60
+ITEM_WIDTH = 36
 COMMANDS = ("list", "cancel", "promote", "park", "drop", "pause", "resume", "help")
 
-HELP_LINES = (
-    "list: show the running, queued, parked and paused tasks",
-    "cancel pN: cancel a queued, parked or paused task",
-    "promote pN: move a parked task into the queue",
-    "park pN: move a queued task aside until you promote it",
-    "drop: drop every queued and parked task",
-    "pause: stop dispatching queued tasks until resume",
-    "resume: dispatch queued tasks again",
-    "help: this list",
+HELP = (
+    "commands: list | cancel pN | promote pN (parked or paused) | park pN | "
+    "drop | pause | resume [pN] | help"
 )
 
 
@@ -45,19 +42,21 @@ def _clip(text: str) -> str:
     return flat[:TEXT_WIDTH] + "…"
 
 
-def _line(t: store.Task) -> str:
-    after = f"after {', '.join(t.depends_on)}" if t.depends_on else ""
-    head = f"{t.id:<4}{t.status:<9}"
-    if after:
-        head += f"{after:<11}"
-    return head + _clip(t.text)
+def _item(t: store.Task) -> str:
+    """``p2 queued after p1: add a goodbye.py…`` with the text cut to ITEM_WIDTH."""
+    after = f" after {', '.join(t.depends_on)}" if t.depends_on else ""
+    flat = " ".join(t.text.split())
+    if len(flat) > ITEM_WIDTH:
+        flat = flat[:ITEM_WIDTH] + "…"
+    return f"{t.id} {t.status}{after}: {flat}"
 
 
 def _list(s: store.Store) -> str:
+    """One line: the notification area shows a single line of a systemMessage."""
     live = s.candidates()
-    body = "\n".join(_line(t) for t in live) if live else "queue is empty"
+    body = "; ".join(_item(t) for t in live) if live else "queue is empty"
     if s.paused:
-        body += "\nqueue is paused; send 'queue: resume' to dispatch again"
+        body += "; queue is paused, send 'queue: resume' to dispatch again"
     return body
 
 
@@ -81,7 +80,7 @@ def _promote(s: store.Store, task_id: str) -> str:
         return f"no task {task_id}"
     t = s.promote(task_id)
     if t is None:
-        return f"{task_id} is not parked"
+        return f"{task_id} is not parked or paused"
     return f"promoted {t.id} to the queue"
 
 
@@ -107,7 +106,7 @@ def _drop(s: store.Store) -> str:
 
 
 def help_text() -> str:
-    return "\n".join(HELP_LINES)
+    return HELP
 
 
 def run(s: store.Store, command: str) -> str:
@@ -133,6 +132,8 @@ def run(s: store.Store, command: str) -> str:
         s.paused = True
         return "queue paused"
     if name == "resume":
+        if arg is not None:
+            return _promote(s, _task_id(arg))
         s.paused = False
         return "queue resumed"
     return help_text()

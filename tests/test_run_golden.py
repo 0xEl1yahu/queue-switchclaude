@@ -140,3 +140,21 @@ def test_cli_with_fake_claude_passes_g01(tmp_path):
 def test_cli_unknown_case_is_an_error_not_a_traceback():
     r = subprocess.run([sys.executable, str(ROOT / "eval" / "run_golden.py"), "--rules-only", "--cases", "g99"], capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 2 and "Traceback" not in r.stderr and "g99" in r.stderr
+
+
+def test_split_parts_are_confidence_gated_like_intake():
+    row = G["g09"]
+    d = classify.Decision(label="split", confidence=0.95, interrupt=False, parked=False, depends_on=[], target=None, note=None,
+                          parts=[classify.Part(label="steer", text="use argon2 instead", confidence=0.95),
+                                 classify.Part(label="queue", text="add password reset", confidence=0.5, depends_on=["p1"])])
+    got = run_golden.decide(row, classifier=lambda p: d)
+    assert got["label"] in ("steer", "split")
+    if got["label"] == "split":
+        assert [p["label"] for p in got["parts"]] == ["steer", "steer"]
+
+
+def test_amend_rewire_only_when_model_named_target():
+    row = G["g23"]   # queue holds p2 "Add a Stripe webhook handler"; message is about it
+    d = classify.Decision(label="amend", confidence=0.95, interrupt=False, parked=False, depends_on=[], target=None, note=None, parts=[])
+    got = run_golden.decide(row, classifier=lambda p: d)
+    assert got["label"] == "amend" and got["target"] == "p2" and "depends_on" not in got

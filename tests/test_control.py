@@ -8,7 +8,7 @@ def seeded():
 
 def test_list_shows_live_tasks():
     out = control.run(seeded(), "list")
-    assert "p1" in out and "p2  queued" in out.replace("   ", "  ") and "p3  parked" in out.replace("   ", "  ")
+    assert "\n" not in out and "p1 running: add login" in out and "p2 queued after p1: write tests for login" in out and "p3 parked after p1: social login" in out
 
 
 def test_empty_command_is_list():
@@ -19,7 +19,7 @@ def test_cancel_promote_park_messages():
     s = seeded()
     assert control.run(s, "cancel p2").startswith("cancelled p2") and s.get("p2").status == "cancelled"
     assert control.run(s, "cancel p9") == "no task p9"
-    assert control.run(s, "promote p3") == "promoted p3 to the queue" and control.run(s, "promote p3") == "p3 is not parked"
+    assert control.run(s, "promote p3") == "promoted p3 to the queue" and control.run(s, "promote p3") == "p3 is not parked or paused"
     assert control.run(s, "park p3") == "parked p3" and control.run(s, "cancel p1") == "p1 is not queued, parked or paused"
 
 
@@ -44,10 +44,10 @@ def test_list_hides_finished_tasks_and_shows_deps():
     assert "after p1" in out and out.index("p1") < out.index("p2") < out.index("p3")
 
 
-def test_list_truncates_long_text_at_60():
+def test_list_truncates_long_text_per_item():
     s = store.Store("s1"); s.new_task("x" * 100, [], None)
     line = control.run(s, "list")
-    assert "x" * 60 in line and "x" * 61 not in line and line.endswith("…")
+    assert "x" * control.ITEM_WIDTH in line and "x" * (control.ITEM_WIDTH + 1) not in line and line.endswith("…")
 
 
 def test_commands_are_case_insensitive_and_whitespace_tolerant():
@@ -61,7 +61,7 @@ def test_cancel_promote_park_missing_or_wrong_status():
     assert control.run(s, "promote p9") == "no task p9"
     assert control.run(s, "park p9") == "no task p9"
     assert control.run(s, "park p1") == "p1 is not queued"
-    assert control.run(s, "promote p2") == "p2 is not parked"
+    assert control.run(s, "promote p2") == "p2 is not parked or paused"
     assert control.run(s, "cancel") != "" and "cancel pN" in control.run(s, "cancel")
 
 
@@ -88,3 +88,18 @@ def test_help_lists_every_command():
     out = control.run(store.Store("s1"), "help")
     for word in ("list", "cancel pN", "promote pN", "park pN", "drop", "pause", "resume"):
         assert word in out
+
+
+def test_resume_pn_and_promote_bring_a_paused_task_back():
+    s = seeded(); s.get("p2").status = "paused"
+    assert control.run(s, "resume p2") == "promoted p2 to the queue" and s.get("p2").status == "queued"
+    s.get("p2").status = "paused"
+    assert control.run(s, "promote p2") == "promoted p2 to the queue"
+    assert control.run(s, "resume") == "queue resumed"
+
+
+def test_help_and_list_are_single_lines():
+    s = seeded(); s.paused = True
+    assert "\n" not in control.run(s, "help") and "resume [pN]" in control.run(s, "help")
+    out = control.run(s, "list")
+    assert "\n" not in out and out.endswith("queue is paused, send 'queue: resume' to dispatch again")
