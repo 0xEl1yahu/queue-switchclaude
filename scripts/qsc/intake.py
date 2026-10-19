@@ -25,7 +25,19 @@ It also keeps the per-session store in step with the turn: a message whose
 turn arriving while the store still says ``running`` means the previous turn
 was interrupted by Esc (D5): the running task is marked ``interrupted``,
 queued tasks are ``dropped``, and a notice listing them is attached to the
-new prompt.
+new prompt. A new turn arriving while the store says ``planning`` means Esc
+cut the planning turn instead (M3): the task being planned goes back to
+``queued``, its half-written plan file is deleted, nothing is dropped (the
+user interrupted planning, not work), and the notice says it is queued
+again; dispatch plans it afresh after this turn.
+
+At ``idle`` (nothing running, nothing pending) the rule markers mean
+something else than mid-turn (M3, ``_idle_turn``): ``later: x`` has nothing
+to wait for, so ``x`` (the remainder, not the raw prompt) becomes the turn
+that starts now and the prompt passes through with a context line saying
+so; a tentative marker parks its item and blocks, nothing runs; and "stop"
+is answered with ``nothing is running``, no task and no interrupt flag.
+Dedupe still runs first, so held marker text sent again at idle is caught.
 
 In shadow mode with the ``shadow_compare`` option on, a message the rules
 decided is also sent to the classifier; the log then carries ``rule_label``
@@ -102,6 +114,10 @@ MID_TURN_STATES = ("running", "planning")
 
 SHADOW_QUEUED = "shadow_queued"
 
+# Returned by a branch that had nothing to act on, so the caller carries on;
+# distinct from ``None``, which is a pass-through the caller returns as is.
+_UNHANDLED = object()
+
 
 def _block(reason: str) -> dict:
     """A UserPromptSubmit block the user can actually see.
@@ -160,16 +176,53 @@ def _esc_notice(dropped: list[store.Task]) -> str | None:
     return f"{PREFIX}: the previous turn was interrupted, dropped queued tasks: {listed}"
 
 
-def _new_turn(s: store.Store, event: dict, prompt: str, prompt_id: str | None) -> dict | None:
-    """Register a fresh turn: handle a missed Esc, then make the prompt the running task."""
+def _planning_notice(task_id: str) -> str:
+    """The additionalContext line for an Esc that cut a planning turn (M3)."""
+    return f"{PREFIX}: the planning turn for {task_id} was interrupted; it is queued again"
+
+
+def _interrupt_planning(s: store.Store) -> str | None:
+    """Esc during planning: give the task being planned back to the queue.
+
+    Returns the id of the task requeued, or ``None`` when nothing was really
+    being planned (no pending task, or one the user cancelled, parked or
+    dropped meanwhile: control works in every state, and ``_after_planning``
+    makes the same exception, so a cancelled task is never resurrected).
+    The half-written plan file goes with it; dispatch asks for a fresh plan
+    when a later Stop finds the task ready again.
+    """
+    task = s.get(s.pending_task) if s.pending_task else None
+    if task is None or task.status != "queued":
+        return None
+    task.status = "queued"
+    task.attempts = 0
+    with contextlib.suppress(OSError):
+        paths.plan_path(s.session_id, task.id).unlink()
+    return task.id
+
+
+def _new_turn(
+    s: store.Store,
+    event: dict,
+    prompt: str,
+    prompt_id: str | None,
+    *,
+    text: str | None = None,
+    marker_stripped: bool = False,
+) -> dict | None:
+    """Register a fresh turn: handle a missed Esc, then make the prompt the running task.
+
+    ``text`` is the running task's text when it differs from the prompt (an
+    idle ``later: x`` runs as ``x``); ``marker_stripped`` says so in the log.
+    """
     notice = None
     interrupted = None
+    interrupted_planning = None
     dropped: list[store.Task] = []
     if s.state == "running":
         # No Stop fired for the task that was running: the turn was cut by
-        # Esc (D5). Only ``running`` counts: a new turn arriving while a plan
-        # or a question waits, or while a plan is being written, interrupts
-        # nothing and drops nothing.
+        # Esc (D5). A new turn arriving while a plan or a question waits
+        # interrupts nothing and drops nothing.
         running = s.get(s.running_task) if s.running_task else None
         if running is not None and running.status == "running":
             running.status = "interrupted"
@@ -178,6 +231,13 @@ def _new_turn(s: store.Store, event: dict, prompt: str, prompt_id: str | None) -
         for t in dropped:
             t.status = "dropped"
         notice = _esc_notice(dropped)
+    elif s.state == "planning":
+        # Esc cut the planning turn (review focus 2). The user interrupted
+        # planning, not work, so D5's drop does not apply: queued tasks
+        # stay queued and the one being planned rejoins them.
+        interrupted_planning = _interrupt_planning(s)
+        if interrupted_planning is not None:
+            notice = _planning_notice(interrupted_planning)
 
     s.state = "running"
     s.current_prompt_id = prompt_id
@@ -185,7 +245,7 @@ def _new_turn(s: store.Store, event: dict, prompt: str, prompt_id: str | None) -
     # A planned task whose approval this turn defers keeps its status;
     # dispatch finds it again through ``_planned_ready`` after the turn.
     s.pending_task = None
-    t = s.new_task(prompt, [], prompt_id, kind="prompt")
+    t = s.new_task(prompt if text is None else text, [], prompt_id, kind="prompt")
     t.status = "running"
     s.running_task = t.id
 
@@ -196,6 +256,8 @@ def _new_turn(s: store.Store, event: dict, prompt: str, prompt_id: str | None) -
         prompt_id=prompt_id,
         interrupted=interrupted,
         dropped=[d.id for d in dropped],
+        interrupted_planning=interrupted_planning,
+        marker_stripped=marker_stripped,
     )
     if notice is None:
         return None
@@ -534,6 +596,10 @@ def _turn(
             return None
 
     if not mid_turn:
+        if _idle(s):
+            out = _idle_turn(s, event, v, prompt, prompt_id, shadow)
+            if out is not _UNHANDLED:
+                return out
         return _new_turn(s, event, prompt, prompt_id)
 
     return _mid_turn(s, event, v, prompt, prompt_id, classifier, shadow)
@@ -541,6 +607,66 @@ def _turn(
 
 def _dedupe_text(dup: store.Task) -> str:
     return f"{PREFIX}: that is already {dup.id} ({dup.status}); send 'queue: list' to see the queue"
+
+
+# --- M3: idle-state markers ---------------------------------------------------
+
+
+def _idle(s: store.Store) -> bool:
+    """Nothing running, nothing pending: the next message starts a turn."""
+    return s.state == "idle" and s.running_task is None and s.pending_task is None
+
+
+def _idle_turn(
+    s: store.Store,
+    event: dict,
+    v: rules.Verdict,
+    prompt: str,
+    prompt_id: str | None,
+    shadow: bool,
+) -> object:
+    """A rule verdict at idle, where the markers mean something else than
+    mid-turn. Returns the hook output, or ``_UNHANDLED`` for an ordinary
+    new turn.
+
+    * ``later: x`` (``queue_marker``): there is nothing to run it after, so
+      ``x`` starts now as the running task's text and the prompt passes
+      through with a context line saying so.
+    * ``maybe later x`` (``parked_marker``): parked and blocked; nothing
+      runs until ``queue: promote``.
+    * "stop" (``interrupt``): nothing is running, so it is answered and
+      blocked; no task is created and no interrupt flag is set, which would
+      end the next turn at its first tool call.
+
+    Shadow mode records the decision but changes nothing on screen: the raw
+    prompt starts a turn as before, and a tentative item is filed as
+    ``shadow_queued`` the way the mid-turn path files it.
+    """
+    sid = s.session_id
+
+    if v.label == "interrupt":
+        log.record(sid, "intake", decision="noop", state="idle", message=prompt, rule=v.rule,
+                   rule_label=v.label, label="interrupt", shadow=shadow, prompt_id=prompt_id)
+        if shadow:
+            return _new_turn(s, event, prompt, prompt_id)
+        return _block(f"{PREFIX}: nothing is running")
+
+    if v.label == "queue" and v.parked:
+        confirmation = _queue(s, v.text, [], prompt_id, parked=True, shadow=shadow)
+        log.record(sid, "intake", decision="parked_idle", state="idle", task=s.tasks[-1].id,
+                   message=prompt, rule=v.rule, rule_label=v.label, label="queue", parked=True,
+                   shadow=shadow, prompt_id=prompt_id)
+        if shadow:
+            return _new_turn(s, event, prompt, prompt_id)
+        return _block(f"{PREFIX}: {confirmation}")
+
+    if v.label == "queue":
+        if shadow:
+            return _new_turn(s, event, prompt, prompt_id)
+        _new_turn(s, event, prompt, prompt_id, text=v.text, marker_stripped=True)
+        return _context(f"{PREFIX}: nothing is running, so this starts now: {v.text}")
+
+    return _UNHANDLED
 
 
 def _mid_turn(
@@ -916,7 +1042,8 @@ def _defer(
     if context is None:
         return out
     # ``_new_turn`` attaches a notice only after an Esc, which needs state
-    # ``running``; here the state was ``awaiting_approval``, so ``out`` is None.
+    # ``running`` or ``planning``; here the state was ``awaiting_approval``,
+    # so ``out`` is None.
     return _context(context)
 
 
@@ -979,9 +1106,6 @@ def _approval_state(
             return out
 
     return _defer(s, event, v, t, prompt, prompt_id, shadow, **kw)
-
-
-_UNHANDLED = object()
 
 
 def _split_while_waiting(

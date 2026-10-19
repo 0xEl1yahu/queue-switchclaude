@@ -317,8 +317,10 @@ def test_dedupe_skips_cancelled_tasks(data_dir):
 
 
 def test_dedupe_never_swallows_an_interrupt(data_dir):
-    intake.handle(ev("stop"))                       # a new turn whose text happens to be "stop"
-    out = intake.handle(ev("stop"))                 # mid-turn: this is an interrupt, not a duplicate
+    # M3 Task 1 made "stop" at idle a no-op, so the task whose text is "stop"
+    # is queued mid-turn instead of started as the turn itself.
+    intake.handle(ev("add a user model")); intake.handle(ev("later: stop"))   # p2: a queued task whose text is "stop"
+    out = intake.handle(ev("stop"))                 # mid-turn: this is an interrupt, not a duplicate of p2
     assert "stopping p1" in out["systemMessage"] and store.load("s1").interrupt is True
 
 
@@ -778,7 +780,147 @@ def test_new_turn_during_planning_clears_pending_without_esc_drop(data_dir):
     with store.locked("s1") as s:
         s.get("p1").status = "done"; s.new_task("add login", ["p1"], "pid-1"); s.new_task("add logout", ["p2"], "pid-1")
         s.state = "planning"; s.pending_task = "p2"; s.running_task = None
-    assert intake.handle(ev("something else", prompt_id="pid-2")) is None
+    # M3 Task 1: a new prompt_id during planning is Esc on the planning turn
+    # (review focus 2): the pending task is queued again and the prompt
+    # carries a notice; nothing is dropped.
+    out = intake.handle(ev("something else", prompt_id="pid-2"))
+    assert "planning turn for p2 was interrupted" in out["hookSpecificOutput"]["additionalContext"]
     s = store.load("s1")
     assert s.state == "running" and s.running_task == "p4" and s.pending_task is None
     assert s.get("p2").status == "queued" and s.get("p3").status == "queued"
+
+
+# --- M3 Task 1: idle-state markers and Esc during planning ------------------
+
+def test_idle_queue_marker_runs_now_with_stripped_text(data_dir):
+    out = intake.handle(ev("later: add goodbye.py"))
+    assert "starts now: add goodbye.py" in out["hookSpecificOutput"]["additionalContext"]
+    t = store.load("s1").get("p1"); assert t.text == "add goodbye.py" and t.status == "running"
+
+
+def test_idle_parked_marker_parks_and_blocks(data_dir):
+    out = intake.handle(ev("maybe later we can add a README"))
+    assert out["decision"] == "block" and "parked p1" in out["systemMessage"]
+    s = store.load("s1"); assert s.get("p1").status == "parked" and s.state == "idle"
+
+
+def test_idle_stop_is_a_noop(data_dir):
+    out = intake.handle(ev("stop"))
+    assert out["decision"] == "block" and "nothing is running" in out["systemMessage"]
+    assert not store.load("s1").tasks and not store.load("s1").interrupt
+
+
+def test_esc_during_planning_requeues_pending(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: add login"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.state = "planning"; s.pending_task = "p2"; s.running_task = None
+    p = paths.plan_path("s1", "p2"); p.parent.mkdir(parents=True, exist_ok=True); p.write_text("# half")
+    out = intake.handle(ev("something else", prompt_id="pid-2"))
+    s = store.load("s1")
+    assert s.get("p2").status == "queued" and s.pending_task is None and not p.exists()
+    assert s.running_task == "p3" and s.state == "running"
+    assert "planning turn for p2 was interrupted" in out["hookSpecificOutput"]["additionalContext"]     # review focus 2
+
+
+# --- additional Task 1 tests beyond the plan ---------------------------------
+
+def test_idle_queue_marker_passes_through_and_logs_marker_stripped(data_dir):
+    out = intake.handle(ev("later: add goodbye.py"))
+    assert "decision" not in out and out["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p1" and s.current_prompt_id == "pid-1"
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["decision"] == "new_turn" and row["marker_stripped"] is True and row["task"] == "p1"
+    # The turn is the user's own: a marker typed during it queues after p1 as usual.
+    assert "queued p2 after p1" in intake.handle(ev("later: add hello.py"))["systemMessage"]
+
+
+def test_idle_queue_marker_in_shadow_keeps_the_raw_prompt(data_dir):
+    assert intake.handle(ev("later: add goodbye.py"), shadow=True) is None
+    t = store.load("s1").get("p1"); assert t.text == "later: add goodbye.py" and t.status == "running"
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["decision"] == "new_turn" and row["marker_stripped"] is False
+
+
+def test_idle_parked_marker_logs_parked_idle_and_never_dispatches(data_dir):
+    intake.handle(ev("maybe later we can add a README"))
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["decision"] == "parked_idle" and row["task"] == "p1" and row["parked"] is True
+    s = store.load("s1"); assert s.ready() == [] and s.running_task is None and s.pending_task is None
+    # The next prompt is an ordinary turn that does not chain after the parked item.
+    assert intake.handle(ev("add hello.py", prompt_id="pid-2")) is None
+    s = store.load("s1"); assert s.running_task == "p2" and s.get("p2").depends_on == []
+
+
+def test_idle_parked_marker_in_shadow_records_and_passes(data_dir):
+    assert intake.handle(ev("maybe later we can add a README"), shadow=True) is None
+    s = store.load("s1")
+    assert s.get("p1").status == "shadow_queued" and s.state == "running" and s.running_task == "p2"
+
+
+def test_idle_parked_marker_without_content_is_a_plain_turn(data_dir):
+    assert intake.handle(ev("maybe later we can add this")) is None
+    t = store.load("s1").get("p1"); assert t.status == "running" and t.text == "maybe later we can add this"
+
+
+def test_idle_stop_logs_noop_and_the_next_prompt_runs(data_dir):
+    intake.handle(ev("stop"))
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["decision"] == "noop" and row["label"] == "interrupt" and row["state"] == "idle"
+    assert intake.handle(ev("add hello.py", prompt_id="pid-2")) is None
+    s = store.load("s1"); assert s.running_task == "p1" and s.interrupt is False
+
+
+def test_idle_stop_in_shadow_is_a_turn(data_dir):
+    assert intake.handle(ev("stop"), shadow=True) is None
+    s = store.load("s1"); assert s.get("p1").status == "running" and s.interrupt is False
+
+
+def test_idle_stop_after_a_finished_turn_is_a_noop(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.state = "idle"; s.running_task = None
+    out = intake.handle(ev("stop", prompt_id="pid-2"))
+    assert out["decision"] == "block" and "nothing is running" in out["systemMessage"]
+    s = store.load("s1"); assert s.state == "idle" and s.next_id == 2 and s.interrupt is False
+
+
+def test_idle_markers_still_dedupe_held_text_first(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: add goodbye.py"))
+    with store.locked("s1") as s:
+        for t in s.tasks: t.status = "done"
+        s.state = "idle"; s.running_task = None
+    out = intake.handle(ev("later: add goodbye.py", prompt_id="pid-2"))
+    assert out["decision"] == "block" and "already p2 (done)" in out["systemMessage"] and store.load("s1").next_id == 3
+
+
+def test_esc_during_planning_keeps_other_queued_tasks_and_logs(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.new_task("add login", ["p1"], "pid-1"); s.new_task("add logout", ["p2"], "pid-1")
+        s.state = "planning"; s.pending_task = "p2"; s.running_task = None; s.get("p2").attempts = 1
+    out = intake.handle(ev("something else", prompt_id="pid-2"))
+    s = store.load("s1")
+    assert s.get("p2").status == "queued" and s.get("p2").attempts == 0 and s.get("p3").status == "queued"
+    assert s.state == "running" and s.running_task == "p4" and s.pending_task is None
+    assert out["hookSpecificOutput"]["additionalContext"] == "queue-switchclaude: the planning turn for p2 was interrupted; it is queued again"
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["decision"] == "new_turn" and row["interrupted_planning"] == "p2" and row["dropped"] == [] and row["interrupted"] is None
+
+
+def test_esc_during_planning_then_the_task_is_planned_again(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: add login"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.state = "planning"; s.pending_task = "p2"; s.running_task = None
+    intake.handle(ev("what time is it", prompt_id="pid-2"))
+    out = dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": "noon", "cwd": str(ROOT)})
+    assert "Write a short plan for p2" in out["hookSpecificOutput"]["additionalContext"]
+    s = store.load("s1"); assert s.state == "planning" and s.pending_task == "p2" and s.get("p3").status == "done"
+
+
+def test_esc_during_planning_does_not_resurrect_a_cancelled_task(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: add login"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.state = "planning"; s.pending_task = "p2"; s.running_task = None
+        s.get("p2").status = "cancelled"
+    assert intake.handle(ev("something else", prompt_id="pid-2")) is None
+    s = store.load("s1"); assert s.get("p2").status == "cancelled" and s.pending_task is None and s.running_task == "p3"
