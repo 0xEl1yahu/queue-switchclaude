@@ -1,6 +1,7 @@
-"""Classifier wrapper: shells out to `claude -p` with a JSON schema. Stdlib only.
+"""Classifier wrapper: `claude -p` with the Decision JSON schema. Stdlib only.
 
-Rules-first intake sends only what it cannot decide here. Every failure
+Rules-first intake sends only what it cannot decide here. The call goes
+through ``model.call`` (shared with the M2 done judge); every failure
 (missing binary, timeout, bad exit, unparseable or invalid answer) returns
 ``None`` so the caller fails open and treats the message as ``steer``.
 
@@ -12,12 +13,13 @@ holds the per-part decisions of a ``split``.
 """
 from __future__ import annotations
 
-import json
-import subprocess
+import subprocess  # noqa: F401  (tests monkeypatch ``classify.subprocess.run``; it is the module ``model`` uses)
 from dataclasses import dataclass, field
 from pathlib import Path
 
-LABELS = ("steer", "queue", "amend", "split", "unclear")
+from . import model
+
+LABELS =("steer", "queue", "amend", "split", "unclear")
 
 # Values `note` may take; None means no note.
 NOTES = ("approve", "revise plan", "cancel", "pause")
@@ -213,42 +215,12 @@ def _validate(obj: object) -> Decision | None:
 
 
 def run(payload: dict, timeout: float = 15.0, claude: str = "claude") -> Decision | None:
-    """Call the isolated `claude -p` classifier. ``None`` on any failure."""
-    prompt = _system_prompt()
-    if prompt is None:
-        return None
-    try:
-        payload_json = json.dumps(payload)
-    except (TypeError, ValueError):
-        return None
+    """Call the isolated `claude -p` classifier. ``None`` on any failure.
 
-    cmd = [
-        claude, "-p",
-        "--model", "haiku",
-        "--setting-sources", "",
-        "--strict-mcp-config",
-        "--tools", "",
-        "--output-format", "json",
-        "--json-schema", json.dumps(SCHEMA),
-        "--system-prompt", prompt,
-        payload_json,
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+    The call itself is ``model.call`` (M2: one wrapper shared with the judge);
+    this function owns the prompt, the schema and the validation.
+    """
+    out = model.call(PROMPT_PATH, SCHEMA, payload, timeout, claude)
+    if out is None:
         return None
-    if proc.returncode != 0:
-        return None
-    try:
-        out = json.loads(proc.stdout)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-    if not isinstance(out, dict):
-        return None
-    return _validate(out.get("structured_output"))
+    return _validate(out)
