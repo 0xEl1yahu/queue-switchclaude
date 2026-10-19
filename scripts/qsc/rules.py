@@ -19,6 +19,13 @@ Rule order and labels:
     numbered_split   -> undecided (rule name only; the model does the split)
     (none)           -> undecided
 
+The table never looks at the harness state. Two helpers do the state-aware
+word matching for intake's waiting states (M2, decision D3): `is_approval`
+("lgtm", "ok", "ship it": exact after normalisation, so "ok" approves a
+waiting plan but "looks good but do X first" never does) and
+`is_confirmation` ("ok, merge": an approval word as the first clause, used
+only while the running task waits for the user's answer, spec section 7).
+
 Stdlib only.
 """
 
@@ -36,6 +43,24 @@ HARNESS_PHRASES = (
 )
 
 NON_TASK_WORDS = frozenset({"ok", "okay", "yes", "y", "continue", "go", "."})
+
+# What approves a plan that is waiting (state `awaiting_approval`, g44) or
+# confirms a task done (state `awaiting_answer`, spec section 7). Exact match
+# after normalisation: "ok" is here, "ok, but ..." is not. The overlap with
+# NON_TASK_WORDS is deliberate: intake checks the store state before the
+# non-task pass short-circuit, so "ok" approves only while a plan waits.
+APPROVE_WORDS = frozenset({
+    "lgtm", "approve", "approved", "go", "go ahead", "yes", "ok", "okay", "y",
+    "ship it", "do it", "looks good", "sounds good",
+})
+
+# "ok, but use postgres" is an answer that happens to start with "ok", not a
+# confirmation: a remainder opening with one of these words keeps
+# `is_confirmation` False.
+CONTRAST_WORDS = frozenset({"but", "except", "however", "though", "although", "unless", "only"})
+
+# "ok, merge" -> head "ok", rest "merge".
+_CLAUSE_RE = re.compile(r"^(?P<head>[^,;:!.?]+)[,;:!.?]+\s*(?P<rest>.+)$")
 
 PASTE_WORDS = 150
 PASTE_LINES = 12
@@ -131,6 +156,43 @@ def _control_command(message: str) -> Optional[str]:
     if m is not None and m.group(1).lower() in CONTROL_WORDS:
         return (m.group(1) + m.group(2)).strip()
     return None
+
+
+def _approval_form(message: str) -> str:
+    """The comparison form of a candidate approval: normalised, trailing punctuation gone."""
+    if not isinstance(message, str):
+        message = "" if message is None else str(message)
+    return _normalise(message).rstrip(_TRAILING_PUNCT + " ")
+
+
+def is_approval(message: str) -> bool:
+    """True when the whole message is one of APPROVE_WORDS ("LGTM!", "ship it").
+
+    Exact after normalisation and trailing-punctuation stripping, so any
+    added clause ("looks good but do X first", "ok, merge") is not an
+    approval; intake sends those to the classifier (revise plan) or treats
+    them as a confirmation, by state.
+    """
+    return _approval_form(message) in APPROVE_WORDS
+
+
+def is_confirmation(message: str) -> bool:
+    """True when the message confirms a task done: an approval, or an approval
+    word as the first clause with more after it ("ok, merge", spec section 7).
+
+    A remainder that opens with a contrast word ("ok, but use postgres") is
+    an answer, not a confirmation. Used only in state `awaiting_answer`.
+    """
+    if is_approval(message):
+        return True
+    m = _CLAUSE_RE.match(_approval_form(message))
+    if m is None:
+        return False
+    head = m.group("head").strip()
+    rest = m.group("rest").strip().split()
+    if head not in APPROVE_WORDS or not rest:
+        return False
+    return rest[0] not in CONTRAST_WORDS
 
 
 def _is_non_task(message: str) -> bool:

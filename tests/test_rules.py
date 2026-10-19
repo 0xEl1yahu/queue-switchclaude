@@ -161,3 +161,33 @@ def test_golden_undecided_cases_keep_their_text():
 def test_control_rule_requires_colon_slash_or_command_word(msg, label, control):
     v = rules.decide(msg)
     assert v.label == label and v.control == control
+
+
+# --- M2 Task 6: approval words ------------------------------------------------
+
+def test_is_approval_words():
+    assert rules.is_approval("LGTM!") and rules.is_approval("ship it") and not rules.is_approval("looks good but do X first")
+
+
+@pytest.mark.parametrize("msg", ["ok", "Okay.", "yes", "y", "go", "Go ahead", "approve", "approved", "do it", "looks good", "sounds good", "  LGTM  "])
+def test_is_approval_accepts_every_word(msg):
+    assert rules.is_approval(msg)
+
+
+@pytest.mark.parametrize("msg", ["ok, merge", "yes but use postgres", "go on", "continue", ".", "", "lgtm, and add logout"])
+def test_is_approval_is_exact(msg):
+    assert not rules.is_approval(msg)
+
+
+@pytest.mark.parametrize("msg,expected", [
+    ("ok, merge", True), ("ok", True), ("LGTM! merge it", True), ("yes: ship", True),
+    ("ok, but use postgres", False), ("ok, except the tests", False), ("yes, however keep sqlite", False),
+    ("use postgres", False), ("looks good but do X first", False), ("merge, ok", False),
+])
+def test_is_confirmation(msg, expected):
+    assert rules.is_confirmation(msg) is expected
+
+
+def test_approval_words_are_a_frozenset_including_the_non_task_words():
+    assert isinstance(rules.APPROVE_WORDS, frozenset)
+    assert {"ok", "okay", "yes", "y", "go"} <= rules.APPROVE_WORDS

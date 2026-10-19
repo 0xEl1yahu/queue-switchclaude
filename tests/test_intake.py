@@ -542,3 +542,242 @@ def test_dedupe_still_catches_held_marker_text_after_it_finished(data_dir):
         s.state = "idle"; s.running_task = None
     out = intake.handle(ev("later: email verification", prompt_id="pid-2"))
     assert "already p2 (done)" in out["systemMessage"] and store.load("s1").next_id == 3
+
+
+# --- M2 Task 6: the waiting states ------------------------------------------
+
+from qsc import dispatch, done, rules  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def waiting(state="awaiting_approval"):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        b = s.new_task("add login", ["p1"], "pid-1"); b.status = "planned"; s.get("p1").status = "done"
+        s.state = state; s.pending_task = "p2"; s.running_task = None
+    p = paths.plan_path("s1", "p2"); p.parent.mkdir(parents=True, exist_ok=True); p.write_text("# plan p2")
+
+
+def test_lgtm_approves_and_starts(data_dir):
+    waiting()
+    out = intake.handle(ev("lgtm", prompt_id="pid-2"))
+    assert "decision" not in out and "Execute the plan at" in out["hookSpecificOutput"]["additionalContext"]
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p2" and s.get("p2").status == "running"
+
+
+def test_ok_is_approval_only_when_waiting(data_dir):
+    waiting()
+    assert "Execute the plan" in intake.handle(ev("ok", prompt_id="pid-2"))["hookSpecificOutput"]["additionalContext"]   # review focus 4
+    assert intake.handle(ev("ok", prompt_id="pid-3")) is None      # now running: ok is a non-task again
+
+
+def test_revise_keeps_waiting(data_dir):
+    waiting()
+    out = intake.handle(ev("looks good but do the rate limiter before the endpoint", prompt_id="pid-2"), classifier=lambda p: dec(label="steer", note="revise plan"))
+    assert "revise the plan at" in out["hookSpecificOutput"]["additionalContext"]
+    s = store.load("s1"); assert s.state == "awaiting_approval" and s.get("p2").status == "planned"
+
+
+def test_g46_approve_plus_queue(data_dir):
+    waiting()
+    d = dec(label="split", parts=[part(label="steer", text="go", note="approve"), part(label="queue", text="add logout", depends_on=["p2"])])
+    out = intake.handle(ev("go, and once it's in add logout", prompt_id="pid-2"), classifier=lambda p: d)
+    s = store.load("s1"); assert s.get("p3").status == "queued" and s.get("p3").depends_on == ["p2"] and s.state == "running" and s.running_task == "p2"
+    assert "Execute the plan" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_unrelated_prompt_defers_approval(data_dir):
+    waiting()
+    out = intake.handle(ev("what time zone does the server use?", prompt_id="pid-2"), classifier=lambda p: dec(label="steer"))
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p3" and s.get("p2").status == "planned" and s.pending_task is None   # review focus 1
+
+
+def test_answer_resumes_running_task(data_dir):
+    waiting("awaiting_answer")
+    with store.locked("s1") as s: s.get("p2").status = "running"
+    assert intake.handle(ev("use postgres", prompt_id="pid-2")) is None
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p2" and s.next_id == 3
+
+
+def test_confirmation_closes_task_and_plans_next(data_dir):
+    waiting("awaiting_answer")
+    with store.locked("s1") as s:
+        s.get("p2").status = "running"; s.new_task("add logout", ["p2"], "pid-1")
+    out = intake.handle(ev("ok, merge", prompt_id="pid-2"))
+    s = store.load("s1")
+    assert s.get("p2").status == "done" and s.get("p2").verdict == "confirmed" and paths.handoff_path("s1", "p2").exists()
+    assert "Write a short plan for p3" in out["hookSpecificOutput"]["additionalContext"] and s.state == "planning"
+
+
+# --- additional Task 6 tests beyond the plan ---------------------------------
+
+def test_approval_never_calls_classifier_and_logs(data_dir):
+    waiting()
+    called = []
+    out = intake.handle(ev("ship it!", prompt_id="pid-2"), classifier=lambda p: called.append(p))
+    assert called == [] and "Execute the plan" in out["hookSpecificOutput"]["additionalContext"]
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["decision"] == "approve" and row["task"] == "p2"
+    s = store.load("s1"); assert s.current_prompt_id == "pid-2" and s.pending_task is None
+
+
+def test_classifier_approve_note_approves(data_dir):
+    waiting()
+    seen = {}
+    def clf(p): seen.update(p); return dec(label="steer", note="approve")
+    out = intake.handle(ev("yeah do that", prompt_id="pid-2"), classifier=clf)
+    assert "Execute the plan" in out["hookSpecificOutput"]["additionalContext"]
+    # The classifier saw the waiting state and the pending task as the current one (context E).
+    assert seen["state"] == "awaiting_approval" and seen["running_task"]["id"] == "p2"
+    assert store.load("s1").state == "running"
+
+
+def test_low_confidence_approve_note_defers(data_dir):
+    waiting()
+    intake.handle(ev("yeah do that", prompt_id="pid-2"), classifier=lambda p: dec(label="steer", note="approve", confidence=0.5))
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p3" and s.get("p2").status == "planned"
+
+
+def test_revise_passes_message_and_names_plan_path(data_dir):
+    waiting()
+    out = intake.handle(ev("looks good but do the rate limiter before the endpoint", prompt_id="pid-2"), classifier=lambda p: dec(label="steer", note="revise plan"))
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "decision" not in out and str(paths.plan_path("s1", "p2")) in ctx and ctx.startswith("queue-switchclaude:")
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["decision"] == "revise"
+    # A Stop after the revised plan is presented changes nothing: the plan still waits.
+    assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": "Revised plan presented."}) is None
+    assert store.load("s1").state == "awaiting_approval"
+
+
+def test_queue_marker_while_awaiting_approval_queues_after_pending(data_dir):
+    waiting()
+    out = intake.handle(ev("later: add logout", prompt_id="pid-2"))
+    assert out["decision"] == "block" and "queued p3 after p2" in out["systemMessage"]
+    s = store.load("s1"); assert s.state == "awaiting_approval" and s.pending_task == "p2" and s.get("p3").depends_on == ["p2"]
+    # The held text coming back is a duplicate, not a second task.
+    assert "already p3" in intake.handle(ev("later: add logout", prompt_id="pid-3"))["systemMessage"]
+
+
+def test_stop_while_waiting_blocks_without_setting_the_flag(data_dir):
+    waiting()
+    out = intake.handle(ev("stop", prompt_id="pid-2"))
+    assert out["decision"] == "block" and "p2" in out["systemMessage"]
+    s = store.load("s1"); assert s.interrupt is False and s.state == "awaiting_approval" and s.get("p2").status == "planned"
+
+
+def test_harness_traffic_and_slash_commands_pass_while_waiting(data_dir):
+    waiting("awaiting_answer")
+    with store.locked("s1") as s: s.get("p2").status = "running"
+    assert intake.handle(ev("<system-reminder>ok</system-reminder>", prompt_id="pid-2")) is None
+    assert intake.handle(ev("/compact", prompt_id="pid-2")) is None
+    s = store.load("s1"); assert s.state == "awaiting_answer" and s.pending_task == "p2" and s.next_id == 3
+
+
+def test_non_approval_non_task_passes_while_awaiting_approval(data_dir):
+    waiting()
+    assert intake.handle(ev("continue", prompt_id="pid-2")) is None
+    s = store.load("s1"); assert s.state == "awaiting_approval" and s.next_id == 3
+
+
+def test_control_approve_hands_over_execution(data_dir):
+    waiting()
+    out = intake.handle(ev("queue: approve", prompt_id="pid-2"))
+    assert "decision" not in out
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "approved p2" in ctx and "Execute the plan at" in ctx
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p2" and s.get("p2").status == "running"
+
+
+def test_control_show_names_the_plan_file(data_dir):
+    waiting()
+    out = intake.handle(ev("queue: show p2", prompt_id="pid-2"))
+    assert str(paths.plan_path("s1", "p2")) in out["systemMessage"] and store.load("s1").state == "awaiting_approval"
+
+
+def test_control_list_marks_awaiting_approval(data_dir):
+    waiting()
+    assert "p2 planned (awaiting approval)" in intake.handle(ev("queue: list", prompt_id="pid-2"))["systemMessage"]
+
+
+def test_deferred_approval_is_represented_after_the_turn(data_dir, monkeypatch):
+    waiting()
+    with store.locked("s1") as s: s.get("p2").plan_based_on = ["p1"]        # as dispatch records it: p1 was done when the plan was written
+    intake.handle(ev("what time zone does the server use?", prompt_id="pid-2"), classifier=lambda p: dec(label="steer"))
+    monkeypatch.setattr(done, "judge", lambda *a, **k: done.Verdict("done", "r"))
+    out = dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": "UTC.", "cwd": str(ROOT)})
+    assert "p2" in out["hookSpecificOutput"]["additionalContext"] and "waiting for your approval" in out["hookSpecificOutput"]["additionalContext"]
+    s = store.load("s1"); assert s.state == "awaiting_approval" and s.pending_task == "p2" and s.get("p3").status == "done"
+    assert "Execute the plan" in intake.handle(ev("lgtm", prompt_id="pid-3"))["hookSpecificOutput"]["additionalContext"]
+
+
+def test_answer_with_but_clause_is_an_answer_not_a_confirmation(data_dir):
+    waiting("awaiting_answer")
+    with store.locked("s1") as s: s.get("p2").status = "running"
+    assert intake.handle(ev("ok, but use postgres", prompt_id="pid-2")) is None
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p2" and s.get("p2").status == "running"
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["decision"] == "answer" and row["task"] == "p2"
+
+
+def test_answer_sets_prompt_id_so_later_messages_are_mid_turn(data_dir):
+    waiting("awaiting_answer")
+    with store.locked("s1") as s: s.get("p2").status = "running"
+    intake.handle(ev("use postgres", prompt_id="pid-2"))
+    out = intake.handle(ev("later: add logout", prompt_id="pid-2"))
+    assert "queued p3 after p2" in out["systemMessage"] and store.load("s1").state == "running"
+
+
+def test_confirmation_without_next_task_starts_a_turn_with_notice(data_dir):
+    waiting("awaiting_answer")
+    with store.locked("s1") as s: s.get("p2").status = "running"
+    out = intake.handle(ev("ok", prompt_id="pid-2"))
+    assert "decision" not in out and "p2 confirmed done" in out["hookSpecificOutput"]["additionalContext"]
+    s = store.load("s1")
+    assert s.get("p2").status == "done" and s.get("p2").verdict == "confirmed" and s.state == "running" and s.running_task == "p3"
+    assert "- user confirmed" not in paths.handoff_path("s1", "p2").read_text() and "confirmed: user confirmed" in paths.handoff_path("s1", "p2").read_text()
+
+
+def test_queue_marker_while_awaiting_answer_queues_and_keeps_waiting(data_dir):
+    waiting("awaiting_answer")
+    with store.locked("s1") as s: s.get("p2").status = "running"
+    out = intake.handle(ev("later: add logout", prompt_id="pid-2"))
+    assert "queued p3 after p2" in out["systemMessage"]
+    s = store.load("s1"); assert s.state == "awaiting_answer" and s.pending_task == "p2"
+
+
+def test_waiting_state_without_pending_task_fails_open_to_a_new_turn(data_dir):
+    waiting()
+    with store.locked("s1") as s: s.pending_task = None
+    assert intake.handle(ev("add logout", prompt_id="pid-2")) is None
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p3"
+
+
+def test_split_queue_only_while_waiting_blocks_and_keeps_waiting(data_dir):
+    waiting()
+    d = dec(label="split", parts=[part(label="queue", text="add logout", depends_on=["p2"]), part(label="queue", text="add profile", depends_on=["p3"])])
+    out = intake.handle(ev("1) add logout 2) add profile", prompt_id="pid-2"), classifier=lambda p: d)
+    assert out["decision"] == "block" and "queued p4 after p3" in out["systemMessage"]
+    s = store.load("s1"); assert s.state == "awaiting_approval" and s.get("p2").status == "planned"
+
+
+def test_queue_marker_during_planning_turn_is_mid_turn(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; b = s.new_task("add login", ["p1"], "pid-1")
+        s.state = "planning"; s.pending_task = "p2"; s.running_task = None
+    out = intake.handle(ev("later: add logout"))                      # same prompt_id: the planning continuation
+    assert "queued p3 after p2" in out["systemMessage"]
+    s = store.load("s1"); assert s.state == "planning" and s.pending_task == "p2" and s.get("p2").status == "queued"
+
+
+def test_new_turn_during_planning_clears_pending_without_esc_drop(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.new_task("add login", ["p1"], "pid-1"); s.new_task("add logout", ["p2"], "pid-1")
+        s.state = "planning"; s.pending_task = "p2"; s.running_task = None
+    assert intake.handle(ev("something else", prompt_id="pid-2")) is None
+    s = store.load("s1")
+    assert s.state == "running" and s.running_task == "p4" and s.pending_task is None
+    assert s.get("p2").status == "queued" and s.get("p3").status == "queued"
