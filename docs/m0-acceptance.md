@@ -63,3 +63,32 @@ Observed:
 2. **Shadow mode does not record the would-be queue.** The log has the intake decision, but dispatch cannot log what it would dispatch. A fix would be to record the task in shadow mode under a status that dispatch logs but never runs, such as `shadow_queued`.
 3. **Classifier latency is enough to miss a steer.** At 3.4 s, a steer typed early in a short turn reaches the model after the work it was meant to shape, as with `add` → `add_two` in C. It still landed and was acted on.
 4. **Test noise (not a plugin defect).** The plugin is also installed in the operator's own Claude Code session (`queue-switchclaude-inline`), so that session wrote its own store and log during the test. It caused no interference, because each session has its own files.
+
+## Re-run after the fixes, 2026-10-19
+
+Commit `ee88422` (blocks carry `systemMessage` and `suppressOriginalPrompt`; shadow mode records `shadow_queued` / `shadow_dispatched`). Same method: Claude Code 2.1.302, Opus 5.5, auto permission mode, `--plugin-dir`, tmux in `/tmp/qsc-demo`, the `later:` message sent 2.0 s after the first prompt, timestamps in UTC.
+
+| Scenario | Result | Intake delay |
+|---|---|---|
+| A, queue then dispatch | Pass. Block message now visible. Held text still returns to the input box. | 73 ms (rule `queue_marker`) |
+| D, shadow mode | Pass. `dispatch next: p2, shadow: true`; store `p2 shadow_dispatched`. | 74 ms (rule `queue_marker`) |
+
+### Scenario A
+
+- 1.5 s after the send, the screen showed `queue-switchclaude: queued p2 after p1: add a goodbye.py that prints goodbye` above the input box (the `systemMessage`). It stayed while the turn ran and was gone once the turn ended.
+- No `Original prompt: …` line appeared at any capture (`suppressOriginalPrompt` works).
+- The held text was back in the input box at 1.5 s and still there at 25 s, after the turn had ended. Pressing Enter would resubmit it as a new turn, which intake would register as a fresh running task. Issue 1 is therefore half fixed: the user now sees the confirmation, but the input box is not cleared. A classic hook cannot clear it. M1 candidates: a dedupe rule in intake (a new-turn prompt identical to a task queued or done in the last few minutes is dropped with a notice), and the `/queue` command as the confirmation channel.
+- Dispatch: `Ran 2 stop hooks` → `Stop hook feedback: … Do it now: add a goodbye.py that prints goodbye` → `goodbye.py` created and run with no further input. Store `p1 done`, `p2 done (depends_on p1)`, log `intake new_turn p1` → `intake queue (queue_marker)` → `dispatch next p2` → `dispatch next null`.
+- Delay: sent 08:46:14.698, logged 08:46:14.771.
+
+### Scenario D
+
+- Shadow mode set by editing `pluginConfigs."queue-switchclaude@inline".options.shadow` to `true` and restarting the session (restored to `false` afterwards).
+- Nothing was blocked. Claude Code's own mid-turn queueing took over: the screen showed `ctrl+x ctrl+s to send now` and `Press up to edit queued messages`, then delivered the message into the running turn, and Claude wrote both files in that turn. Stock behaviour, as in the first run.
+- Log: `intake queue, shadow: true` → `dispatch next: p2, shadow: true`. Store: `p1 done`, `p2 shadow_dispatched (depends_on p1)`. Issue 2 is fixed.
+- Delay: sent 08:47:43.089, logged 08:47:43.163.
+
+### Still open from the first run
+
+- Issue 1, second half: held text returns to the input box (above).
+- Issue 3: classifier latency (3.4 s in scenario C) is unchanged; not re-run.
