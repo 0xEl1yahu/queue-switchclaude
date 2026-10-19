@@ -41,7 +41,7 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import done, gc, log, paths, store
+from . import done, gc, hookio, log, paths, store
 from .interrupt import reset_after_interrupt
 
 PREFIX = "queue-switchclaude"
@@ -66,6 +66,11 @@ _WAITING = ("awaiting_approval", "awaiting_answer")
 
 
 # --- envelopes and handover texts --------------------------------------------
+
+
+def _record(session_id: str, event_name: str, **fields) -> None:
+    """``log.record`` plus ``hook_ms``, the time since the hook parsed its event."""
+    log.record(session_id, event_name, hook_ms=hookio.hook_ms(), **fields)
 
 
 def handback(text: str, system_message: str | None = None) -> dict:
@@ -227,9 +232,9 @@ def write_handoff(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
     except OSError as exc:
-        log.record(s.session_id, "handoff_write_failed", task=task.id, path=str(path),
+        _record(s.session_id, "handoff_write_failed", task=task.id, path=str(path),
                    error=f"{type(exc).__name__}: {exc}")
-    log.record(s.session_id, "handoff", task=task.id, verdict=verdict.verdict,
+    _record(s.session_id, "handoff", task=task.id, verdict=verdict.verdict,
                reason=verdict.reason, path=str(path))
     return path
 
@@ -268,14 +273,14 @@ def _close_running(
     if shadow:
         # Observe only: the verdict is filed and logged, never acted on
         # (no handback, no wait for an answer).
-        log.record(sid, "shadow_verdict", task=running.id, verdict=verdict.verdict,
+        _record(sid, "shadow_verdict", task=running.id, verdict=verdict.verdict,
                    reason=verdict.reason, shadow=True)
         write_handoff(s, running, verdict, closing)
         return None, True
 
     if verdict.verdict in ("verify_failed", "not_done") and running.attempts < MAX_ATTEMPTS:
         running.attempts += 1
-        log.record(sid, "dispatch", task=running.id, verdict=verdict.verdict,
+        _record(sid, "dispatch", task=running.id, verdict=verdict.verdict,
                    reason=verdict.reason, handback=True, attempts=running.attempts, next=None)
         if verdict.verdict == "verify_failed":
             return handback(_verify_failed_text(running, verdict)), False
@@ -288,7 +293,7 @@ def _close_running(
         s.state = "awaiting_answer"
         s.pending_task = running.id
         s.running_task = None
-        log.record(sid, "dispatch", task=running.id, verdict="asked_question",
+        _record(sid, "dispatch", task=running.id, verdict="asked_question",
                    reason=verdict.reason, next=None, waiting="awaiting_answer")
         return None, False
 
@@ -300,7 +305,7 @@ def _close_running(
         running.closing = closing
         s.running_task = None
         s.state = "idle"
-        log.record(sid, "dispatch", task=running.id, verdict="verify_failed", reason=verdict.reason,
+        _record(sid, "dispatch", task=running.id, verdict="verify_failed", reason=verdict.reason,
                    failed_verify=True, next=None)
         return {"systemMessage": _failed_verify_message(running)}, True
     if verdict.verdict == "not_done":
@@ -352,14 +357,14 @@ def _after_planning(s: store.Store) -> tuple[dict | None, bool]:
     sid = s.session_id
     task = s.get(s.pending_task) if s.pending_task else None
     if task is None:
-        log.record(sid, "plan_failed", task=s.pending_task, reason="no pending task")
+        _record(sid, "plan_failed", task=s.pending_task, reason="no pending task")
         return None, True
     if task.status != "queued":
         # The user cancelled, parked or dropped the task while Claude was
         # writing its plan (control works in every state). It must not come
         # back as ``planned``, so the plan file is ignored and ``choose_next``
         # moves on.
-        log.record(sid, "plan_failed", task=task.id, reason=f"pending task is {task.status}")
+        _record(sid, "plan_failed", task=task.id, reason=f"pending task is {task.status}")
         return None, True
 
     if _plan_written(s, task):
@@ -368,22 +373,22 @@ def _after_planning(s: store.Store) -> tuple[dict | None, bool]:
         task.attempts = 0
         if task.auto and s.continuations >= MAX_CONTINUATIONS:
             s.state = "awaiting_approval"
-            log.record(sid, "dispatch", planned=task.id, auto=True, next=None,
+            _record(sid, "dispatch", planned=task.id, auto=True, next=None,
                        continuation_budget=s.continuations)
             return {"systemMessage": _budget_message(s.continuations)}, False
         if task.auto:
             # Review focus 5: no approval stop; plan and execution in one
             # continuation.
             text = start(s, task)
-            log.record(sid, "dispatch", planned=task.id, auto=True, next=task.id)
+            _record(sid, "dispatch", planned=task.id, auto=True, next=task.id)
             return handback(text), False
         s.state = "awaiting_approval"
-        log.record(sid, "dispatch", planned=task.id, auto=False, next=None)
+        _record(sid, "dispatch", planned=task.id, auto=False, next=None)
         return None, False
 
     task.attempts += 1
     if task.attempts < MAX_ATTEMPTS:
-        log.record(sid, "dispatch", next=task.id, plan_retry=task.attempts)
+        _record(sid, "dispatch", next=task.id, plan_retry=task.attempts)
         return handback(_planning_text(s, task)), False
 
     # Review focus 2: Claude stopped twice without a plan (asked something,
@@ -393,7 +398,7 @@ def _after_planning(s: store.Store) -> tuple[dict | None, bool]:
     task.attempts = 0
     s.state = "idle"
     s.pending_task = None
-    log.record(sid, "plan_failed", task=task.id, attempts=MAX_ATTEMPTS)
+    _record(sid, "plan_failed", task=task.id, attempts=MAX_ATTEMPTS)
     return None, False
 
 
@@ -448,7 +453,7 @@ def _replan_stale(s: store.Store) -> None:
         t.attempts = 0
         with contextlib.suppress(OSError):
             paths.plan_path(s.session_id, t.id).unlink()
-        log.record(s.session_id, "replan", task=t.id)
+        _record(s.session_id, "replan", task=t.id)
 
 
 def choose_next(s: store.Store, stop_hook_active: bool = False, shadow: bool = False) -> str | None:
@@ -470,7 +475,7 @@ def choose_next(s: store.Store, stop_hook_active: bool = False, shadow: bool = F
     if s.paused:
         # `queue: pause`: the running task still closed, but nothing is
         # handed over (real or shadow) until `queue: resume`.
-        log.record(sid, "dispatch", next=None, shadow=shadow, paused=True)
+        _record(sid, "dispatch", next=None, shadow=shadow, paused=True)
         return None
 
     if shadow:
@@ -478,7 +483,7 @@ def choose_next(s: store.Store, stop_hook_active: bool = False, shadow: bool = F
         would = _shadow_ready(s)
         if would:
             would[0].status = SHADOW_DISPATCHED
-        log.record(sid, "dispatch", next=would[0].id if would else None, shadow=True)
+        _record(sid, "dispatch", next=would[0].id if would else None, shadow=True)
         return None
 
     planned = _planned_ready(s)
@@ -488,22 +493,22 @@ def choose_next(s: store.Store, stop_hook_active: bool = False, shadow: bool = F
         task = planned[0]
         s.state = "awaiting_approval"
         s.pending_task = task.id
-        log.record(sid, "dispatch", next=task.id, shadow=False, represent=True)
+        _record(sid, "dispatch", next=task.id, shadow=False, represent=True)
         return _represent_text(s, task)
 
     ready = s.ready()
     if not ready:
-        log.record(sid, "dispatch", next=None, shadow=shadow)
+        _record(sid, "dispatch", next=None, shadow=shadow)
         return None
     nxt = ready[0]
 
     # The spin guard lives in ``handle`` (``_issue``): it compares the text
     # about to go out with the last one, which is what a spin repeats.
     if s.continuations >= MAX_CONTINUATIONS:
-        log.record(sid, "dispatch", next=nxt.id, shadow=shadow, continuation_budget=s.continuations)
+        _record(sid, "dispatch", next=nxt.id, shadow=shadow, continuation_budget=s.continuations)
         return None
 
-    log.record(sid, "dispatch", next=nxt.id, shadow=shadow)
+    _record(sid, "dispatch", next=nxt.id, shadow=shadow)
     s.state = "planning"
     s.pending_task = nxt.id
     return _planning_text(s, nxt)
@@ -528,10 +533,10 @@ def _maybe_gc(s: store.Store) -> None:
     try:
         deleted = list(gc.collect(protect={s.session_id}))
     except Exception as exc:
-        log.record(s.session_id, "gc", error=f"{type(exc).__name__}: {exc}")
+        _record(s.session_id, "gc", error=f"{type(exc).__name__}: {exc}")
         return
     if deleted:
-        log.record(s.session_id, "gc", deleted=deleted)
+        _record(s.session_id, "gc", deleted=deleted)
 
 
 # --- entry point -------------------------------------------------------------
@@ -556,7 +561,7 @@ def _issue(s: store.Store, out: dict | None, stop_hook_active: bool) -> dict | N
         return out
     digest = _digest(text)
     if stop_hook_active and digest == s.last_handback:
-        log.record(s.session_id, "dispatch", next=s.pending_task or s.running_task, spin_guard=True)
+        _record(s.session_id, "dispatch", next=s.pending_task or s.running_task, spin_guard=True)
         return {"systemMessage": SPIN_GUARD_MESSAGE}
     s.last_handback = digest
     return out
@@ -564,6 +569,7 @@ def _issue(s: store.Store, out: dict | None, stop_hook_active: bool) -> dict | N
 
 def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | None:
     """Run the stages that apply to the store's state; return the Stop output."""
+    hookio.start_clock(event)
     session_id = event.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return None
@@ -579,7 +585,7 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
             # set; the turn is ending now, so apply the same reset and dispatch
             # nothing.
             task_id, _dropped = reset_after_interrupt(s)
-            log.record(session_id, "interrupt", task=task_id, via=event.get("hook_event_name"))
+            _record(session_id, "interrupt", task=task_id, via=event.get("hook_event_name"))
             return None
 
         extra: dict | None = None
@@ -590,7 +596,7 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
         elif s.state in _WAITING:
             # The user's turn ran something else, or nothing changed; the
             # pending plan or question is still waiting on the user.
-            log.record(session_id, "dispatch", next=None, waiting=s.state)
+            _record(session_id, "dispatch", next=None, waiting=s.state)
             return None
         elif s.state == "running" or s.running_task:
             running = s.get(s.running_task) if s.running_task else None

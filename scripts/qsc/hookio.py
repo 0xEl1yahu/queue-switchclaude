@@ -9,8 +9,14 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 _TRUTHY = {"1", "true", "yes"}
+
+# ``time.monotonic()`` when the running hook parsed its event (M3 Task 5):
+# ``read_event`` stamps it on the event as ``_hook_started`` and ``start_clock``
+# copies it here so every log line of the hook can carry ``hook_ms``.
+_started: float | None = None
 
 
 def read_event(expected: str | tuple[str, ...]) -> dict | None:
@@ -18,8 +24,10 @@ def read_event(expected: str | tuple[str, ...]) -> dict | None:
 
     Returns None when stdin is empty, not JSON, not a dict, or when the
     payload's hook_event_name is not `expected` (a name, or any of a tuple
-    of names).
+    of names). The parsed event is stamped with ``_hook_started`` (a
+    ``time.monotonic()`` value) so intake and dispatch can log ``hook_ms``.
     """
+    started = time.monotonic()
     try:
         raw = sys.stdin.read()
     except Exception:
@@ -39,7 +47,29 @@ def read_event(expected: str | tuple[str, ...]) -> dict | None:
         accepted = tuple(expected)
     if name not in accepted:
         return None
+    event["_hook_started"] = started
     return event
+
+
+def start_clock(event: object) -> None:
+    """Remember the event's ``_hook_started`` stamp for ``hook_ms``.
+
+    Called at the top of ``intake.handle`` and ``dispatch.handle``. An event
+    built by hand (unit tests) has no stamp, so ``hook_ms`` reads 0.
+    """
+    global _started
+    value = event.get("_hook_started") if isinstance(event, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _started = None
+    else:
+        _started = float(value)
+
+
+def hook_ms() -> int:
+    """Milliseconds since the running hook parsed its event; 0 without a stamp."""
+    if _started is None:
+        return 0
+    return max(0, round((time.monotonic() - _started) * 1000))
 
 
 def emit(obj: dict | None) -> None:

@@ -120,6 +120,11 @@ SHADOW_QUEUED = "shadow_queued"
 _UNHANDLED = object()
 
 
+def _record(session_id: str, event_name: str, **fields) -> None:
+    """``log.record`` plus ``hook_ms``, the time since the hook parsed its event."""
+    log.record(session_id, event_name, hook_ms=hookio.hook_ms(), **fields)
+
+
 def _block(reason: str) -> dict:
     """A UserPromptSubmit block the user can actually see.
 
@@ -265,7 +270,7 @@ def _new_turn(
     t.status = "running"
     s.running_task = t.id
 
-    log.record(
+    _record(
         s.session_id, "intake",
         decision="new_turn",
         task=t.id,
@@ -506,6 +511,7 @@ def _part_label(p: classify.Part) -> str:
 
 def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = False) -> dict | None:
     """Sort one UserPromptSubmit event. Returns the hook output or None to pass through."""
+    hookio.start_clock(event)
     prompt = event.get("prompt")
     if not isinstance(prompt, str):
         return None
@@ -557,7 +563,7 @@ def _control(s: store.Store, v: rules.Verdict, prompt: str, prompt_id: str | Non
         and s.running_task is not None
         and s.running_task == before_pending
     )
-    log.record(
+    _record(
         s.session_id, "intake",
         decision="control",
         message=prompt,
@@ -596,7 +602,7 @@ def _turn(
 
     dup = _find_duplicate(s, v, mid_turn)
     if dup is not None:
-        log.record(
+        _record(
             s.session_id, "intake",
             decision="dedupe",
             task=dup.id,
@@ -661,7 +667,7 @@ def _idle_turn(
     sid = s.session_id
 
     if v.label == "interrupt":
-        log.record(sid, "intake", decision="noop", state="idle", message=prompt, rule=v.rule,
+        _record(sid, "intake", decision="noop", state="idle", message=prompt, rule=v.rule,
                    rule_label=v.label, label="interrupt", shadow=shadow, prompt_id=prompt_id)
         if shadow:
             return _new_turn(s, event, prompt, prompt_id)
@@ -669,7 +675,7 @@ def _idle_turn(
 
     if v.label == "queue" and v.parked:
         confirmation = _queue(s, v.text, [], prompt_id, parked=True, shadow=shadow)
-        log.record(sid, "intake", decision="parked_idle", state="idle", task=s.tasks[-1].id,
+        _record(sid, "intake", decision="parked_idle", state="idle", task=s.tasks[-1].id,
                    message=prompt, rule=v.rule, rule_label=v.label, label="queue", parked=True,
                    shadow=shadow, prompt_id=prompt_id)
         if shadow:
@@ -754,7 +760,7 @@ def _mid_turn(
         output, label, target_id = _split(s, decision, prompt_id, shadow)
 
     logged = decision if decision is not None else compared
-    log.record(
+    _record(
         session_id, "intake",
         message=prompt,
         rule=v.rule,
@@ -872,7 +878,7 @@ def _log_waiting(
     target: str | None = None,
     **extra,
 ) -> None:
-    log.record(
+    _record(
         s.session_id, "intake",
         decision=decision,
         state=state,
@@ -907,7 +913,7 @@ def _waiting(
         # Fail open: the store does not describe a real wait (the planned
         # task was cancelled, the file was edited by hand). Back to idle and
         # the message is an ordinary turn.
-        log.record(s.session_id, "intake", decision="waiting_reset", state=s.state,
+        _record(s.session_id, "intake", decision="waiting_reset", state=s.state,
                    task=s.pending_task, prompt_id=prompt_id)
         s.state = "idle"
         s.pending_task = None

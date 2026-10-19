@@ -9,17 +9,27 @@ else ``~/.claude/queue-switchclaude``) and prints:
   with the ``shadow_compare`` option on, M1 Task 10)
 - the mean wall-clock latency of the ``claude -p`` call where ``latency_ms`` is logged
 - the ten most recent disagreements with their message text
+- hook latency (M3): p50 and p95 of ``hook_ms`` (the time from the hook
+  parsing its event to the log line) for ``intake`` and ``dispatch`` lines,
+  split by whether a model call was made, with the classifier's own
+  ``latency_ms`` percentiles alongside
+- a count of every intake ``decision`` value (``new_turn``, ``control``,
+  ``dedupe``, ``approve``, ``revise``, ``defer_approval``, ``answer``,
+  ``confirm``, ``parked_idle``, ``noop``, ...)
 
 Usage: ``python3 eval/shadow_report.py [--since 7d]`` (``s``, ``m``, ``h``, ``d``, ``w``).
 
-Stdlib only. A log line that is not JSON, or not an intake decision, is skipped.
+Stdlib only. A log line that is not JSON, or not a dict with an ``event``,
+is skipped; the rule-vs-model sections use only intake decision lines.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,6 +40,8 @@ from qsc import paths  # noqa: E402
 
 RECENT = 10
 TEXT_WIDTH = 80
+LATENCY_EVENTS = ("intake", "dispatch")
+PERCENTILES = (50, 95)
 
 _SINCE_RE = re.compile(r"^(\d+)\s*([smhdw])$")
 _SINCE_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
@@ -111,7 +123,7 @@ def is_disagreement(row: dict) -> bool:
 
 
 def load_rows(log_dir: Path, since: timedelta | None) -> tuple[list[dict], int]:
-    """All intake decision rows under ``log_dir``, newest first, plus the file count.
+    """All log rows with an ``event`` under ``log_dir``, newest first, plus the file count.
 
     With ``since``, rows older than now - since (or without a readable ``ts``)
     are left out.
@@ -130,7 +142,7 @@ def load_rows(log_dir: Path, since: timedelta | None) -> tuple[list[dict], int]:
                 row = json.loads(line)
             except ValueError:
                 continue
-            if not isinstance(row, dict) or not is_decision(row):
+            if not isinstance(row, dict) or not isinstance(row.get("event"), str):
                 continue
             ts = parse_ts(row.get("ts"))
             if cutoff is not None and (ts is None or ts < cutoff):
@@ -152,6 +164,69 @@ def mean_latency(rows: list[dict]) -> tuple[float | None, int]:
     return sum(values) / len(values), len(values)
 
 
+def _number(value: object) -> float | None:
+    """A logged number as float; ``None`` for anything else (bools included)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def percentile(values: list[float], p: int) -> float | None:
+    """Nearest-rank percentile: the value at rank ceil(p/100 * n). ``None`` when empty."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil(p / 100.0 * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+def model_called(row: dict) -> bool:
+    """Whether the line records a model call: a classifier answer or a timed call."""
+    return isinstance(row.get("classifier"), dict) or _number(row.get("latency_ms")) is not None
+
+
+def _pct_text(values: list[float]) -> str:
+    if not values:
+        return "p50 n/a  p95 n/a"
+    return "  ".join(f"p{p} {round(percentile(values, p))} ms" for p in PERCENTILES)
+
+
+def latency_lines(rows: list[dict]) -> list[str]:
+    """The ``hook latency`` section: p50/p95 of ``hook_ms`` per event, split by model call.
+
+    Lines without ``hook_ms`` (M0 to M2 logs) are left out rather than counted as 0.
+    """
+    lines = ["hook latency (hook_ms from parsing the event to the log line):"]
+    for event in LATENCY_EVENTS:
+        for with_model in (False, True):
+            group = [r for r in rows if r.get("event") == event and model_called(r) is with_model]
+            hook = [v for v in (_number(r.get("hook_ms")) for r in group) if v is not None]
+            label = "model called" if with_model else "no model call"
+            text = f"  {event} {_pct_text(hook)}  ({len(hook)} line(s), {label}"
+            if with_model:
+                clf = [v for v in (_number(r.get("latency_ms")) for r in group) if v is not None]
+                text += f"; classifier {_pct_text(clf)}"
+            lines.append(text + ")")
+    return lines
+
+
+def decision_lines(rows: list[dict]) -> list[str]:
+    """The ``decisions`` section: how many intake lines carry each ``decision`` value.
+
+    An intake line without the field (a mid-turn sort) counts as ``(none)``.
+    """
+    counts: Counter = Counter()
+    for row in rows:
+        if row.get("event") != "intake":
+            continue
+        decision = row.get("decision")
+        counts[decision if isinstance(decision, str) and decision else "(none)"] += 1
+    lines = [f"decisions ({sum(counts.values())} intake line(s)):"]
+    for name, n in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        lines.append(f"  {name}: {n}")
+    return lines
+
+
 def message_text(row: dict) -> str:
     text = row.get("message")
     if not isinstance(text, str) or not text.strip():
@@ -164,10 +239,14 @@ def pct(part: int, whole: int) -> str:
     return f"{100.0 * part / whole:.0f}%" if whole else "n/a"
 
 
-def report(rows: list[dict], files: int, since_text: str | None) -> str:
+def report(all_rows: list[dict], files: int, since_text: str | None) -> str:
     window = f" since {since_text}" if since_text else ""
+    rows = [r for r in all_rows if is_decision(r)]
     if not rows:
-        return f"shadow report: no intake decisions found in {files} log file(s){window}\n"
+        lines = [f"shadow report: no intake decisions found in {files} log file(s){window}"]
+        if all_rows:
+            lines += latency_lines(all_rows) + decision_lines(all_rows)
+        return "\n".join(lines) + "\n"
     total = len(rows)
     by_rule = sum(1 for r in rows if decided_by(r) == "rule")
     by_model = total - by_rule
@@ -191,6 +270,7 @@ def report(rows: list[dict], files: int, since_text: str | None) -> str:
         for row in disagreements[:RECENT]:
             ts = row.get("ts") if isinstance(row.get("ts"), str) else "?"
             lines.append(f"  {ts}  rule={rule_label(row)}  model={model_label(row)}  {message_text(row)}")
+    lines += latency_lines(all_rows) + decision_lines(all_rows)
     return "\n".join(lines) + "\n"
 
 
