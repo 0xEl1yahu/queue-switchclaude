@@ -16,3 +16,25 @@ def test_session_id_cannot_escape_data_dir(data_dir):
     p = paths.store_path("../evil")
     assert p.parent == data_dir / "sessions" and p.name == "___evil.json"
     assert paths.log_path("a b/c").name == "a_b_c.jsonl"
+
+
+# M2 Task 2: per-session directory for plans and handoffs. Spec §4.3 wrote
+# `plans/pN.md`; they live under the plugin data dir, not the user's
+# repository, so the working tree stays clean.
+
+def test_plan_and_handoff_paths(data_dir):
+    assert paths.plan_path("s1", "p2") == data_dir / "sessions" / "s1" / "plans" / "p2.md"
+    assert paths.handoff_path("s1", "p2") == data_dir / "sessions" / "s1" / "handoffs" / "p2.md"
+    assert paths.plan_path("../x", "p1").parent.parent.name == "___x"
+
+
+def test_session_dir(data_dir):
+    assert paths.session_dir("s1") == data_dir / "sessions" / "s1"
+    assert paths.session_dir("a b/c") == data_dir / "sessions" / "a_b_c"
+
+
+def test_task_id_cannot_escape_session_dir(data_dir):
+    p = paths.plan_path("s1", "../../evil")
+    assert p.parent == data_dir / "sessions" / "s1" / "plans" and p.name == "______evil.md"
+    h = paths.handoff_path("s1", "a/b")
+    assert h.parent == data_dir / "sessions" / "s1" / "handoffs" and h.name == "a_b.md"
