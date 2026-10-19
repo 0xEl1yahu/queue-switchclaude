@@ -43,7 +43,7 @@ def test_hooks_json_registers_exactly_three_events():
 def test_plugin_manifest_declares_shadow():
     m = json.load(open(ROOT / ".claude-plugin" / "plugin.json"))
     assert m["name"] == "queue-switchclaude" and m["userConfig"]["shadow"]["type"] == "boolean"
-    assert m["version"] == "0.3.0"
+    assert m["version"] == "0.4.0"
     assert m["author"]["name"] == "0xEl1yahu"
     assert m["userConfig"]["shadow"]["default"] is False
 
@@ -74,7 +74,7 @@ def test_marketplace_manifest_lists_this_plugin():
 
 def test_plugin_version_and_links():
     m = json.load(open(ROOT / ".claude-plugin" / "plugin.json"))
-    assert m["version"] == "0.3.0" and m["repository"].startswith("https://github.com/0xEl1yahu/queue-switchclaude") and m["license"] == "MIT"
+    assert m["version"] == "0.4.0" and m["repository"].startswith("https://github.com/0xEl1yahu/queue-switchclaude") and m["license"] == "MIT"
 
 
 def test_readme_has_marketplace_install_line():
@@ -112,3 +112,47 @@ def test_ci_workflow_matrix_and_test_command():
     for version in ('"3.10"', '"3.12"', '"3.14"'):
         assert version in text
     assert "python -m pip install pytest" in text and "python -m pytest -q" in text
+
+
+# Task 4 (M4): README for daily use, CHANGELOG, version 0.4.0.
+
+def test_version_and_descriptions_match():
+    p = json.load(open(ROOT / ".claude-plugin" / "plugin.json")); m = json.load(open(ROOT / ".claude-plugin" / "marketplace.json"))
+    assert p["version"] == "0.4.0" and p["description"] == m["plugins"][0]["description"]
+
+
+def test_readme_and_changelog_cover_the_known_limits():
+    readme = (ROOT / "README.md").read_text(); log = (ROOT / "CHANGELOG.md").read_text()
+    for phrase in ("scope", "Escape", "fcntl", "shadow_report", "input box", "tool call"):
+        assert phrase in readme, phrase
+    assert "0.4.0" in log and "0.1.0" in log
+
+
+def test_descriptions_say_what_the_plugin_does():
+    p = json.load(open(ROOT / ".claude-plugin" / "plugin.json")); m = json.load(open(ROOT / ".claude-plugin" / "marketplace.json"))
+    expected = ("Sorts messages typed mid-run into steer / queue / amend / split, runs queued tasks "
+                "after the current one with plans and approvals, and stops the turn when you say stop.")
+    assert p["description"] == expected and m["plugins"][0]["description"] == expected
+
+
+def test_changelog_has_a_section_per_milestone_newest_first():
+    log = (ROOT / "CHANGELOG.md").read_text()
+    versions = ["0.4.0", "0.3.0", "0.2.0", "0.1.0"]
+    positions = [log.index(f"## {v}") for v in versions]
+    assert positions == sorted(positions)
+
+
+def test_readme_install_matches_the_m3_acceptance_walkthrough():
+    text = (ROOT / "README.md").read_text()
+    for phrase in ("scope", "options", "Shadow mode", "restart", "Escape",
+                   "claude plugin marketplace remove queue-switchclaude", "/plugin uninstall queue-switchclaude@queue-switchclaude"):
+        assert phrase in text, phrase
+    install = text[text.index("## Install"):text.index("## Install for development")]
+    assert "/plugin marketplace add 0xEl1yahu/queue-switchclaude" in install and "Escape" in install
+
+
+def test_readme_requirements_and_daily_use_sections():
+    text = (ROOT / "README.md").read_text()
+    assert "## Requirements" in text and "## Daily use" in text and "## Known limits" in text
+    for phrase in ("fcntl", "python3", "3.10", "2.1.302", "Shadow: also ask the model", "eval/shadow_report.py"):
+        assert phrase in text, phrase

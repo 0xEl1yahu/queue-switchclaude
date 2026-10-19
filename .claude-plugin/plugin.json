@@ -1,7 +1,7 @@
 {
   "name": "queue-switchclaude",
-  "version": "0.3.0",
-  "description": "Sorts messages typed mid-run into steer / queue / interrupt, runs queued tasks after the current one finishes, and stops the turn when you say stop.",
+  "version": "0.4.0",
+  "description": "Sorts messages typed mid-run into steer / queue / amend / split, runs queued tasks after the current one with plans and approvals, and stops the turn when you say stop.",
   "author": {
     "name": "0xEl1yahu"
   },
