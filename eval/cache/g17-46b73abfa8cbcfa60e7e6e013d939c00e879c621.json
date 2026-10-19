@@ -1,0 +1,30 @@
+{
+  "case": "g17",
+  "payload": {
+    "state": "idle",
+    "running_task": null,
+    "queue": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords",
+        "status": "done",
+        "depends_on": []
+      }
+    ],
+    "recent": [],
+    "message": "now add the login endpoint",
+    "candidates": []
+  },
+  "decision": {
+    "label": "queue",
+    "confidence": 0.93,
+    "depends_on": [
+      "p1"
+    ],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

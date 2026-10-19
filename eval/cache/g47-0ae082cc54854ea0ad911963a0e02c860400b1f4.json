@@ -1,0 +1,42 @@
+{
+  "case": "g47",
+  "payload": {
+    "state": "awaiting_approval",
+    "running_task": {
+      "id": "p2",
+      "text": "Add a /login endpoint that returns a JWT"
+    },
+    "queue": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords",
+        "status": "done",
+        "depends_on": []
+      }
+    ],
+    "recent": [
+      {
+        "role": "assistant",
+        "text": "Plan's at plans/p2.md. I've also suggested adding refresh tokens as a follow-up."
+      }
+    ],
+    "message": "yeah do that",
+    "candidates": [
+      {
+        "id": "p2",
+        "text": "Add a /login endpoint that returns a JWT",
+        "score": 0.308
+      }
+    ]
+  },
+  "decision": {
+    "label": "steer",
+    "confidence": 0.9,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": "approve",
+    "parts": []
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "case": "g43",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p1",
+      "text": "Add a User model with hashed passwords (SQLAlchemy)"
+    },
+    "queue": [
+      {
+        "id": "p2",
+        "text": "Add email verification",
+        "status": "queued",
+        "depends_on": [
+          "p1"
+        ]
+      }
+    ],
+    "recent": [
+      {
+        "role": "user",
+        "text": "later: email verification"
+      }
+    ],
+    "message": "nvm, scrap that",
+    "candidates": [
+      {
+        "id": "p2",
+        "text": "Add email verification",
+        "score": 0.216
+      },
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords (SQLAlchemy)",
+        "score": 0.152
+      }
+    ]
+  },
+  "decision": {
+    "label": "amend",
+    "confidence": 0.93,
+    "depends_on": [
+      "p1"
+    ],
+    "interrupt": false,
+    "parked": false,
+    "target": "p2",
+    "note": "cancel",
+    "parts": []
+  }
+}

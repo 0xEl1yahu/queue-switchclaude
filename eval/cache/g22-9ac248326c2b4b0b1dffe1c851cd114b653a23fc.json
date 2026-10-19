@@ -1,0 +1,44 @@
+{
+  "case": "g22",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p1",
+      "text": "Refactor the billing service into its own module"
+    },
+    "queue": [
+      {
+        "id": "p2",
+        "text": "Add a Stripe webhook handler",
+        "status": "queued",
+        "depends_on": [
+          "p1"
+        ]
+      }
+    ],
+    "recent": [],
+    "message": "don't touch invoice.py, reporting imports it",
+    "candidates": [
+      {
+        "id": "p1",
+        "text": "Refactor the billing service into its own module",
+        "score": 0.326
+      },
+      {
+        "id": "p2",
+        "text": "Add a Stripe webhook handler",
+        "score": 0.139
+      }
+    ]
+  },
+  "decision": {
+    "label": "steer",
+    "confidence": 0.95,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

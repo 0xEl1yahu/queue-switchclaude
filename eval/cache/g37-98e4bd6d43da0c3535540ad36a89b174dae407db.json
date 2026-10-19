@@ -1,0 +1,52 @@
+{
+  "case": "g37",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p2",
+      "text": "Add a /login endpoint that returns a JWT"
+    },
+    "queue": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords",
+        "status": "done",
+        "depends_on": []
+      },
+      {
+        "id": "p3",
+        "text": "Write tests for /login",
+        "status": "queued",
+        "depends_on": [
+          "p2"
+        ]
+      }
+    ],
+    "recent": [],
+    "message": "I would also like to add an admin dashboard",
+    "candidates": [
+      {
+        "id": "p2",
+        "text": "Add a /login endpoint that returns a JWT",
+        "score": 0.313
+      },
+      {
+        "id": "p3",
+        "text": "Write tests for /login",
+        "score": 0.246
+      }
+    ]
+  },
+  "decision": {
+    "label": "queue",
+    "confidence": 0.9,
+    "depends_on": [
+      "p2"
+    ],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

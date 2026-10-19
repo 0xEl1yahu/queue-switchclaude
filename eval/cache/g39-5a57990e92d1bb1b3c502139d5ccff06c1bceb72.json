@@ -1,0 +1,49 @@
+{
+  "case": "g39",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p1",
+      "text": "Refactor the billing service into its own module"
+    },
+    "queue": [
+      {
+        "id": "p2",
+        "text": "Add a Stripe webhook handler",
+        "status": "queued",
+        "depends_on": [
+          "p1"
+        ]
+      }
+    ],
+    "recent": [
+      {
+        "role": "assistant",
+        "text": "Refactor about halfway done."
+      }
+    ],
+    "message": "this could benefit from this here stuff",
+    "candidates": [
+      {
+        "id": "p1",
+        "text": "Refactor the billing service into its own module",
+        "score": 0.253
+      },
+      {
+        "id": "p2",
+        "text": "Add a Stripe webhook handler",
+        "score": 0.149
+      }
+    ]
+  },
+  "decision": {
+    "label": "unclear",
+    "confidence": 0.85,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

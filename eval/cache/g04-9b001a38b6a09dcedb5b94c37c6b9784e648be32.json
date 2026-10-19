@@ -1,0 +1,30 @@
+{
+  "case": "g04",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p1",
+      "text": "Add a User model with hashed passwords (SQLAlchemy)"
+    },
+    "queue": [],
+    "recent": [],
+    "message": "and add a created_at timestamp",
+    "candidates": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords (SQLAlchemy)",
+        "score": 0.346
+      }
+    ]
+  },
+  "decision": {
+    "label": "steer",
+    "confidence": 0.85,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

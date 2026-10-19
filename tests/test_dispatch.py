@@ -533,9 +533,25 @@ def test_spin_guard_fires_on_identical_handback(data_dir):
         s.new_task("b", [], "pid")                     # idle store, one ready task
     first = dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]     # planning handover
     assert "Write a short plan for p1" in first
-    out = dispatch.handle(stop(active=True))         # planning, no plan file: the retry text is identical
+    # Replay the identical text on a continuation: the guard fires.
+    with store.locked("s1") as s:
+        s.state = "idle"; s.pending_task = None; s.get("p1").status = "queued"; s.last_handback = dispatch._digest(first)
+    out = dispatch.handle(stop(active=True))
     assert "hookSpecificOutput" not in out and "came back twice" in out["systemMessage"]
-    assert store.load("s1").state == "planning"      # Task 1's Esc-during-planning path requeues it on the next prompt
+
+
+def test_planning_retry_is_not_a_spin(data_dir):
+    # Review follow-up: the one planning retry must get through the guard, so its text differs.
+    with store.locked("s1") as s:
+        s.new_task("b", [], "pid")
+    first = dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]
+    out = dispatch.handle(stop(active=True))          # planning, no plan file
+    retry = out["hookSpecificOutput"]["additionalContext"]
+    assert retry.startswith("queue-switchclaude: second attempt") and "Write a short plan for p1" in retry and retry != first
+    rows = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()]
+    assert any(r.get("plan_retry") == 1 for r in rows) and not any(r.get("spin_guard") for r in rows)
+    assert dispatch.handle(stop(active=True)) is None  # second miss: requeued, as before
+    assert store.load("s1").get("p1").status == "queued" and store.load("s1").state == "idle"
 
 
 def test_auto_execution_text_is_idempotent(data_dir):
@@ -555,7 +571,9 @@ def test_verify_failed_text_without_tail():
 def test_spin_guard_message_and_log(data_dir):
     with store.locked("s1") as s:
         s.new_task("b", [], "pid")
-    dispatch.handle(stop(active=True))
+    first = dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]
+    with store.locked("s1") as s:
+        s.state = "idle"; s.pending_task = None; s.get("p1").status = "queued"; s.last_handback = dispatch._digest(first)
     out = dispatch.handle(stop(active=True))
     assert out == {"systemMessage": "queue-switchclaude: the same instruction came back twice; stopping here, send any message to continue"}
     rows = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()]

@@ -1,0 +1,52 @@
+{
+  "case": "g16",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p2",
+      "text": "Add a /login endpoint that returns a JWT"
+    },
+    "queue": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords",
+        "status": "done",
+        "depends_on": []
+      },
+      {
+        "id": "p3",
+        "text": "Write tests for /login",
+        "status": "queued",
+        "depends_on": [
+          "p2"
+        ]
+      }
+    ],
+    "recent": [],
+    "message": "skip the tests for now, I'll write them myself",
+    "candidates": [
+      {
+        "id": "p3",
+        "text": "Write tests for /login",
+        "score": 0.8
+      },
+      {
+        "id": "p2",
+        "text": "Add a /login endpoint that returns a JWT",
+        "score": 0.279
+      }
+    ]
+  },
+  "decision": {
+    "label": "amend",
+    "confidence": 0.95,
+    "depends_on": [
+      "p2"
+    ],
+    "interrupt": false,
+    "parked": false,
+    "target": "p3",
+    "note": "cancel",
+    "parts": []
+  }
+}

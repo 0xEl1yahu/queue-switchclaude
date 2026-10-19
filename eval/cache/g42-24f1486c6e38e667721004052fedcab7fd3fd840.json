@@ -1,0 +1,39 @@
+{
+  "case": "g42",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p1",
+      "text": "Add a User model with hashed passwords (SQLAlchemy)"
+    },
+    "queue": [],
+    "recent": [
+      {
+        "role": "user",
+        "text": "also bump the bcrypt rounds to 14"
+      },
+      {
+        "role": "assistant",
+        "text": "Bumping rounds to 14."
+      }
+    ],
+    "message": "nvm",
+    "candidates": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords (SQLAlchemy)",
+        "score": 0.037
+      }
+    ]
+  },
+  "decision": {
+    "label": "steer",
+    "confidence": 0.9,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

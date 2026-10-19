@@ -1,0 +1,35 @@
+{
+  "case": "g34",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p1",
+      "text": "Add a User model with hashed passwords (SQLAlchemy)"
+    },
+    "queue": [],
+    "recent": [
+      {
+        "role": "assistant",
+        "text": "Added the password hashing helper."
+      }
+    ],
+    "message": "maybe later we can add this",
+    "candidates": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords (SQLAlchemy)",
+        "score": 0.179
+      }
+    ]
+  },
+  "decision": {
+    "label": "unclear",
+    "confidence": 0.9,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

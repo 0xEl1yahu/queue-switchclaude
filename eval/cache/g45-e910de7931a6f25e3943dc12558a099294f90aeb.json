@@ -1,0 +1,37 @@
+{
+  "case": "g45",
+  "payload": {
+    "state": "awaiting_approval",
+    "running_task": {
+      "id": "p2",
+      "text": "Add a /login endpoint that returns a JWT"
+    },
+    "queue": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords",
+        "status": "done",
+        "depends_on": []
+      }
+    ],
+    "recent": [],
+    "message": "looks good but do the rate limiter before the endpoint",
+    "candidates": [
+      {
+        "id": "p2",
+        "text": "Add a /login endpoint that returns a JWT",
+        "score": 0.4
+      }
+    ]
+  },
+  "decision": {
+    "label": "steer",
+    "confidence": 0.95,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": "revise plan",
+    "parts": []
+  }
+}

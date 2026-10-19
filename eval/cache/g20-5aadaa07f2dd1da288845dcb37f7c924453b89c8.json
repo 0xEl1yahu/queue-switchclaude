@@ -1,0 +1,66 @@
+{
+  "case": "g20",
+  "payload": {
+    "state": "idle",
+    "running_task": null,
+    "queue": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords",
+        "status": "done",
+        "depends_on": []
+      }
+    ],
+    "recent": [],
+    "message": "1) login endpoint 2) logout endpoint 3) tests for both",
+    "candidates": []
+  },
+  "decision": {
+    "label": "split",
+    "confidence": 0.95,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": [
+      {
+        "label": "queue",
+        "text": "login endpoint",
+        "confidence": 0.95,
+        "interrupt": false,
+        "parked": false,
+        "depends_on": [
+          "p1"
+        ],
+        "target": null,
+        "note": null
+      },
+      {
+        "label": "queue",
+        "text": "logout endpoint",
+        "confidence": 0.95,
+        "interrupt": false,
+        "parked": false,
+        "depends_on": [
+          "p2"
+        ],
+        "target": null,
+        "note": null
+      },
+      {
+        "label": "queue",
+        "text": "tests for both",
+        "confidence": 0.95,
+        "interrupt": false,
+        "parked": false,
+        "depends_on": [
+          "p2",
+          "p3"
+        ],
+        "target": null,
+        "note": null
+      }
+    ]
+  }
+}

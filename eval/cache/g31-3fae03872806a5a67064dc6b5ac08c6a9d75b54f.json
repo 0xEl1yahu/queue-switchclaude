@@ -1,0 +1,55 @@
+{
+  "case": "g31",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p2",
+      "text": "Add a /login endpoint that returns a JWT"
+    },
+    "queue": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords",
+        "status": "done",
+        "depends_on": []
+      },
+      {
+        "id": "p3",
+        "text": "Write tests for /login",
+        "status": "queued",
+        "depends_on": [
+          "p2"
+        ]
+      }
+    ],
+    "recent": [
+      {
+        "role": "assistant",
+        "text": "The CSRF check on /login adds a bit of complexity. Want me to keep it or drop it for now?"
+      }
+    ],
+    "message": "this is necessary",
+    "candidates": [
+      {
+        "id": "p3",
+        "text": "Write tests for /login",
+        "score": 0.256
+      },
+      {
+        "id": "p2",
+        "text": "Add a /login endpoint that returns a JWT",
+        "score": 0.175
+      }
+    ]
+  },
+  "decision": {
+    "label": "steer",
+    "confidence": 0.95,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

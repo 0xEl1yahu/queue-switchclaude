@@ -2,5 +2,4 @@
 __pycache__/
 .pytest_cache/
 *.pyc
-eval/cache/
 eval/reports/

@@ -230,35 +230,18 @@ def _new_turn(
     *,
     text: str | None = None,
     marker_stripped: bool = False,
+    notice: str | None = None,
 ) -> dict | None:
     """Register a fresh turn: handle a missed Esc, then make the prompt the running task.
 
     ``text`` is the running task's text when it differs from the prompt (an
     idle ``later: x`` runs as ``x``); ``marker_stripped`` says so in the log.
     """
-    notice = None
     interrupted = None
     interrupted_planning = None
     dropped: list[store.Task] = []
-    if s.state == "running":
-        # No Stop fired for the task that was running: the turn was cut by
-        # Esc (D5). A new turn arriving while a plan or a question waits
-        # interrupts nothing and drops nothing.
-        running = s.get(s.running_task) if s.running_task else None
-        if running is not None and running.status == "running":
-            running.status = "interrupted"
-            interrupted = running.id
-        dropped = [t for t in s.tasks if t.status in ("queued", SHADOW_QUEUED)]
-        for t in dropped:
-            t.status = "dropped"
-        notice = _esc_notice(dropped)
-    elif s.state == "planning":
-        # Esc cut the planning turn (review focus 2). The user interrupted
-        # planning, not work, so D5's drop does not apply: queued tasks
-        # stay queued and the one being planned rejoins them.
-        interrupted_planning = _interrupt_planning(s)
-        if interrupted_planning is not None:
-            notice = _planning_notice(interrupted_planning)
+    if s.state in ("running", "planning"):
+        notice, interrupted, dropped, interrupted_planning = _reset_turn_details(s)
 
     s.state = "running"
     s.current_prompt_id = prompt_id
@@ -283,6 +266,48 @@ def _new_turn(
     if notice is None:
         return None
     return _context(notice)
+
+
+def _reset_turn_details(s: store.Store) -> tuple[str | None, str | None, list[store.Task], str | None]:
+    """A new prompt arrived while the store said running or planning: the
+    user pressed Esc. Returns ``(notice, interrupted id, dropped tasks,
+    interrupted planning id)`` and leaves the store idle.
+
+    Running: no Stop fired for the task that was running, so the turn was
+    cut by Esc (D5): the task is interrupted and queued tasks are dropped.
+    Planning: the user interrupted planning, not work, so D5's drop does not
+    apply; the task being planned rejoins the queue.
+    """
+    notice = None
+    interrupted = None
+    interrupted_planning = None
+    dropped: list[store.Task] = []
+    if s.state == "running":
+        running = s.get(s.running_task) if s.running_task else None
+        if running is not None and running.status == "running":
+            running.status = "interrupted"
+            interrupted = running.id
+        dropped = [t for t in s.tasks if t.status in ("queued", SHADOW_QUEUED)]
+        for t in dropped:
+            t.status = "dropped"
+        notice = _esc_notice(dropped)
+    elif s.state == "planning":
+        interrupted_planning = _interrupt_planning(s)
+        if interrupted_planning is not None:
+            notice = _planning_notice(interrupted_planning)
+    s.state = "idle"
+    s.running_task = None
+    s.pending_task = None
+    s.interrupt = False
+    return notice, interrupted, dropped, interrupted_planning
+
+
+def _reset_turn(s: store.Store) -> str | None:
+    """The Esc reset alone, for a marker typed right after Esc; logs it."""
+    notice, interrupted, dropped, interrupted_planning = _reset_turn_details(s)
+    _record(s.session_id, "intake", decision="esc_reset", interrupted=interrupted,
+            dropped=[d.id for d in dropped], interrupted_planning=interrupted_planning)
+    return notice
 
 
 def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
@@ -618,11 +643,17 @@ def _turn(
             return None
 
     if not mid_turn:
+        notice = None
+        if s.state in ("running", "planning") and _is_marker(v):
+            # Esc, then a marker or "stop": apply the Esc reset first so the
+            # idle rules below see the store as it really is (review follow-up).
+            notice = _reset_turn(s)
         if _idle(s):
-            out = _idle_turn(s, event, v, prompt, prompt_id, shadow)
+            out = _idle_turn(s, event, v, prompt, prompt_id, shadow,
+                             run_now=not _waiting_work(s), notice=notice)
             if out is not _UNHANDLED:
                 return out
-        return _new_turn(s, event, prompt, prompt_id)
+        return _new_turn(s, event, prompt, prompt_id, notice=notice)
 
     return _mid_turn(s, event, v, prompt, prompt_id, classifier, shadow)
 
@@ -634,9 +665,27 @@ def _dedupe_text(dup: store.Task) -> str:
 # --- M3: idle-state markers ---------------------------------------------------
 
 
+WAITING_WORK = ("queued", "planned", "paused", "failed_verify")
+
+
 def _idle(s: store.Store) -> bool:
     """Nothing running, nothing pending: the next message starts a turn."""
     return s.state == "idle" and s.running_task is None and s.pending_task is None
+
+
+def _waiting_work(s: store.Store) -> bool:
+    """Queued, planned, paused or verify-failed tasks exist but nothing runs:
+    a paused queue, an exhausted continuation budget, or work blocked behind
+    a failed dependency. A ``later: x`` typed now belongs after them."""
+    return any(t.status in WAITING_WORK for t in s.tasks)
+
+
+def _is_marker(v: rules.Verdict) -> bool:
+    return v.label == "interrupt" or v.rule in ("queue_marker", "parked_marker")
+
+
+def _with_notice(notice: str | None, text: str) -> str:
+    return f"{notice}; {text}" if notice else text
 
 
 def _idle_turn(
@@ -646,6 +695,8 @@ def _idle_turn(
     prompt: str,
     prompt_id: str | None,
     shadow: bool,
+    run_now: bool = True,
+    notice: str | None = None,
 ) -> object:
     """A rule verdict at idle, where the markers mean something else than
     mid-turn. Returns the hook output, or ``_UNHANDLED`` for an ordinary
@@ -670,8 +721,8 @@ def _idle_turn(
         _record(sid, "intake", decision="noop", state="idle", message=prompt, rule=v.rule,
                    rule_label=v.label, label="interrupt", shadow=shadow, prompt_id=prompt_id)
         if shadow:
-            return _new_turn(s, event, prompt, prompt_id)
-        return _block(f"{PREFIX}: nothing is running")
+            return _new_turn(s, event, prompt, prompt_id, notice=notice)
+        return _block(_with_notice(notice, f"{PREFIX}: nothing is running"))
 
     if v.label == "queue" and v.parked:
         confirmation = _queue(s, v.text, [], prompt_id, parked=True, shadow=shadow)
@@ -679,14 +730,23 @@ def _idle_turn(
                    message=prompt, rule=v.rule, rule_label=v.label, label="queue", parked=True,
                    shadow=shadow, prompt_id=prompt_id)
         if shadow:
-            return _new_turn(s, event, prompt, prompt_id)
-        return _block(f"{PREFIX}: {confirmation}")
+            return _new_turn(s, event, prompt, prompt_id, notice=notice)
+        return _block(_with_notice(notice, f"{PREFIX}: {confirmation}"))
 
     if v.label == "queue":
         if shadow:
-            return _new_turn(s, event, prompt, prompt_id)
+            return _new_turn(s, event, prompt, prompt_id, notice=notice)
+        if not run_now:
+            # Work is waiting (paused queue, exhausted budget, a blocked
+            # dependency): this belongs after it, not in front of it.
+            confirmation = _queue(s, v.text, [], prompt_id, parked=False, shadow=False)
+            _record(sid, "intake", decision="queued_idle", state="idle", task=s.tasks[-1].id,
+                    message=prompt, rule=v.rule, rule_label=v.label, label="queue",
+                    shadow=shadow, prompt_id=prompt_id)
+            return _block(_with_notice(
+                notice, f"{PREFIX}: {confirmation} (nothing is running; send 'queue: list' to see why)"))
         _new_turn(s, event, prompt, prompt_id, text=v.text, marker_stripped=True)
-        return _context(f"{PREFIX}: nothing is running, so this starts now: {v.text}")
+        return _context(_with_notice(notice, f"{PREFIX}: nothing is running, so this starts now: {v.text}"))
 
     return _UNHANDLED
 

@@ -146,3 +146,7 @@ One line each; "model" is the raw cached answer.
 - `scoring.outcome` ignores `confidence` and `id`; ids are assigned by the runner as "highest known id + 1", which reproduces the golden numbering in every context (the plan's `p{len(queue)+1}` is off by one whenever a task is running).
 - `missed_hard_dependency` is -1.0; an extra dependency is 0.0 (`dependency_extra`). Split cases score per part in order; any part with a missed dependency makes the case -1.0.
 - The gate also fails when `claude` is missing or any classifier call fails (fail-open `steer` must not count as a pass), which is how `--cases g01` with no `claude` on `PATH` exits 1 without a traceback (review focus 5).
+
+## The model cache is tracked (2026-10-19)
+
+`eval/cache/` is committed (47 small JSON files, about 190 KB) so a fresh clone and CI reproduce the cached gate without a `claude` binary: `python3 eval/run_golden.py` reads every answer from the cache and makes no live call. Keys are the case id plus a hash of the prompt and payload, so a change to `prompts/intake_system.md` or to a case's payload misses the cache for the affected cases and makes live calls; refresh the whole cache with `python3 eval/run_golden.py --no-cache` and commit the result. `eval/reports/` stays ignored.

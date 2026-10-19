@@ -1,0 +1,53 @@
+{
+  "case": "g09",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p1",
+      "text": "Add a User model with hashed passwords (SQLAlchemy)"
+    },
+    "queue": [],
+    "recent": [],
+    "message": "use argon2 instead, and after that add password reset",
+    "candidates": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords (SQLAlchemy)",
+        "score": 0.385
+      }
+    ]
+  },
+  "decision": {
+    "label": "split",
+    "confidence": 0.9,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": [
+      {
+        "label": "steer",
+        "text": "use argon2 instead",
+        "confidence": 0.95,
+        "interrupt": false,
+        "parked": false,
+        "depends_on": [],
+        "target": null,
+        "note": null
+      },
+      {
+        "label": "queue",
+        "text": "add password reset",
+        "confidence": 0.9,
+        "interrupt": false,
+        "parked": false,
+        "depends_on": [
+          "p1"
+        ],
+        "target": null,
+        "note": null
+      }
+    ]
+  }
+}

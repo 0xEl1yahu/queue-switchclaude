@@ -1,0 +1,28 @@
+{
+  "case": "g19",
+  "payload": {
+    "state": "idle",
+    "running_task": null,
+    "queue": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords",
+        "status": "done",
+        "depends_on": []
+      }
+    ],
+    "recent": [],
+    "message": "what did you change in p1?",
+    "candidates": []
+  },
+  "decision": {
+    "label": "steer",
+    "confidence": 0.95,
+    "depends_on": [],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

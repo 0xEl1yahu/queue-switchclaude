@@ -1,0 +1,46 @@
+{
+  "case": "g23",
+  "payload": {
+    "state": "running",
+    "running_task": {
+      "id": "p1",
+      "text": "Refactor the billing service into its own module"
+    },
+    "queue": [
+      {
+        "id": "p2",
+        "text": "Add a Stripe webhook handler",
+        "status": "queued",
+        "depends_on": [
+          "p1"
+        ]
+      }
+    ],
+    "recent": [],
+    "message": "the webhook handler should verify Stripe signatures",
+    "candidates": [
+      {
+        "id": "p2",
+        "text": "Add a Stripe webhook handler",
+        "score": 1.0
+      },
+      {
+        "id": "p1",
+        "text": "Refactor the billing service into its own module",
+        "score": 0.182
+      }
+    ]
+  },
+  "decision": {
+    "label": "amend",
+    "confidence": 0.95,
+    "depends_on": [
+      "p1"
+    ],
+    "interrupt": false,
+    "parked": false,
+    "target": "p2",
+    "note": null,
+    "parts": []
+  }
+}

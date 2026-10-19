@@ -946,3 +946,35 @@ def test_esc_during_planning_does_not_resurrect_a_cancelled_task(data_dir):
         s.get("p2").status = "cancelled"
     assert intake.handle(ev("something else", prompt_id="pid-2")) is None
     s = store.load("s1"); assert s.get("p2").status == "cancelled" and s.pending_task is None and s.running_task == "p3"
+
+
+# --- review follow-ups after M3 -------------------------------------------------
+
+def test_idle_later_with_paused_queue_queues_after_it(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: write tests"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.state = "idle"; s.running_task = None; s.paused = True
+    out = intake.handle(ev("later: add logout", prompt_id="pid-2"))
+    assert out["decision"] == "block" and "queued p3 after p2" in out["systemMessage"] and "nothing is running" in out["systemMessage"]
+    s = store.load("s1"); assert s.get("p3").status == "queued" and s.get("p3").depends_on == ["p2"] and s.running_task is None
+
+
+def test_idle_later_with_only_parked_work_runs_now(data_dir):
+    intake.handle(ev("maybe later we can add a README"))
+    out = intake.handle(ev("later: add goodbye.py", prompt_id="pid-2"))
+    assert "starts now: add goodbye.py" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_stop_right_after_esc_is_a_noop_with_the_esc_notice(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: write tests"))
+    out = intake.handle(ev("stop", prompt_id="pid-2"))                    # new prompt_id while running: Esc, then stop
+    assert out["decision"] == "block" and "nothing is running" in out["systemMessage"] and "dropped queued tasks: p2" in out["systemMessage"]
+    s = store.load("s1"); assert s.get("p1").status == "interrupted" and s.get("p2").status == "dropped" and s.next_id == 3 and not s.interrupt
+
+
+def test_later_right_after_esc_runs_with_marker_stripped(data_dir):
+    intake.handle(ev("add a user model"))
+    out = intake.handle(ev("later: add goodbye.py", prompt_id="pid-2"))
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "starts now: add goodbye.py" in ctx
+    s = store.load("s1"); assert s.get("p1").status == "interrupted" and s.get("p2").text == "add goodbye.py" and s.get("p2").status == "running"

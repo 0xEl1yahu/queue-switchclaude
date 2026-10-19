@@ -1,0 +1,30 @@
+{
+  "case": "g18",
+  "payload": {
+    "state": "idle",
+    "running_task": null,
+    "queue": [
+      {
+        "id": "p1",
+        "text": "Add a User model with hashed passwords",
+        "status": "done",
+        "depends_on": []
+      }
+    ],
+    "recent": [],
+    "message": "the user model's missing a unique constraint on email",
+    "candidates": []
+  },
+  "decision": {
+    "label": "queue",
+    "confidence": 0.9,
+    "depends_on": [
+      "p1"
+    ],
+    "interrupt": false,
+    "parked": false,
+    "target": null,
+    "note": null,
+    "parts": []
+  }
+}

@@ -117,8 +117,13 @@ def _notes(task: store.Task) -> str:
     return f". The user later added: {notes}"
 
 
-def _planning_text(s: store.Store, task: store.Task) -> str:
-    """The handover that asks Claude to plan ``task``."""
+def _planning_text(s: store.Store, task: store.Task, retry: bool = False) -> str:
+    """The handover that asks Claude to plan ``task``.
+
+    ``retry`` (a planning Stop found no plan file) changes the wording, so the
+    spin guard, which suppresses a byte-identical handover on a continuation,
+    lets the one retry through; ``Task.attempts`` still caps retries at two.
+    """
     handoffs = [
         str(p) for p in (paths.handoff_path(s.session_id, d) for d in task.depends_on)
         if p.exists()
@@ -130,8 +135,12 @@ def _planning_text(s: store.Store, task: store.Task) -> str:
         if task.auto else
         "then stop and wait for approval."
     )
+    attempt = (
+        f"{PREFIX}: second attempt, no plan file was found at {plan} after the last turn. "
+        if retry else f"{PREFIX}: "
+    )
     return (
-        f"{PREFIX}: next task is {task.id}: {task.text}{_notes(task)}. "
+        f"{attempt}next task is {task.id}: {task.text}{_notes(task)}. "
         f"Read the handoff of what came before at {before}. "
         f"Write a short plan for {task.id} to {plan} (goal, steps, how to verify), "
         f"present it to the user in a few lines, {ending}"
@@ -389,7 +398,7 @@ def _after_planning(s: store.Store) -> tuple[dict | None, bool]:
     task.attempts += 1
     if task.attempts < MAX_ATTEMPTS:
         _record(sid, "dispatch", next=task.id, plan_retry=task.attempts)
-        return handback(_planning_text(s, task)), False
+        return handback(_planning_text(s, task, retry=True)), False
 
     # Review focus 2: Claude stopped twice without a plan (asked something,
     # hit an error). Give the task back to the queue and end the turn; it is
