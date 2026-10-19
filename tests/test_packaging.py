@@ -46,3 +46,8 @@ def test_command_file_frontmatter_and_script_exist():
     assert text.startswith("---\n") and "description:" in text and "argument-hint:" in text
     assert "${CLAUDE_PLUGIN_ROOT}/scripts/queue_cli.py" in text and "$ARGUMENTS" in text
     assert (ROOT / "scripts" / "queue_cli.py").exists()
+
+
+def test_command_file_passes_plugin_data_dir_to_the_cli():
+    text = (ROOT / "commands" / "queue.md").read_text()
+    assert 'CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_DATA}"' in text and "Bash(CLAUDE_PLUGIN_DATA=*)" in text

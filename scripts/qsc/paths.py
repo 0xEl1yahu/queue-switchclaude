@@ -18,10 +18,48 @@ def safe_id(session_id: str) -> str:
     return cleaned or "_"
 
 
+PLUGIN_DATA_ROOT = Path.home() / ".claude" / "plugins" / "data"
+PLUGIN_NAME = "queue-switchclaude"
+
+
+def _installed_data_dir() -> Path | None:
+    """The data dir Claude Code gave this plugin, found without the env var.
+
+    Hooks receive ``CLAUDE_PLUGIN_DATA``; a command Claude runs through the
+    Bash tool does not (``queue_cli.py``). Claude Code keeps plugin data at
+    ``~/.claude/plugins/data/<plugin id>/`` where the id starts with the
+    plugin name (``queue-switchclaude-inline`` for ``--plugin-dir`` loads).
+    When several exist, the one whose pointer file was written last wins.
+    """
+    try:
+        candidates = [
+            d for d in PLUGIN_DATA_ROOT.iterdir()
+            if d.is_dir() and d.name.startswith(PLUGIN_NAME)
+        ]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+
+    def recency(d: Path) -> float:
+        try:
+            return (d / "last_session").stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return max(candidates, key=recency)
+
+
 def data_dir() -> Path:
-    """$CLAUDE_PLUGIN_DATA when set, else ~/.claude/queue-switchclaude."""
+    """$CLAUDE_PLUGIN_DATA when set, else the installed plugin data dir, else
+    ~/.claude/queue-switchclaude."""
     env = os.environ.get("CLAUDE_PLUGIN_DATA")
-    return Path(env) if env else Path.home() / ".claude" / "queue-switchclaude"
+    if env:
+        return Path(env)
+    installed = _installed_data_dir()
+    if installed is not None:
+        return installed
+    return Path.home() / ".claude" / PLUGIN_NAME
 
 
 def store_path(session_id: str) -> Path:
