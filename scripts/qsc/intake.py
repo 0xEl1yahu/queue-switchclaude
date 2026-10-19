@@ -1,29 +1,59 @@
 """Intake logic for the ``UserPromptSubmit`` hook. Stdlib only.
 
-``handle(event)`` sorts one user message into steer / queue / interrupt:
-rules first (``qsc.rules``), the ``claude -p`` classifier (``qsc.classify``)
-only for what the rules cannot decide. It also keeps the per-session store
-in step with the turn: a message whose ``prompt_id`` differs from the one
-being run starts a new turn, and a new turn arriving while the store still
-says ``running`` means the previous turn was interrupted by Esc (D5): the
-running task is marked ``interrupted``, queued tasks are ``dropped``, and a
-notice listing them is attached to the new prompt.
+``handle(event)`` sorts one user message: rules first (``qsc.rules``), the
+``claude -p`` classifier (``qsc.classify``) only for what the rules cannot
+decide. M1 adds four branches on top of the M0 steer / queue / interrupt
+routing, in this order:
 
-The return value is the hook's JSON output, or ``None`` for pass-through.
+* ``control``: a ``queue: ...`` or ``/queue ...`` prompt runs one command
+  from ``qsc.control`` against the store and is blocked with the reply. It
+  works in every state, never reaches the classifier, never counts as a
+  turn, and still acts in shadow mode (it is the user's explicit command).
+* ``dedupe``: a message whose normalised task text equals a task created in
+  the last ten minutes is blocked with a pointer to that task. Exact after
+  normalisation only (docs/m0-acceptance.md issue 1, second half: held text
+  returns to the input box and gets resubmitted).
+* ``parked``: a maybe-later item (rule marker or the model's ``parked`` flag)
+  is stored with status ``parked`` and never dispatched until promoted.
+* ``amend`` and ``split`` from the v2 decision contract: an amend cancels,
+  pauses, rewires or annotates a live task; a split applies its queue and
+  amend parts and lets the steer parts through with an ``additionalContext``
+  naming what was handled.
+
+It also keeps the per-session store in step with the turn: a message whose
+``prompt_id`` differs from the one being run starts a new turn, and a new
+turn arriving while the store still says ``running`` means the previous turn
+was interrupted by Esc (D5): the running task is marked ``interrupted``,
+queued tasks are ``dropped``, and a notice listing them is attached to the
+new prompt.
+
+Every branch fails open: anything unresolved is ``steer`` and the message
+passes through untouched. The return value is the hook's JSON output, or
+``None`` for pass-through.
 """
 from __future__ import annotations
 
 import dataclasses
 from typing import Callable, Optional
 
-from . import classify, log, rules, store, transcript
+from . import classify, control, log, match, rules, store, transcript
 
 HOOK_EVENT = "UserPromptSubmit"
 PREFIX = "queue-switchclaude"
 
-# The model's answer counts only at or above this confidence (spec §10 M0).
+# The model's answer counts only at or above this confidence (spec §10 M0),
+# for every actionable label: queue, amend, split, interrupt, parked queue.
 CONFIDENCE_THRESHOLD = 0.9
-ACTIONABLE_LABELS = ("queue", "interrupt")
+ACTIONABLE_LABELS = ("queue", "amend", "split")
+
+# A task created with the same normalised text inside this window is a
+# resubmission of held text, not a new request.
+DEDUPE_WINDOW_SECONDS = 600
+# Statuses a duplicate is reported against. Dropped and cancelled tasks are
+# excluded by Store.find_recent itself; interrupted tasks are gone too.
+DEDUPE_STATUSES = (
+    "queued", "running", "done", "parked", "paused", "shadow_queued", "shadow_dispatched",
+)
 
 Classifier = Callable[[dict], Optional[classify.Decision]]
 
@@ -49,6 +79,11 @@ def _block(reason: str) -> dict:
             "suppressOriginalPrompt": True,
         },
     }
+
+
+def _context(text: str) -> dict:
+    """Pass the prompt through with ``additionalContext`` attached."""
+    return {"hookSpecificOutput": {"hookEventName": HOOK_EVENT, "additionalContext": text}}
 
 
 def _esc_notice(dropped: list[store.Task]) -> str | None:
@@ -92,7 +127,7 @@ def _new_turn(s: store.Store, event: dict, prompt: str, prompt_id: str | None) -
     )
     if notice is None:
         return None
-    return {"hookSpecificOutput": {"hookEventName": HOOK_EVENT, "additionalContext": notice}}
+    return _context(notice)
 
 
 def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
@@ -100,20 +135,154 @@ def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
     running_dict = {"id": running.id, "text": running.text} if running else None
     queue = [
         {"id": t.id, "text": t.text, "status": t.status, "depends_on": list(t.depends_on)}
-        for t in s.tasks if t.status == "queued"
+        for t in s.tasks if t.status in ("queued", "parked", "paused")
     ]
     recent = transcript.recent(event.get("transcript_path"))
-    return classify.payload(s.state, running_dict, queue, recent, text)
+    return classify.payload(
+        s.state, running_dict, queue, recent, text,
+        candidates=match.candidates(text, s.candidates()),
+    )
 
 
 def _chain_deps(s: store.Store) -> list[str]:
-    """M0 dependency rule: the last queued task, else the running task, else nothing."""
+    """M0 dependency rule: the last queued task, else the running task, else nothing.
+
+    Parked and paused tasks are skipped: chaining after a task that may never
+    run would hold the queue hostage.
+    """
     queued = [t for t in s.tasks if t.status in ("queued", SHADOW_QUEUED)]
     if queued:
         return [queued[-1].id]
     if s.running_task:
         return [s.running_task]
     return []
+
+
+def _find_duplicate(s: store.Store, v: rules.Verdict, mid_turn: bool) -> store.Task | None:
+    """The live task this prompt resubmits, or None.
+
+    An interrupt phrase is never a duplicate: "stop" must stop even when a
+    task called "stop" exists. On a new turn, the task the store still calls
+    ``running`` is about to be marked interrupted (Esc, D5), so resending its
+    text is a retry, not a duplicate.
+    """
+    if v.label == "interrupt":
+        return None
+    dup = s.find_recent(store.normalise(v.text), DEDUPE_WINDOW_SECONDS)
+    if dup is None or dup.status not in DEDUPE_STATUSES:
+        return None
+    if not mid_turn and dup.status == "running" and dup.id == s.running_task:
+        return None
+    return dup
+
+
+def _confident(obj: classify.Decision | classify.Part) -> bool:
+    return obj.confidence >= CONFIDENCE_THRESHOLD
+
+
+def _parts_for_log(decision: classify.Decision | None) -> list[str]:
+    return [p.label for p in decision.parts] if decision is not None else []
+
+
+# --- actions ----------------------------------------------------------------
+# Each returns a confirmation string, or None when the branch resolves to
+# steer. They never block themselves; the caller decides how to answer.
+
+
+def _queue(
+    s: store.Store,
+    text: str,
+    depends_on: list[str],
+    prompt_id: str | None,
+    parked: bool,
+    shadow: bool,
+) -> str:
+    deps = list(depends_on) if depends_on else _chain_deps(s)
+    status = SHADOW_QUEUED if shadow else ("parked" if parked else "queued")
+    t = s.new_task(text, deps, prompt_id, status=status)
+    if parked:
+        return f"parked {t.id}: {t.text} (send 'queue: promote {t.id}' to run it)"
+    after = ", ".join(deps) if deps else "nothing"
+    return f"queued {t.id} after {after}: {t.text}"
+
+
+def _resolve_target(s: store.Store, text: str, named: str | None) -> tuple[store.Task | None, bool]:
+    """The task an amend is about, and whether the model named it.
+
+    ``named`` wins when it is a live candidate; otherwise ``match.pick`` must
+    find one clear subject, or the amend is unresolved (``None``).
+    """
+    live = s.candidates()
+    if named:
+        for t in live:
+            if t.id == named:
+                return t, True
+    return match.pick(text, live), False
+
+
+def _amend(
+    s: store.Store,
+    text: str,
+    decision: classify.Decision | classify.Part,
+    shadow: bool,
+) -> tuple[str | None, str | None]:
+    """Apply one amend. Returns ``(confirmation, target_id)``; confirmation
+    is None when the amend falls through to steer.
+
+    Precedence: cancel, pause, dependency rewire, note. A dependency rewire
+    is applied only when the model named the target itself: when the target
+    came from text matching, the model's ``depends_on`` was written without
+    knowing which task it was about and cannot be a rewiring instruction.
+    """
+    target, named = _resolve_target(s, text, decision.target)
+    if target is None:
+        return None, None
+    if shadow:
+        return f"would amend {target.id}", target.id
+
+    if decision.note == "cancel":
+        cancelled = s.cancel(target.id)
+        if cancelled is None:
+            # Running (or done): not a queue edit; let Claude handle the message.
+            return None, target.id
+        return f"cancelled {cancelled.id}: {cancelled.text}", target.id
+
+    if decision.note == "pause":
+        # Only meaningful on the running task: the turn keeps going, and the
+        # next Stop leaves it paused instead of done (dispatch, Task 7).
+        target.status = "paused"
+        return f"paused {target.id}", target.id
+
+    if named and list(decision.depends_on) != list(target.depends_on):
+        target.depends_on = list(decision.depends_on)
+        ids = ", ".join(target.depends_on) if target.depends_on else "nothing"
+        return f"{target.id} now depends on {ids}", target.id
+
+    target.notes.append(text)
+    return f"noted on {target.id}: {text}", target.id
+
+
+def _clean_parts(parts: list[classify.Part]) -> list[classify.Part]:
+    """Fake-split guard: drop empty parts, merge parts with identical normalised text."""
+    seen: set[str] = set()
+    out = []
+    for p in parts:
+        key = store.normalise(p.text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _part_label(p: classify.Part) -> str:
+    """The label a split part is acted on as; anything unsure is steer."""
+    if not _confident(p) or p.label not in ("queue", "amend"):
+        return "steer"
+    return p.label
+
+
+# --- entry point --------------------------------------------------------------
 
 
 def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = False) -> dict | None:
@@ -131,51 +300,158 @@ def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = Fa
         return None
 
     with store.locked(session_id) as s:
+        if v.label == "control":
+            reply = control.run(s, v.control or "")
+            log.record(
+                session_id, "intake",
+                decision="control",
+                message=prompt,
+                rule=v.rule,
+                label="control",
+                command=v.control,
+                shadow=shadow,
+                prompt_id=prompt_id,
+            )
+            return _block(f"{PREFIX}: {reply}")
+
         mid_turn = s.state == "running" and prompt_id == s.current_prompt_id
+
+        dup = _find_duplicate(s, v, mid_turn)
+        if dup is not None:
+            log.record(
+                session_id, "intake",
+                decision="dedupe",
+                task=dup.id,
+                message=prompt,
+                rule=v.rule,
+                label="dedupe",
+                shadow=shadow,
+                prompt_id=prompt_id,
+            )
+            if not shadow:
+                return _block(
+                    f"{PREFIX}: that is already {dup.id} ({dup.status}); "
+                    f"send 'queue: list' to see the queue"
+                )
+            if mid_turn:
+                return None
+
         if not mid_turn:
             return _new_turn(s, event, prompt, prompt_id)
 
-        decision: classify.Decision | None = None
-        if v.label == "undecided":
-            decision = classifier(_classifier_payload(s, event, v.text))
-            if (
-                decision is not None
-                and decision.confidence >= CONFIDENCE_THRESHOLD
-                and decision.label in ACTIONABLE_LABELS
-            ):
+        return _mid_turn(s, event, v, prompt, prompt_id, classifier, shadow)
+
+
+def _mid_turn(
+    s: store.Store,
+    event: dict,
+    v: rules.Verdict,
+    prompt: str,
+    prompt_id: str | None,
+    classifier: Classifier,
+    shadow: bool,
+) -> dict | None:
+    session_id = s.session_id
+    decision: classify.Decision | None = None
+    parked = v.parked
+    if v.label == "undecided":
+        decision = classifier(_classifier_payload(s, event, v.text))
+        label = "steer"
+        if decision is not None and _confident(decision):
+            if decision.label == "steer" and decision.interrupt:
+                label = "interrupt"
+            elif decision.label in ACTIONABLE_LABELS:
                 label = decision.label
-            else:
-                label = "steer"
-        else:
-            label = v.label
+                parked = decision.label == "queue" and decision.parked
+    else:
+        label = v.label
 
-        log.record(
-            session_id, "intake",
-            message=prompt,
-            rule=v.rule,
-            classifier=dataclasses.asdict(decision) if decision is not None else None,
-            label=label,
-            shadow=shadow,
-            prompt_id=prompt_id,
-        )
+    # Resolve the branch before logging so the log carries the acted label
+    # (a split that is really a steer logs as steer) and the amend target.
+    output: dict | None = None
+    target_id: str | None = None
 
-        if label == "interrupt":
-            if shadow:
-                return None
+    if label == "interrupt":
+        if not shadow:
             s.interrupt = True
-            return _block(f"{PREFIX}: stopping {s.running_task or 'the current turn'} at the next tool call")
+            output = _block(f"{PREFIX}: stopping {s.running_task or 'the current turn'} at the next tool call")
 
-        if label == "queue":
-            deps = _chain_deps(s)
-            if decision is not None and decision.depends_on:
-                deps = list(decision.depends_on)
-            t = s.new_task(v.text, deps, prompt_id)
-            if shadow:
-                # Record what would have been queued so dispatch can report what
-                # it would have run (docs/m0-acceptance.md, issue 2). Never ready().
-                t.status = SHADOW_QUEUED
-                return None
-            after = ", ".join(deps) if deps else "nothing"
-            return _block(f"{PREFIX}: queued {t.id} after {after}: {t.text}")
+    elif label == "queue":
+        deps = list(decision.depends_on) if decision is not None else []
+        confirmation = _queue(s, v.text, deps, prompt_id, parked, shadow)
+        if not shadow:
+            output = _block(f"{PREFIX}: {confirmation}")
 
-        return None
+    elif label == "amend":
+        assert decision is not None
+        confirmation, target_id = _amend(s, v.text, decision, shadow)
+        if confirmation is None:
+            label = "steer"
+        elif not shadow:
+            output = _block(f"{PREFIX}: {confirmation}")
+
+    elif label == "split":
+        assert decision is not None
+        output, label, target_id = _split(s, decision, prompt_id, shadow)
+
+    log.record(
+        session_id, "intake",
+        message=prompt,
+        rule=v.rule,
+        classifier=dataclasses.asdict(decision) if decision is not None else None,
+        label=label,
+        target=target_id,
+        parts=_parts_for_log(decision),
+        parked=parked if label == "queue" else False,
+        shadow=shadow,
+        prompt_id=prompt_id,
+    )
+    return output
+
+
+def _split(
+    s: store.Store,
+    decision: classify.Decision,
+    prompt_id: str | None,
+    shadow: bool,
+) -> tuple[dict | None, str, str | None]:
+    """Apply a split decision. Returns ``(output, acted_label, amend_target)``."""
+    parts = _clean_parts(decision.parts)
+    labels = [_part_label(p) for p in parts]
+    if not parts or all(lbl == "steer" for lbl in labels):
+        # Nothing to split, or every part is Claude's: a plain steer (review focus 3).
+        return None, "steer", None
+
+    confirmations: list[str] = []
+    steer_texts: list[str] = []
+    target_id: str | None = None
+    for p, lbl in zip(parts, labels):
+        if lbl == "queue":
+            confirmations.append(_queue(s, p.text, list(p.depends_on), prompt_id, p.parked, shadow))
+        elif lbl == "amend":
+            confirmation, tid = _amend(s, p.text, p, shadow)
+            if confirmation is None:
+                steer_texts.append(p.text)
+            else:
+                confirmations.append(confirmation)
+                target_id = target_id or tid
+        else:
+            steer_texts.append(p.text)
+
+    if not confirmations:
+        return None, "steer", None
+    if len(parts) == 1:
+        # One real part: the decision is that part's label, answered as a standalone.
+        acted = labels[0]
+        output = None if shadow else _block(f"{PREFIX}: {confirmations[0]}")
+        return output, acted, target_id
+
+    handled = "; ".join(confirmations)
+    if shadow:
+        return None, "split", target_id
+    if steer_texts:
+        return _context(
+            f"{PREFIX}: handled the rest of this message: {handled}; "
+            f"act only on: {' '.join(steer_texts)}"
+        ), "split", target_id
+    return _block(f"{PREFIX}: {handled}"), "split", target_id
