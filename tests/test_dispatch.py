@@ -29,12 +29,6 @@ def test_dispatch_nothing_ready_goes_idle(data_dir):
     assert store.load("s1").state == "idle"
 
 
-def test_dispatch_spin_guard(data_dir):
-    with store.locked("s1") as s:
-        s.new_task("b", [], "pid"); s.last_dispatched = "p1"
-    assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "stop_hook_active": True}) is None
-
-
 def test_dispatch_shadow_does_not_change_status(data_dir):
     with store.locked("s1") as s:
         s.new_task("b", [], "pid")
@@ -58,7 +52,7 @@ def test_dispatch_output_shape(data_dir):
         "queue-switchclaude: next task is p1: write goodbye.py. Read the handoff of what came before at none. "
         f"Write a short plan for p1 to {plan} (goal, steps, how to verify), present it to the user in a few lines, "
         "then stop and wait for approval."}}
-    s = store.load("s1"); assert s.state == "planning" and s.last_dispatched == "p1" and s.pending_task == "p1"
+    s = store.load("s1"); assert s.state == "planning" and s.last_handback and s.pending_task == "p1"
 
 
 def test_dispatch_keeps_current_prompt_id(data_dir):
@@ -67,14 +61,6 @@ def test_dispatch_keeps_current_prompt_id(data_dir):
         s.new_task("b", ["p1"], "pid-1")
     dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"})
     assert store.load("s1").current_prompt_id == "pid-1"
-
-
-def test_dispatch_spin_guard_only_when_stop_hook_active(data_dir):
-    with store.locked("s1") as s:
-        s.new_task("b", [], "pid"); s.last_dispatched = "p1"
-    out = dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "stop_hook_active": False})
-    s = store.load("s1")
-    assert out is not None and s.state == "planning" and s.pending_task == "p1"
 
 
 def test_dispatch_dependency_not_done_is_not_dispatched(data_dir):
@@ -455,7 +441,7 @@ def test_planning_stop_never_resurrects_a_cancelled_or_parked_task(data_dir):
     # `planned`, and dispatch must move on to the next ready task.
     for status in ("cancelled", "parked"):
         with store.locked("s1") as s:
-            s.tasks = []; s.next_id = 1; s.last_dispatched = None
+            s.tasks = []; s.next_id = 1; s.last_handback = None
             a = s.new_task("a", [], "pid"); s.new_task("b", [], "pid")
             s.state = "planning"; s.pending_task = "p1"; a.status = status
         p = paths.plan_path("s1", "p1"); p.parent.mkdir(parents=True, exist_ok=True); p.write_text("# plan")
@@ -535,3 +521,95 @@ def test_continuation_budget_pauses_an_auto_chain(data_dir, monkeypatch):
     out = dispatch.handle(stop(active=False))                       # a real user turn resets the budget
     assert "Write a short plan for p2" in out["hookSpecificOutput"]["additionalContext"]
     assert store.load("s1").continuations == 0
+
+
+# --- M3 Task 3: spin guard, idempotent auto handover, verify text -------------
+
+import hashlib  # noqa: E402
+
+
+def test_spin_guard_fires_on_identical_handback(data_dir):
+    with store.locked("s1") as s:
+        s.new_task("b", [], "pid")                     # idle store, one ready task
+    first = dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]     # planning handover
+    assert "Write a short plan for p1" in first
+    out = dispatch.handle(stop(active=True))         # planning, no plan file: the retry text is identical
+    assert "hookSpecificOutput" not in out and "came back twice" in out["systemMessage"]
+    assert store.load("s1").state == "planning"      # Task 1's Esc-during-planning path requeues it on the next prompt
+
+
+def test_auto_execution_text_is_idempotent(data_dir):
+    with store.locked("s1") as s:
+        b = s.new_task("b", [], "pid"); b.auto = True; s.state = "planning"; s.pending_task = "p1"
+    p = paths.plan_path("s1", "p1"); p.parent.mkdir(parents=True); p.write_text("# plan")
+    assert "if you have not already carried it out" in dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]
+
+
+def test_verify_failed_text_without_tail():
+    t = store.Task(id="p1", text="x"); v = done.Verdict("verify_failed", "exit 1", "")
+    assert "Output tail" not in dispatch._verify_failed_text(t, v)
+
+
+# Additional tests beyond the plan's three.
+
+def test_spin_guard_message_and_log(data_dir):
+    with store.locked("s1") as s:
+        s.new_task("b", [], "pid")
+    dispatch.handle(stop(active=True))
+    out = dispatch.handle(stop(active=True))
+    assert out == {"systemMessage": "queue-switchclaude: the same instruction came back twice; stopping here, send any message to continue"}
+    rows = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()]
+    assert rows[-1]["event"] == "dispatch" and rows[-1]["spin_guard"] is True and rows[-1]["next"] == "p1"
+    s = store.load("s1"); assert s.pending_task == "p1" and s.get("p1").status == "queued"
+
+
+def test_spin_guard_needs_stop_hook_active(data_dir):
+    # The same planning text on a Stop the user caused is a fresh attempt, not a spin.
+    with store.locked("s1") as s:
+        s.new_task("b", [], "pid")
+    dispatch.handle(stop(active=False))
+    out = dispatch.handle(stop(active=False))
+    assert "Write a short plan for p1" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_last_handback_is_the_sha1_of_the_text(data_dir):
+    with store.locked("s1") as s:
+        s.new_task("b", [], "pid")
+    text = dispatch.handle(stop())["hookSpecificOutput"]["additionalContext"]
+    assert store.load("s1").last_handback == hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def test_spin_guard_lets_a_different_handover_through(data_dir, monkeypatch):
+    # Planning p1, then its plan is written and auto-executed, then p1 closes
+    # and p2 is planned: three continuations, three different texts, no guard.
+    monkeypatch.setattr(done, "judge", judge_as("done"))
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.auto = True; s.new_task("b", ["p1"], "pid")
+    assert "Write a short plan for p1" in dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]
+    p = paths.plan_path("s1", "p1"); p.parent.mkdir(parents=True); p.write_text("# plan")
+    assert "Execute the plan at" in dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]
+    assert "Write a short plan for p2" in dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]
+
+
+def test_auto_execution_text_exact(data_dir):
+    with store.locked("s1") as s:
+        b = s.new_task("b", [], "pid"); b.auto = True; s.state = "planning"; s.pending_task = "p1"
+    p = paths.plan_path("s1", "p1"); p.parent.mkdir(parents=True); p.write_text("# plan")
+    ctx = dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]
+    assert ctx == (f"queue-switchclaude: task p1 is approved. Execute the plan at {p} now if you have not already "
+                   "carried it out; if you have, say so and stop.")
+
+
+def test_verify_failed_text_with_and_without_tail():
+    t = store.Task(id="p1", text="x")
+    assert dispatch._verify_failed_text(t, done.Verdict("verify_failed", "exit 1", "")) == \
+        "queue-switchclaude: task p1 failed its verify command (exit 1). Fix it, then stop."
+    assert dispatch._verify_failed_text(t, done.Verdict("verify_failed", "exit 3", "boom")) == \
+        "queue-switchclaude: task p1 failed its verify command (exit 3). Output tail: boom. Fix it, then stop."
+
+
+def test_verify_failed_handback_without_output_has_no_tail(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "exit 1"; s.running_task = "p1"; s.state = "running"
+    ctx = dispatch.handle(stop())["hookSpecificOutput"]["additionalContext"]
+    assert ctx == "queue-switchclaude: task p1 failed its verify command (exit 1). Fix it, then stop."

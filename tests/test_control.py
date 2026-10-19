@@ -19,8 +19,8 @@ def test_cancel_promote_park_messages():
     s = seeded()
     assert control.run(s, "cancel p2").startswith("cancelled p2") and s.get("p2").status == "cancelled"
     assert control.run(s, "cancel p9") == "no task p9"
-    assert control.run(s, "promote p3") == "promoted p3 to the queue" and control.run(s, "promote p3") == "p3 is not parked or paused"
-    assert control.run(s, "park p3") == "parked p3" and control.run(s, "cancel p1") == "p1 is not queued, parked or paused"
+    assert control.run(s, "promote p3") == "promoted p3 to the queue" and control.run(s, "promote p3") == "p3 is not parked, paused or failed_verify"
+    assert control.run(s, "park p3") == "parked p3" and control.run(s, "cancel p1") == "p1 is not queued, parked, paused, planned or failed_verify"
 
 
 def test_drop_and_pause():
@@ -61,7 +61,7 @@ def test_cancel_promote_park_missing_or_wrong_status():
     assert control.run(s, "promote p9") == "no task p9"
     assert control.run(s, "park p9") == "no task p9"
     assert control.run(s, "park p1") == "p1 is not queued"
-    assert control.run(s, "promote p2") == "p2 is not parked or paused"
+    assert control.run(s, "promote p2") == "p2 is not parked, paused or failed_verify"
     assert control.run(s, "cancel") != "" and "cancel pN" in control.run(s, "cancel")
 
 
@@ -223,3 +223,38 @@ def test_help_lists_the_plan_flow_commands():
         assert word in out
     for word in ("verify", "auto", "manual", "show", "approve"):
         assert word in control.COMMANDS
+
+
+# --- M3 Task 3: reply strings name every status; shadow tasks are editable ----
+
+def test_control_replies_name_every_status():
+    s = seeded(); s.get("p2").status = "done"
+    assert control.run(s, "cancel p2") == "p2 is not queued, parked, paused, planned or failed_verify"
+    assert control.run(s, "promote p2") == "p2 is not parked, paused or failed_verify"
+
+
+def test_shadow_control_edits_shadow_tasks():
+    s = seeded(); s.get("p2").status = "shadow_queued"
+    assert control.run(s, "cancel p2").startswith("cancelled p2")
+
+
+# Additional tests beyond the plan's two.
+
+def test_shadow_park_and_drop_act_on_shadow_tasks():
+    s = seeded(); s.get("p2").status = "shadow_queued"
+    assert control.run(s, "park p2") == "parked p2" and s.get("p2").status == "parked"
+    s.get("p2").status = "shadow_queued"
+    assert control.run(s, "drop") == "dropped 2 tasks: p2, p3"
+    assert s.get("p2").status == "dropped" and s.get("p3").status == "dropped"
+
+
+def test_cancel_planned_and_failed_verify_tasks():
+    s = seeded(); s.get("p2").status = "planned"
+    assert control.run(s, "cancel p2") == "cancelled p2: write tests for login"
+    s.get("p3").status = "failed_verify"
+    assert control.run(s, "cancel p3") == "cancelled p3: social login"
+
+
+def test_promote_failed_verify_task():
+    s = seeded(); s.get("p2").status = "failed_verify"
+    assert control.run(s, "promote p2") == "promoted p2 to the queue" and s.get("p2").status == "queued"

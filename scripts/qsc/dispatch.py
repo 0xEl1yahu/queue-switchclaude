@@ -23,10 +23,21 @@ Every handover goes through ``hookSpecificOutput.additionalContext``
 (``handback``): a ``decision: "block"`` would also keep the turn alive but
 shows as a hook error in the UI. A Stop-hook continuation keeps the original
 ``current_prompt_id``, so intake still sees later messages as mid-turn.
+
+Spin guard (M3): ``handle`` hashes every handover it issues into
+``Store.last_handback``. A Stop fired by the harness's own continuation
+(``stop_hook_active``) whose handover hashes the same as the last one is a
+spin, so it is suppressed with a ``systemMessage`` and the turn ends; the
+user's next message carries on. The guard covers the instruction handovers
+(planning, its retry, re-presenting a plan, execution). The "fix it" and
+"finish it" handbacks from ``_close_running`` are bounded by ``Task.attempts``
+instead: their second copy is by design, and ends in ``failed_verify`` or
+``gave_up``.
 """
 from __future__ import annotations
 
 import contextlib
+import hashlib
 from pathlib import Path
 
 from . import done, log, paths, store
@@ -78,6 +89,16 @@ def _budget_message(n: int) -> str:
     return f"{PREFIX}: paused the automatic chain after {n} continuations; send any message to carry on"
 
 
+SPIN_GUARD_MESSAGE = (
+    f"{PREFIX}: the same instruction came back twice; stopping here, send any message to continue"
+)
+
+
+def _digest(text: str) -> str:
+    """The sha1 hex digest ``Store.last_handback`` keeps for a handover text."""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
 def _notes(task: store.Task) -> str:
     """``. The user later added: n1; n2`` or ``""``.
 
@@ -120,7 +141,19 @@ def _represent_text(s: store.Store, task: store.Task) -> str:
 
 
 def _execution_text(s: store.Store, task: store.Task) -> str:
+    """The execution handover.
+
+    An ``auto`` task's planning handover already told Claude to carry the
+    plan out at once, so by the time this text arrives the work may be done:
+    its wording is idempotent (M3) so a second pass neither redoes nor undoes
+    anything. An approved task gets the plain instruction.
+    """
     plan = paths.plan_path(s.session_id, task.id)
+    if task.auto:
+        return (
+            f"{PREFIX}: task {task.id} is approved. Execute the plan at {plan} now "
+            "if you have not already carried it out; if you have, say so and stop."
+        )
     return (
         f"{PREFIX}: task {task.id} is approved. Execute the plan at {plan} now. "
         "When it is done, say what was produced and stop."
@@ -128,9 +161,10 @@ def _execution_text(s: store.Store, task: store.Task) -> str:
 
 
 def _verify_failed_text(task: store.Task, verdict: done.Verdict) -> str:
+    tail = f"Output tail: {verdict.output_tail}. " if verdict.output_tail else ""
     return (
         f"{PREFIX}: task {task.id} failed its verify command ({verdict.reason}). "
-        f"Output tail: {verdict.output_tail}. Fix it, then stop."
+        f"{tail}Fix it, then stop."
     )
 
 
@@ -462,11 +496,8 @@ def choose_next(s: store.Store, stop_hook_active: bool = False, shadow: bool = F
         return None
     nxt = ready[0]
 
-    # Spin guard: a Stop fired by our own continuation must not push the
-    # same task twice.
-    if stop_hook_active and s.last_dispatched == nxt.id:
-        log.record(sid, "dispatch", next=nxt.id, shadow=shadow, spin_guard=True)
-        return None
+    # The spin guard lives in ``handle`` (``_issue``): it compares the text
+    # about to go out with the last one, which is what a spin repeats.
     if s.continuations >= MAX_CONTINUATIONS:
         log.record(sid, "dispatch", next=nxt.id, shadow=shadow, continuation_budget=s.continuations)
         return None
@@ -474,11 +505,35 @@ def choose_next(s: store.Store, stop_hook_active: bool = False, shadow: bool = F
     log.record(sid, "dispatch", next=nxt.id, shadow=shadow)
     s.state = "planning"
     s.pending_task = nxt.id
-    s.last_dispatched = nxt.id
     return _planning_text(s, nxt)
 
 
 # --- entry point -------------------------------------------------------------
+
+
+def _issue(s: store.Store, out: dict | None, stop_hook_active: bool) -> dict | None:
+    """Record the handover in ``out``, or suppress it when it is a spin.
+
+    ``out`` without an ``additionalContext`` (``None``, or a bare
+    ``systemMessage``) passes through untouched. Otherwise its text is hashed:
+    on a Stop-hook continuation whose text equals ``Store.last_handback``
+    the handover is replaced by ``SPIN_GUARD_MESSAGE`` and logged with
+    ``spin_guard=True``; the store keeps the state the stage set (so a
+    planning spin stays ``planning`` with its ``pending_task``, which intake
+    requeues on the user's next prompt). Any other text becomes the new
+    ``last_handback``.
+    """
+    if not out:
+        return out
+    text = out.get("hookSpecificOutput", {}).get("additionalContext")
+    if not isinstance(text, str) or not text:
+        return out
+    digest = _digest(text)
+    if stop_hook_active and digest == s.last_handback:
+        log.record(s.session_id, "dispatch", next=s.pending_task or s.running_task, spin_guard=True)
+        return {"systemMessage": SPIN_GUARD_MESSAGE}
+    s.last_handback = digest
+    return out
 
 
 def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | None:
@@ -504,7 +559,7 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
         if s.state == "planning":
             out, proceed = _after_planning(s)
             if not proceed:
-                return out
+                return _issue(s, out, active)
         elif s.state in _WAITING:
             # The user's turn ran something else, or nothing changed; the
             # pending plan or question is still waiting on the user.
@@ -520,7 +575,7 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
 
         text = choose_next(s, stop_hook_active=active, shadow=shadow)
         if text:
-            return handback(text, (extra or {}).get("systemMessage"))
+            return _issue(s, handback(text, (extra or {}).get("systemMessage")), active)
         if s.continuations >= MAX_CONTINUATIONS and s.ready():
             return {"systemMessage": _budget_message(s.continuations)}
         return extra or None
