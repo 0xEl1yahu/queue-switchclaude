@@ -258,3 +258,113 @@ def test_promote_accepts_paused(data_dir):
     assert s.promote("p1").status == "queued"
     t.status = "done"
     assert s.promote("p1") is None
+
+
+# M2 Task 2: store v3 (plan-flow states, verify/auto/attempts/plan fields,
+# stale-plan detection, promote/cancel for the new statuses).
+
+def test_new_task_fields_default(data_dir):
+    t = store.load("s1").new_task("a", [], None)
+    assert (t.verify, t.auto, t.attempts, t.plan_based_on, t.closing, t.verdict) == (None, False, 0, [], None, None)
+
+
+def test_stale_planned(data_dir):
+    s = store.load("s1"); a = s.new_task("a", [], None); b = s.new_task("b", ["p1"], None); c = s.new_task("c", [], None)
+    b.status = "planned"; b.plan_based_on = []; c.status = "planned"; c.plan_based_on = []
+    assert s.stale_planned() == []
+    a.status = "done"
+    assert [t.id for t in s.stale_planned()] == ["p2"]     # c does not depend on a
+
+
+def test_cancel_and_promote_new_statuses(data_dir):
+    s = store.load("s1"); a = s.new_task("a", [], None); a.status = "failed_verify"
+    assert s.promote("p1").status == "queued"
+    a.status = "planned"; assert s.cancel("p1").status == "cancelled"
+
+
+def test_m1_store_loads(data_dir):
+    p = paths.store_path("s1"); p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"session_id": "s1", "state": "idle", "current_prompt_id": None, "running_task": None, "next_id": 2, "interrupt": False, "last_dispatched": None, "paused": False, "tasks": [{"id": "p1", "text": "a", "status": "done", "depends_on": [], "prompt_id": None, "created_at": "2026-10-19T00:00:00Z", "norm_text": "a", "notes": []}]}))
+    assert store.load("s1").get("p1").attempts == 0 and store.load("s1").pending_task is None
+
+
+# Additional Task 2 tests beyond the plan's five.
+
+def test_v3_states_and_statuses():
+    assert store.STORE_STATES == ("idle", "running", "planning", "awaiting_approval", "awaiting_answer")
+    assert "planned" in store.TASK_STATUSES and "failed_verify" in store.TASK_STATUSES
+
+
+def test_store_pending_task_defaults_and_roundtrips(data_dir):
+    s = store.load("s1"); assert s.pending_task is None
+    s.new_task("a", [], None); s.pending_task = "p1"; s.state = "awaiting_approval"; store.save(s)
+    s2 = store.load("s1"); assert s2.pending_task == "p1" and s2.state == "awaiting_approval"
+
+
+def test_v3_task_fields_roundtrip(data_dir):
+    s = store.load("s1"); t = s.new_task("a", [], None)
+    t.verify = "pytest -q"; t.auto = True; t.attempts = 2; t.plan_based_on = ["p0"]; t.closing = "did it"; t.verdict = "done"
+    store.save(s)
+    t2 = store.load("s1").get("p1")
+    assert (t2.verify, t2.auto, t2.attempts, t2.plan_based_on, t2.closing, t2.verdict) == ("pytest -q", True, 2, ["p0"], "did it", "done")
+
+
+def test_done_ids_in_creation_order(data_dir):
+    s = store.load("s1")
+    a = s.new_task("a", [], None); b = s.new_task("b", [], None); c = s.new_task("c", [], None)
+    assert s.done_ids() == []
+    c.status = "done"; a.status = "done"; b.status = "running"
+    assert s.done_ids() == ["p1", "p3"]
+
+
+def test_stale_planned_only_counts_own_dependencies(data_dir):
+    s = store.load("s1")
+    a = s.new_task("a", [], None); b = s.new_task("b", [], None)
+    c = s.new_task("c", ["p1", "p2"], None); c.status = "planned"; c.plan_based_on = ["p1"]
+    a.status = "done"
+    assert s.stale_planned() == []          # the plan already saw p1 done; p2 is still pending
+    b.status = "done"
+    assert [t.id for t in s.stale_planned()] == ["p3"]
+
+
+def test_stale_planned_ignores_unrelated_done_and_non_planned(data_dir):
+    s = store.load("s1")
+    a = s.new_task("a", [], None); a.status = "done"
+    b = s.new_task("b", ["p1"], None); b.status = "planned"; b.plan_based_on = ["p1", "p9"]   # p9 unknown, never done
+    c = s.new_task("c", ["p1"], None); c.status = "queued"; c.plan_based_on = []
+    d = s.new_task("d", [], None); d.status = "done"
+    assert s.stale_planned() == []          # b's own deps: p1 done both times; unrelated d ignored
+
+
+def test_stale_planned_plan_based_on_order_does_not_matter(data_dir):
+    s = store.load("s1")
+    a = s.new_task("a", [], None); a.status = "done"
+    b = s.new_task("b", [], None); b.status = "done"
+    c = s.new_task("c", ["p1", "p2"], None); c.status = "planned"; c.plan_based_on = ["p2", "p1"]
+    assert s.stale_planned() == []
+
+
+def test_promote_and_cancel_rules_for_new_statuses(data_dir):
+    s = store.load("s1")
+    a = s.new_task("a", [], None); a.status = "planned"
+    assert s.promote("p1") is None          # planned is not promotable
+    b = s.new_task("b", [], None); b.status = "failed_verify"
+    assert s.cancel("p2").status == "cancelled"
+    c = s.new_task("c", [], None); c.status = "running"
+    assert s.cancel("p3") is None and s.promote("p3") is None
+
+
+def test_candidates_include_planned_and_failed_verify(data_dir):
+    s = store.load("s1")
+    a = s.new_task("a", [], None); a.status = "planned"
+    b = s.new_task("b", [], None); b.status = "failed_verify"
+    c = s.new_task("c", [], None); c.status = "done"
+    assert [t.id for t in s.candidates()] == ["p1", "p2"]
+
+
+def test_ready_excludes_planned_and_failed_verify(data_dir):
+    s = store.load("s1")
+    a = s.new_task("a", [], None); a.status = "planned"
+    b = s.new_task("b", [], None); b.status = "failed_verify"
+    s.new_task("c", [], None)
+    assert [t.id for t in s.ready()] == ["p3"]

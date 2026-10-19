@@ -22,13 +22,21 @@ from . import log, paths
 TASK_STATUSES = (
     "queued", "parked", "running", "paused", "done", "interrupted",
     "dropped", "cancelled", "shadow_queued", "shadow_dispatched",
+    # v3: a plan was written and awaits approval; a verify command failed
+    # and the task was handed back (promote returns it to the queue).
+    "planned", "failed_verify",
 )
-STORE_STATES = ("idle", "running")
+# v3: `planning` while Claude writes a plan for `pending_task`;
+# `awaiting_approval` once the plan is on screen; `awaiting_answer` when the
+# running task ended by asking the user something.
+STORE_STATES = ("idle", "running", "planning", "awaiting_approval", "awaiting_answer")
 
 # Statuses a task can be cancelled from (control "cancel pN", amend note "cancel").
-CANCELLABLE = ("queued", "parked", "paused")
+CANCELLABLE = ("queued", "parked", "paused", "planned", "failed_verify")
+# Statuses promote() moves back to `queued`.
+PROMOTABLE = ("parked", "paused", "failed_verify")
 # Statuses that make a task a live candidate for amend targets and listings.
-CANDIDATE_STATUSES = ("queued", "parked", "paused", "running")
+CANDIDATE_STATUSES = ("queued", "parked", "paused", "running", "planned", "failed_verify")
 # Statuses find_recent() never matches: the task is gone, so resubmitting
 # the same text is a fresh request, not a duplicate.
 _NOT_RECENT = ("dropped", "cancelled")
@@ -79,6 +87,21 @@ class Task:
     norm_text: str = ""
     # v2: amend appendices ("the webhook handler should verify signatures").
     notes: list[str] = field(default_factory=list)
+    # v3: shell command that decides done (exit 0) instead of the judge.
+    verify: str | None = None
+    # v3: skip the approval gate; the plan flows straight into execution.
+    auto: bool = False
+    # v3: "not done, continue" / "verify failed" handbacks so far (cap 2),
+    # and planning retries while in state `planning`.
+    attempts: int = 0
+    # v3: ids of the tasks that were `done` when the plan was written, so
+    # Store.stale_planned() can tell a plan whose dependency finished later.
+    plan_based_on: list[str] = field(default_factory=list)
+    # v3: the closing message filed when the task was marked done.
+    closing: str | None = None
+    # v3: verify_ok | verify_failed | done | not_done | asked_question |
+    # gave_up | stopped (and `confirmed` when the user confirms a task done).
+    verdict: str | None = None
 
 
 @dataclass
@@ -91,6 +114,8 @@ class Store:
     interrupt: bool = False
     last_dispatched: str | None = None
     paused: bool = False  # set by `queue: pause`; dispatch runs nothing while True
+    # v3: the task being planned, awaiting approval or awaiting an answer.
+    pending_task: str | None = None
     tasks: list[Task] = field(default_factory=list)
 
     def new_task(
@@ -129,11 +154,36 @@ class Store:
         A dependency that names no known task is never satisfied. Parked and
         paused tasks are never ready: only ``queued`` counts.
         """
-        done = {t.id for t in self.tasks if t.status == "done"}
+        done = set(self.done_ids())
         return [
             t for t in self.tasks
             if t.status == "queued" and all(dep in done for dep in t.depends_on)
         ]
+
+    def done_ids(self) -> list[str]:
+        """Ids of every ``done`` task, in creation order."""
+        return [t.id for t in self.tasks if t.status == "done"]
+
+    def stale_planned(self) -> list[Task]:
+        """``planned`` tasks whose plan predates the completion of one of their own
+        dependencies.
+
+        A plan records ``plan_based_on`` (the ``done`` ids at the time it was
+        written). Restricted to the task's ``depends_on``, that set is compared
+        with the current ``done_ids()``; a difference means a dependency
+        finished after the plan was written and its outcome may have changed
+        what the plan assumed, so dispatch re-plans it. Tasks that finished
+        but are not dependencies never make a plan stale.
+        """
+        done_now = set(self.done_ids())
+        stale = []
+        for task in self.tasks:
+            if task.status != "planned":
+                continue
+            deps = set(task.depends_on)
+            if (done_now & deps) != (set(task.plan_based_on) & deps):
+                stale.append(task)
+        return stale
 
     def find_recent(
         self,
@@ -161,7 +211,8 @@ class Store:
         return None
 
     def cancel(self, task_id: str) -> Task | None:
-        """Mark a queued, parked or paused task ``cancelled``; else ``None``."""
+        """Mark a queued, parked, paused, planned or failed_verify task
+        ``cancelled``; else ``None``."""
         task = self.get(task_id)
         if task is None or task.status not in CANCELLABLE:
             return None
@@ -169,19 +220,22 @@ class Store:
         return task
 
     def promote(self, task_id: str) -> Task | None:
-        """Move a parked or paused task back to the queue; ``None`` otherwise.
+        """Move a parked, paused or failed_verify task back to the queue;
+        ``None`` otherwise.
 
         A paused task (amend note ``pause``, or the running task left paused
-        by dispatch) has no other way back into ``ready()``.
+        by dispatch) has no other way back into ``ready()``; neither has a
+        task whose verify command kept failing until dispatch gave it back.
         """
         task = self.get(task_id)
-        if task is None or task.status not in ("parked", "paused"):
+        if task is None or task.status not in PROMOTABLE:
             return None
         task.status = "queued"
         return task
 
     def candidates(self) -> list[Task]:
-        """Live tasks (queued, parked, paused, running) in creation order.
+        """Live tasks (queued, parked, paused, running, planned, failed_verify)
+        in creation order.
 
         These are the amend targets and what ``queue: list`` shows.
         """

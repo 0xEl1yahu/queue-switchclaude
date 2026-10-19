@@ -32,6 +32,26 @@ def log_path(session_id: str) -> Path:
     return data_dir() / "log" / f"{safe_id(session_id)}.jsonl"
 
 
+def session_dir(session_id: str) -> Path:
+    """The per-session directory holding plans and handoffs: ``sessions/<safe_id>/``.
+
+    It sits next to the session's ``<safe_id>.json`` store. Plans and handoffs
+    live here, under the plugin data dir, rather than in the user's repository
+    as spec §4.3 (``plans/pN.md``) suggested, so the working tree stays clean.
+    """
+    return data_dir() / "sessions" / safe_id(session_id)
+
+
+def plan_path(session_id: str, task_id: str) -> Path:
+    """``sessions/<sid>/plans/<task_id>.md``: the plan Claude writes for a task."""
+    return session_dir(session_id) / "plans" / f"{safe_id(task_id)}.md"
+
+
+def handoff_path(session_id: str, task_id: str) -> Path:
+    """``sessions/<sid>/handoffs/<task_id>.md``: what dispatch files when a task closes."""
+    return session_dir(session_id) / "handoffs" / f"{safe_id(task_id)}.md"
+
+
 def pointer_path() -> Path:
     """The file holding the id of the session intake saw last.
 
