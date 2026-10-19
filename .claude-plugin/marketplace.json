@@ -1,0 +1,8 @@
+{
+  "name": "queue-switchclaude",
+  "owner": {"name": "0xEl1yahu"},
+  "description": "The queue-switchclaude plugin: a steer / queue / amend / split harness for messages typed mid-run in Claude Code.",
+  "plugins": [
+    {"name": "queue-switchclaude", "source": ".", "description": "Sorts messages typed mid-run into steer / queue / amend / split, runs queued tasks after the current one with plans and approvals, and stops the turn when you say stop."}
+  ]
+}

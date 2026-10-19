@@ -1,10 +1,13 @@
 {
   "name": "queue-switchclaude",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Sorts messages typed mid-run into steer / queue / interrupt, runs queued tasks after the current one finishes, and stops the turn when you say stop.",
   "author": {
     "name": "0xEl1yahu"
   },
+  "homepage": "https://github.com/0xEl1yahu/queue-switchclaude",
+  "repository": "https://github.com/0xEl1yahu/queue-switchclaude",
+  "license": "MIT",
   "userConfig": {
     "shadow": {
       "type": "boolean",

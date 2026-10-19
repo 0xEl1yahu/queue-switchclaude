@@ -38,11 +38,25 @@ The bare form `queue list` (no colon) works for `list`, `cancel`, `promote`, `pa
 - [`queue-harness-plan.md`](queue-harness-plan.md): the surviving side plan. Answers to the open questions, lessons borrowed from two prior projects, risks, and the M0–M3 milestones.
 - [`eval/golden_queue_intake.jsonl`](eval/golden_queue_intake.jsonl): 47 labelled intake cases across five scenarios, with rationales and acceptable alternatives. The schema is in the spec, section 8.
 
-## Install for development
+## Install
+
+From inside Claude Code, add the repository as a marketplace and install the plugin from it:
 
 ```bash
-claude plugin validate /Users/elibelilty/Documents/GitHub/queue-switchclaude
-claude --plugin-dir /Users/elibelilty/Documents/GitHub/queue-switchclaude
+/plugin marketplace add 0xEl1yahu/queue-switchclaude
+/plugin install queue-switchclaude@queue-switchclaude
+```
+
+Restart the session afterwards so the hooks load. To remove it: `/plugin uninstall queue-switchclaude@queue-switchclaude`.
+
+## Install for development
+
+Run a checkout directly, without installing it, to pick up code changes on every hook call:
+
+```bash
+git clone https://github.com/0xEl1yahu/queue-switchclaude.git
+claude plugin validate queue-switchclaude
+claude --plugin-dir queue-switchclaude
 ```
 
 Toggle **Shadow mode** under `/config` to log every decision without acting on it. Everything the plugin writes is under `$CLAUDE_PLUGIN_DATA` (fallback when the variable is unset: `~/.claude/queue-switchclaude/`): the per-session store at `sessions/<session_id>.json`, the plans Claude writes at `sessions/<session_id>/plans/pN.md`, the handoffs dispatch files at `sessions/<session_id>/handoffs/pN.md`, and the decision log at `log/<session_id>.jsonl`. Nothing is written into the repository Claude is working in.

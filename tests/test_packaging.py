@@ -43,7 +43,7 @@ def test_hooks_json_registers_exactly_three_events():
 def test_plugin_manifest_declares_shadow():
     m = json.load(open(ROOT / ".claude-plugin" / "plugin.json"))
     assert m["name"] == "queue-switchclaude" and m["userConfig"]["shadow"]["type"] == "boolean"
-    assert m["version"] == "0.1.0"
+    assert m["version"] == "0.3.0"
     assert m["author"]["name"] == "0xEl1yahu"
     assert m["userConfig"]["shadow"]["default"] is False
 
@@ -63,3 +63,52 @@ def test_command_file_frontmatter_and_script_exist():
 def test_command_file_passes_plugin_data_dir_to_the_cli():
     text = (ROOT / "commands" / "queue.md").read_text()
     assert 'CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_DATA}"' in text and "Bash(CLAUDE_PLUGIN_DATA=*)" in text
+
+
+# Task 6 (M3): installable from GitHub, CI, version.
+
+def test_marketplace_manifest_lists_this_plugin():
+    m = json.load(open(ROOT / ".claude-plugin" / "marketplace.json"))
+    assert m["name"] == "queue-switchclaude" and m["plugins"][0]["source"] == "." and m["plugins"][0]["name"] == "queue-switchclaude"
+
+
+def test_plugin_version_and_links():
+    m = json.load(open(ROOT / ".claude-plugin" / "plugin.json"))
+    assert m["version"] == "0.3.0" and m["repository"].startswith("https://github.com/0xEl1yahu/queue-switchclaude") and m["license"] == "MIT"
+
+
+def test_readme_has_marketplace_install_line():
+    text = (ROOT / "README.md").read_text()
+    assert "/plugin marketplace add 0xEl1yahu/queue-switchclaude" in text and (ROOT / "LICENSE").exists() and (ROOT / ".github" / "workflows" / "test.yml").exists()
+
+
+def test_marketplace_manifest_owner_and_description():
+    m = json.load(open(ROOT / ".claude-plugin" / "marketplace.json"))
+    assert m["owner"]["name"] == "0xEl1yahu"
+    assert m["plugins"][0]["description"].startswith("Sorts messages typed mid-run into steer / queue / amend / split")
+
+
+def test_plugin_manifest_homepage_matches_repository():
+    m = json.load(open(ROOT / ".claude-plugin" / "plugin.json"))
+    assert m["homepage"] == "https://github.com/0xEl1yahu/queue-switchclaude"
+    assert m["repository"] == "https://github.com/0xEl1yahu/queue-switchclaude"
+
+
+def test_license_is_mit():
+    text = (ROOT / "LICENSE").read_text()
+    assert text.startswith("MIT License") and "0xEl1yahu" in text
+
+
+def test_readme_keeps_plugin_dir_line_for_development():
+    text = (ROOT / "README.md").read_text()
+    assert "## Install" in text and "## Install for development" in text
+    assert text.index("/plugin marketplace add") < text.index("## Install for development")
+    assert "claude --plugin-dir" in text
+
+
+def test_ci_workflow_matrix_and_test_command():
+    text = (ROOT / ".github" / "workflows" / "test.yml").read_text()
+    assert "pull_request" in text and "push" in text and "ubuntu-latest" in text
+    for version in ('"3.10"', '"3.12"', '"3.14"'):
+        assert version in text
+    assert "python -m pip install pytest" in text and "python -m pytest -q" in text
