@@ -126,3 +126,24 @@ def test_script_shadow_env_does_not_dispatch(data_dir, monkeypatch):
     assert r.returncode == 0 and r.stdout == ""
     assert store.load("s1").get("p1").status == "queued"
     assert '"shadow": true' in paths.log_path("s1").read_text()
+
+
+def test_shadow_dispatch_reports_would_be_task(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; s.running_task = "p1"; s.state = "running"
+        b = s.new_task("b", ["p1"], "pid"); b.status = "shadow_queued"
+        c = s.new_task("c", ["p2"], "pid"); c.status = "shadow_queued"
+    assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"}, shadow=True) is None
+    s = store.load("s1")
+    assert s.get("p1").status == "done" and s.get("p2").status == "shadow_dispatched" and s.get("p3").status == "shadow_queued"
+    assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"}, shadow=True) is None
+    assert store.load("s1").get("p3").status == "shadow_dispatched"
+    rows = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines() if '"dispatch"' in l]
+    assert [r["next"] for r in rows] == ["p2", "p3"] and all(r["shadow"] for r in rows)
+
+
+def test_shadow_queued_tasks_never_dispatch_for_real(data_dir):
+    with store.locked("s1") as s:
+        b = s.new_task("b", [], "pid"); b.status = "shadow_queued"
+    assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"}) is None
+    assert store.load("s1").get("p1").status == "shadow_queued"

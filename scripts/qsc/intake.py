@@ -28,6 +28,29 @@ ACTIONABLE_LABELS = ("queue", "interrupt")
 Classifier = Callable[[dict], Optional[classify.Decision]]
 
 
+SHADOW_QUEUED = "shadow_queued"
+
+
+def _block(reason: str) -> dict:
+    """A UserPromptSubmit block the user can actually see.
+
+    On Claude Code 2.1.302 the ``reason`` of a block is not displayed; the
+    prompt text is echoed as "Original prompt: ..." and returned to the input
+    box (docs/m0-acceptance.md, issue 1). ``systemMessage`` is the documented
+    "warning message shown to the user" on every event, and
+    ``suppressOriginalPrompt`` keeps the held text out of the block message.
+    """
+    return {
+        "decision": "block",
+        "reason": reason,
+        "systemMessage": reason,
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "suppressOriginalPrompt": True,
+        },
+    }
+
+
 def _esc_notice(dropped: list[store.Task]) -> str | None:
     """The additionalContext line for an Esc-interrupted turn; None when nothing was queued."""
     if not dropped:
@@ -47,7 +70,7 @@ def _new_turn(s: store.Store, event: dict, prompt: str, prompt_id: str | None) -
         if running is not None and running.status == "running":
             running.status = "interrupted"
             interrupted = running.id
-        dropped = [t for t in s.tasks if t.status == "queued"]
+        dropped = [t for t in s.tasks if t.status in ("queued", SHADOW_QUEUED)]
         for t in dropped:
             t.status = "dropped"
         notice = _esc_notice(dropped)
@@ -85,7 +108,7 @@ def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
 
 def _chain_deps(s: store.Store) -> list[str]:
     """M0 dependency rule: the last queued task, else the running task, else nothing."""
-    queued = [t for t in s.tasks if t.status == "queued"]
+    queued = [t for t in s.tasks if t.status in ("queued", SHADOW_QUEUED)]
     if queued:
         return [queued[-1].id]
     if s.running_task:
@@ -136,19 +159,23 @@ def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = Fa
             prompt_id=prompt_id,
         )
 
-        if shadow:
-            return None
-
         if label == "interrupt":
+            if shadow:
+                return None
             s.interrupt = True
-            return {"decision": "block", "reason": f"{PREFIX}: stopping {s.running_task or 'the current turn'} at the next tool call"}
+            return _block(f"{PREFIX}: stopping {s.running_task or 'the current turn'} at the next tool call")
 
         if label == "queue":
             deps = _chain_deps(s)
             if decision is not None and decision.depends_on:
                 deps = list(decision.depends_on)
             t = s.new_task(v.text, deps, prompt_id)
+            if shadow:
+                # Record what would have been queued so dispatch can report what
+                # it would have run (docs/m0-acceptance.md, issue 2). Never ready().
+                t.status = SHADOW_QUEUED
+                return None
             after = ", ".join(deps) if deps else "nothing"
-            return {"decision": "block", "reason": f"{PREFIX}: queued {t.id} after {after}: {t.text}"}
+            return _block(f"{PREFIX}: queued {t.id} after {after}: {t.text}")
 
         return None

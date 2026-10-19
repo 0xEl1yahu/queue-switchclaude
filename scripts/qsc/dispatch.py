@@ -11,6 +11,23 @@ from . import log, store
 from .interrupt import reset_after_interrupt
 
 
+SHADOW_QUEUED = "shadow_queued"
+SHADOW_DISPATCHED = "shadow_dispatched"
+_SATISFIED = ("done", SHADOW_DISPATCHED)
+
+
+def _shadow_ready(s: store.Store) -> list[store.Task]:
+    """Shadow-queued tasks whose dependencies are done or shadow-dispatched."""
+    by_id = {t.id: t for t in s.tasks}
+    out = []
+    for t in s.tasks:
+        if t.status != SHADOW_QUEUED:
+            continue
+        if all(d in by_id and by_id[d].status in _SATISFIED for d in t.depends_on):
+            out.append(t)
+    return out
+
+
 def _handoff(task: store.Task) -> dict:
     text = (
         f"queue-switchclaude: the user queued task {task.id} to run after the "
@@ -38,6 +55,14 @@ def handle(event: dict, shadow: bool = False) -> dict | None:
             running.status = "done"
         s.state = "idle"
         s.running_task = None
+
+        if shadow:
+            # Report what would run, mark it so the next Stop reports the one after.
+            would = _shadow_ready(s)
+            if would:
+                would[0].status = SHADOW_DISPATCHED
+            log.record(session_id, "dispatch", next=would[0].id if would else None, shadow=True)
+            return None
 
         ready = s.ready()
         if not ready:

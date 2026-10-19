@@ -48,8 +48,29 @@ def test_classifier_failure_passes_through(data_dir):
 def test_shadow_logs_but_does_not_block(data_dir):
     intake.handle(ev("add a user model"))
     assert intake.handle(ev("later: email verification"), shadow=True) is None
-    assert store.load("s1").tasks[-1].id == "p1"
+    s = store.load("s1")
+    # Issue 2: shadow mode records the would-be task under a status ready() never picks.
+    assert s.get("p2").status == "shadow_queued" and s.get("p2").depends_on == ["p1"] and s.ready() == []
+    assert intake.handle(ev("later: password reset"), shadow=True) is None
+    assert store.load("s1").get("p3").depends_on == ["p2"]
     assert '"label": "queue"' in paths.log_path("s1").read_text()
+
+
+def test_shadow_interrupt_logs_only(data_dir):
+    intake.handle(ev("add a user model"))
+    assert intake.handle(ev("stop"), shadow=True) is None
+    assert store.load("s1").interrupt is False
+
+
+def test_block_output_is_visible_to_the_user(data_dir):
+    intake.handle(ev("add a user model"))
+    for msg in ("later: email verification", "stop"):
+        out = intake.handle(ev(msg))
+        assert out["decision"] == "block"
+        # Issue 1: reason is not displayed on 2.1.302; systemMessage is, and the
+        # held text must not be echoed back as "Original prompt: ...".
+        assert out["systemMessage"] == out["reason"]
+        assert out["hookSpecificOutput"] == {"hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": True}
 
 
 def test_esc_detected_drops_queue_with_notice(data_dir):
@@ -143,7 +164,8 @@ def test_script_shadow_env_does_not_block(data_dir, monkeypatch):
     run("add a user model")
     r = run("later: email verification")
     assert r.returncode == 0 and r.stdout == ""
-    assert store.load("s1").tasks[-1].id == "p1"
+    t = store.load("s1").tasks[-1]
+    assert t.id == "p2" and t.status == "shadow_queued"
 
 
 def test_interrupt_reason_names_running_task(data_dir):
