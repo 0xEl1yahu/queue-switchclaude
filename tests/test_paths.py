@@ -72,3 +72,14 @@ def test_cwd_pointer_path(data_dir):
     assert p.name == hashlib.sha1(b"/proj/one").hexdigest()[:16]
     assert paths.cwd_pointer_path("/proj/one") == p
     assert paths.cwd_pointer_path("/proj/two") != p
+
+
+def test_cwd_pointer_path_is_the_same_for_every_spelling_of_a_folder(data_dir, tmp_path):
+    # M3 review: the hook's ``cwd`` and the CLI's ``os.getcwd()`` can spell one
+    # folder two ways (a symlink, ``/tmp`` vs ``/private/tmp`` on macOS); both
+    # must hash to one pointer or the CLI falls back to another session.
+    real = tmp_path / "real"; real.mkdir()
+    link = tmp_path / "link"; link.symlink_to(real)
+    assert paths.cwd_pointer_path(str(link)) == paths.cwd_pointer_path(str(real))
+    assert paths.cwd_pointer_path(str(real) + "/") == paths.cwd_pointer_path(str(real))
+    assert paths.canonical_cwd("/proj/one") == "/proj/one"            # a missing path is left as it is

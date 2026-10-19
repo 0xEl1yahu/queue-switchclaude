@@ -68,8 +68,11 @@ def resolve_session(explicit: str | None, cwd: str | None = None) -> str | None:
 
     The Bash tool runs the command in the project directory, and intake
     keys a pointer by each event's ``cwd``, so a session in another folder
-    never answers for this one (M3 review focus 1). The global pointer is
-    the fallback for a directory no session has typed in.
+    never answers for this one (M3 review focus 1). Both sides use the
+    canonical spelling of the folder (``paths.canonical_cwd``) and the CLI
+    also tries each parent directory, so a ``cd`` into a subdirectory or a
+    symlinked path still finds this project's session. The global pointer
+    is the fallback for a directory no session has typed in.
     """
     if explicit:
         return explicit
@@ -84,10 +87,28 @@ def resolve_session(explicit: str | None, cwd: str | None = None) -> str | None:
         except OSError:
             cwd = None
     if cwd:
-        found = _read_pointer(paths.cwd_pointer_path(cwd))
-        if found:
-            return found
+        for folder in _cwd_chain(cwd):
+            found = _read_pointer(paths.cwd_pointer_path(folder))
+            if found:
+                return found
     return _read_pointer(paths.pointer_path())
+
+
+def _cwd_chain(cwd: str) -> list[str]:
+    """``cwd`` (canonical) and then each of its parents up to the root.
+
+    The Bash tool keeps its working directory across calls, so by the time
+    the slash command runs it may sit in a subdirectory of the project the
+    session typed in; the pointer for the nearest enclosing folder is that
+    session's, and the global pointer stays the fallback for a folder no
+    session has typed in.
+    """
+    from pathlib import Path
+
+    from qsc import paths
+
+    here = Path(paths.canonical_cwd(cwd))
+    return [str(here)] + [str(parent) for parent in here.parents]
 
 
 def main(argv: list[str]) -> str:

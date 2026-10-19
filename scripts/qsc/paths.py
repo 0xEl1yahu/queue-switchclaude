@@ -117,5 +117,21 @@ def cwd_pointer_path(cwd: str) -> Path:
     directory it runs in. The hash keeps the name short, safe and free of
     path separators.
     """
-    digest = hashlib.sha1(str(cwd).encode("utf-8", errors="surrogateescape")).hexdigest()
+    digest = hashlib.sha1(canonical_cwd(cwd).encode("utf-8", errors="surrogateescape")).hexdigest()
     return pointers_dir() / digest[:16]
+
+
+def canonical_cwd(cwd: object) -> str:
+    """One spelling for a working directory: absolute, symlinks resolved.
+
+    The hook event's ``cwd`` and the directory ``queue_cli.py`` runs in can
+    spell the same folder differently (``/tmp/x`` and ``/private/tmp/x`` on
+    macOS, a symlinked home); hashing the raw string would give two pointers
+    for one folder and the CLI would fall back to the newest session anywhere.
+    A path that does not exist is normalised without being resolved.
+    """
+    text = str(cwd)
+    try:
+        return os.path.realpath(text)
+    except (OSError, ValueError):
+        return text

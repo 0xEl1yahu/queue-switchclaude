@@ -152,3 +152,29 @@ def test_queue_cli_subprocess_uses_the_directory_it_runs_in(data_dir, tmp_path):
     assert r.returncode == 0 and "email verification" in r.stdout and "write docs" not in r.stdout
     r = run_cli(data_dir, "list", cwd=str(two))
     assert r.returncode == 0 and "write docs" in r.stdout and "email verification" not in r.stdout
+
+
+def test_cli_finds_the_session_through_a_symlinked_cwd(data_dir, tmp_path):
+    # Intake saw the folder through a symlink; the CLI runs in the real path.
+    real = tmp_path / "real"; real.mkdir()
+    link = tmp_path / "link"; link.symlink_to(real)
+    intake.handle({**ev("a", sid="s-link"), "cwd": str(link)})
+    intake.handle({**ev("b", sid="s-other"), "cwd": "/proj/other"})          # newest: the global pointer
+    assert queue_cli.resolve_session(None, cwd=str(real)) == "s-link"
+    assert queue_cli.resolve_session(None, cwd=str(link)) == "s-link"
+
+
+def test_cli_in_a_subdirectory_resolves_to_the_enclosing_session(data_dir, tmp_path):
+    # The Bash tool keeps its cwd across calls: after a ``cd packages/x`` the
+    # slash command runs below the project root. The nearest enclosing
+    # folder's session answers, never the newest session anywhere.
+    proj = tmp_path / "proj"; sub = proj / "packages" / "x"; sub.mkdir(parents=True)
+    intake.handle({**ev("a", sid="s-proj"), "cwd": str(proj)})
+    intake.handle({**ev("b", sid="s-other"), "cwd": "/proj/other"})
+    assert queue_cli.resolve_session(None, cwd=str(sub)) == "s-proj"
+    # A session of its own in the subdirectory wins over the parent's.
+    intake.handle({**ev("c", sid="s-sub"), "cwd": str(sub)})
+    assert queue_cli.resolve_session(None, cwd=str(sub / "deeper")) == "s-sub"
+    assert queue_cli.resolve_session(None, cwd=str(proj)) == "s-proj"
+    r = run_cli(data_dir, "list", cwd=str(sub))
+    assert r.returncode == 0 and "c" in r.stdout
