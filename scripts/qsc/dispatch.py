@@ -29,10 +29,19 @@ def _shadow_ready(s: store.Store) -> list[store.Task]:
 
 
 def _handoff(task: store.Task) -> dict:
+    """The additionalContext that hands ``task`` to Claude.
+
+    An amend by subject (``intake._amend``) appends to ``task.notes`` rather
+    than rewriting ``task.text``, so the notes travel with the handoff; a
+    task without notes reads exactly as it did in M0.
+    """
     text = (
         f"queue-switchclaude: the user queued task {task.id} to run after the "
         f"previous work. Do it now: {task.text}"
     )
+    if task.notes:
+        notes = "; ".join(" ".join(n.split()) for n in task.notes)
+        text += f". The user later added: {notes}"
     return {"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": text}}
 
 

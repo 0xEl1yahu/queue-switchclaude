@@ -204,3 +204,25 @@ def test_dispatch_paused_running_task_clears_running_and_dispatches_independent(
     # p2 waits on the paused p1; p3 has no dependency and runs.
     assert "p3" in out["hookSpecificOutput"]["additionalContext"]
     assert s.get("p1").status == "paused" and s.get("p2").status == "queued" and s.running_task == "p3"
+
+
+def test_dispatch_handoff_includes_notes(data_dir):
+    # An amend by subject appends a note to the queued task (intake._amend);
+    # the handoff must carry it or the note is lost (docs/m1-acceptance.md, H).
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; s.running_task = "p1"; s.state = "running"
+        b = s.new_task("add a goodbye.py that prints goodbye", ["p1"], "pid")
+        b.notes.append("the goodbye script should also print the date")
+    out = dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "stop_hook_active": False})
+    text = out["hookSpecificOutput"]["additionalContext"]
+    assert "Do it now: add a goodbye.py that prints goodbye" in text
+    assert "the goodbye script should also print the date" in text
+    assert text.index("goodbye.py") < text.index("print the date")
+
+
+def test_dispatch_handoff_without_notes_is_unchanged(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; s.running_task = "p1"; s.state = "running"
+        s.new_task("b", ["p1"], "pid")
+    out = dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "stop_hook_active": False})
+    assert out["hookSpecificOutput"]["additionalContext"].endswith("Do it now: b")
