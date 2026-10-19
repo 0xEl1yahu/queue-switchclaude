@@ -1,4 +1,4 @@
-from qsc import control, store
+from qsc import control, rules, store
 
 
 def seeded():
@@ -258,3 +258,23 @@ def test_cancel_planned_and_failed_verify_tasks():
 def test_promote_failed_verify_task():
     s = seeded(); s.get("p2").status = "failed_verify"
     assert control.run(s, "promote p2") == "promoted p2 to the queue" and s.get("p2").status == "queued"
+
+
+# --- M4 Task 3: the help line names every control word -------------------------
+
+def test_help_names_every_control_word():
+    text = control.help_text()
+    for w in rules.CONTROL_WORDS:
+        assert w in text, w
+
+
+# Additional tests beyond the plan's one.
+
+def test_help_names_every_control_word_as_a_whole_word_on_one_line():
+    import re
+    text = control.help_text()
+    assert "\n" not in text and text == control.run(store.Store("s1"), "help")
+    for w in rules.CONTROL_WORDS:
+        assert re.search(rf"(^|[ |]){w}( |$)", text), w
+    assert "resume [pN]" in text and "show pN" in text
+    assert set(rules.CONTROL_WORDS) == set(control.COMMANDS)

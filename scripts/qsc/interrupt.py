@@ -9,8 +9,9 @@ The Stop hook does not fire after that.
 Registered on ``PreToolUse`` only (M3, decision D6): a ``PostToolUse``
 boundary is always followed by the next ``PreToolUse`` or by ``Stop``, and
 dispatch honours the flag there, so one launch per tool call loses
-nothing. ``handle`` still accepts a ``PostToolUse`` event for callers that
-send one. An ``AskUserQuestion`` call is skipped without reading the store:
+nothing. Since M4 ``handle`` reads ``PreToolUse`` only as well: any other
+event name (``PostToolUse`` included) returns None without touching the
+store. An ``AskUserQuestion`` call is skipped without reading the store:
 that turn is already waiting on the user.
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ from __future__ import annotations
 from . import log, store
 
 STOP_REASON = "queue-switchclaude: stopped as requested"
+HOOK_EVENT = "PreToolUse"
 
 # Tools whose call means the turn is already handing control to the user;
 # ending it there would only swallow the question. The flag stays set for
@@ -56,7 +58,12 @@ def stop_reason(dropped: list[store.Task]) -> str:
 
 
 def handle(event: dict) -> dict | None:
-    """Return ``{"continue": False, ...}`` when the interrupt flag is set, else None."""
+    """Return ``{"continue": False, ...}`` when the interrupt flag is set, else None.
+
+    Only a ``PreToolUse`` event is acted on; anything else returns None.
+    """
+    if event.get("hook_event_name") != HOOK_EVENT:
+        return None
     session_id = event.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return None

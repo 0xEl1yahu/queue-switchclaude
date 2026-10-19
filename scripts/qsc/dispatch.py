@@ -176,7 +176,10 @@ def _execution_text(s: store.Store, task: store.Task) -> str:
 
 
 def _verify_failed_text(task: store.Task, verdict: done.Verdict) -> str:
-    tail = f"Output tail: {verdict.output_tail}. " if verdict.output_tail else ""
+    # An empty or whitespace-only tail is omitted, so the handback never
+    # reads ``Output tail: .`` (M2 fixes observation).
+    output_tail = (verdict.output_tail or "").strip()
+    tail = f"Output tail: {output_tail}. " if output_tail else ""
     return (
         f"{PREFIX}: task {task.id} failed its verify command ({verdict.reason}). "
         f"{tail}Fix it, then stop."
@@ -533,19 +536,21 @@ def _maybe_gc(s: store.Store) -> None:
     with this session protected; later Stops skip it. The stamp is written
     before the call, so a collector that raises is not retried every turn,
     and every error is swallowed: housekeeping never costs the user a
-    handover. A ``gc`` log line is written only when something was deleted
-    or the run failed; ``gc_at`` already says that it ran.
+    handover. A ``gc`` log line is written only when a session or a stale
+    pointer was deleted or the run failed; ``gc_at`` already says that it
+    ran. The result is only logged: ``gc.collect`` returns
+    ``(deleted_sessions, deleted_pointers)`` (M4 Task 3).
     """
     if s.gc_at:
         return
     s.gc_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     try:
-        deleted = list(gc.collect(protect={s.session_id}))
+        deleted, pointers = gc.collect(protect={s.session_id})
     except Exception as exc:
         _record(s.session_id, "gc", error=f"{type(exc).__name__}: {exc}")
         return
-    if deleted:
-        _record(s.session_id, "gc", deleted=deleted)
+    if deleted or pointers:
+        _record(s.session_id, "gc", deleted=list(deleted), pointers=list(pointers))
 
 
 # --- entry point -------------------------------------------------------------
