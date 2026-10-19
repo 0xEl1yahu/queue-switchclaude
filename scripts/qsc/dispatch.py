@@ -1,19 +1,311 @@
-"""Stop-hook dispatch: close the running task, hand the next ready one to Claude.
+"""Stop-hook dispatch: the plan-flow state machine (spec sections 4.3, 7; D3, D4).
 
-Stdlib only. The handoff goes through ``hookSpecificOutput.additionalContext``
-(spec section 4.3): a ``decision: "block"`` would also keep the turn alive but
+Stdlib only. Every Stop runs up to three stages, one function each:
+
+* ``_close_running``: in state ``running``, decide whether the task is done
+  (``done.decide``: its verify command, else the judge). A failed verify or
+  a ``not_done`` is handed back at most twice (``Task.attempts``); a question
+  to the user parks the store in ``awaiting_answer``; anything else closes
+  the task and files its handoff (``write_handoff``).
+* ``_after_planning``: in state ``planning``, record the plan Claude wrote
+  (``planned``, then ``awaiting_approval`` or, for an ``auto`` task, straight
+  into execution through ``start``). A missing plan is asked for once more,
+  then the task goes back to ``queued`` (review focus 2).
+* ``choose_next``: from ``idle`` (or after a task closed), re-plan stale
+  children, honour ``paused`` and shadow mode, re-present a planned task that
+  is waiting for approval (review focus 1), else hand the next ready task
+  over for planning.
+
+A Stop in ``awaiting_approval`` or ``awaiting_answer`` changes nothing: the
+user's turn ran something else and intake already decided what that meant.
+
+Every handover goes through ``hookSpecificOutput.additionalContext``
+(``handback``): a ``decision: "block"`` would also keep the turn alive but
 shows as a hook error in the UI. A Stop-hook continuation keeps the original
 ``current_prompt_id``, so intake still sees later messages as mid-turn.
 """
 from __future__ import annotations
 
-from . import log, store
+import contextlib
+from pathlib import Path
+
+from . import done, log, paths, store
 from .interrupt import reset_after_interrupt
 
+PREFIX = "queue-switchclaude"
 
 SHADOW_QUEUED = "shadow_queued"
 SHADOW_DISPATCHED = "shadow_dispatched"
 _SATISFIED = ("done", SHADOW_DISPATCHED)
+
+# "Not done, continue" and "verify failed" handbacks per task before dispatch
+# gives up and closes it with verdict `gave_up`; and planning turns that end
+# without a plan file before the task returns to the queue. Well under the
+# Stop-hook continuation cap of 8.
+MAX_ATTEMPTS = 2
+
+# How much of the plan file the judge sees.
+PLAN_EXCERPT_CHARS = 1500
+
+_WAITING = ("awaiting_approval", "awaiting_answer")
+
+
+# --- envelopes and handover texts --------------------------------------------
+
+
+def handback(text: str) -> dict:
+    """The Stop output that keeps the turn alive with ``text`` as context."""
+    return {"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": text}}
+
+
+def _notes(task: store.Task) -> str:
+    """``. The user later added: n1; n2`` or ``""``.
+
+    An amend by subject (``intake._amend``) appends to ``task.notes`` rather
+    than rewriting ``task.text``, so the notes travel with every handover.
+    """
+    if not task.notes:
+        return ""
+    notes = "; ".join(" ".join(n.split()) for n in task.notes)
+    return f". The user later added: {notes}"
+
+
+def _planning_text(s: store.Store, task: store.Task) -> str:
+    """The handover that asks Claude to plan ``task``."""
+    handoffs = [
+        str(p) for p in (paths.handoff_path(s.session_id, d) for d in task.depends_on)
+        if p.exists()
+    ]
+    before = ", ".join(handoffs) if handoffs else "none"
+    plan = paths.plan_path(s.session_id, task.id)
+    ending = (
+        "then carry it out immediately without waiting."
+        if task.auto else
+        "then stop and wait for approval."
+    )
+    return (
+        f"{PREFIX}: next task is {task.id}: {task.text}{_notes(task)}. "
+        f"Read the handoff of what came before at {before}. "
+        f"Write a short plan for {task.id} to {plan} (goal, steps, how to verify), "
+        f"present it to the user in a few lines, {ending}"
+    )
+
+
+def _represent_text(s: store.Store, task: store.Task) -> str:
+    plan = paths.plan_path(s.session_id, task.id)
+    return (
+        f"{PREFIX}: task {task.id} is planned at {plan} and waiting for your approval; "
+        "present the plan briefly and stop."
+    )
+
+
+def _execution_text(s: store.Store, task: store.Task) -> str:
+    plan = paths.plan_path(s.session_id, task.id)
+    return (
+        f"{PREFIX}: task {task.id} is approved. Execute the plan at {plan} now. "
+        "When it is done, say what was produced and stop."
+    )
+
+
+def _verify_failed_text(task: store.Task, verdict: done.Verdict) -> str:
+    return (
+        f"{PREFIX}: task {task.id} failed its verify command ({verdict.reason}). "
+        f"Output tail: {verdict.output_tail}. Fix it, then stop."
+    )
+
+
+def _not_done_text(task: store.Task, verdict: done.Verdict) -> str:
+    return f"{PREFIX}: task {task.id} does not look finished: {verdict.reason}. Finish it, then stop."
+
+
+# --- files -------------------------------------------------------------------
+
+
+def _read(path: Path, limit: int | None = None) -> str:
+    """The file's text (clipped to ``limit``), or ``""`` when it cannot be read."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[:limit] if limit is not None else text
+
+
+def _plan_excerpt(s: store.Store, task: store.Task) -> str:
+    return _read(paths.plan_path(s.session_id, task.id), PLAN_EXCERPT_CHARS)
+
+
+def _plan_written(s: store.Store, task: store.Task) -> bool:
+    """True when the task's plan file exists and holds something."""
+    return bool(_read(paths.plan_path(s.session_id, task.id)).strip())
+
+
+def write_handoff(
+    s: store.Store,
+    task: store.Task,
+    verdict: done.Verdict,
+    closing: str | None = None,
+) -> Path:
+    """Close ``task`` as ``done`` with ``verdict`` and file its handoff note.
+
+    ``closing`` (the Stop event's ``last_assistant_message``) is recorded on
+    the task when given; otherwise the closing already on the task is used
+    (the question it asked, when the user then confirmed it done). The file
+    is what the next task's planning turn reads. Writing it fails open: a
+    file that cannot be written is logged and the task is still done.
+    """
+    task.status = "done"
+    if closing is not None:
+        task.closing = closing
+    task.verdict = verdict.verdict
+    notes = "".join(f"- {n}\n" for n in task.notes) or "(none)\n"
+    text = (
+        f"# Handoff {task.id}\n\n"
+        f"## Task\n{task.text}\n\n"
+        f"## Notes\n{notes}\n"
+        f"## Verdict\n{verdict.verdict}: {verdict.reason}\n\n"
+    )
+    if verdict.output_tail:
+        text += f"## Verify output tail\n{verdict.output_tail}\n\n"
+    text += f"## Closing message\n{task.closing or ''}\n"
+    path = paths.handoff_path(s.session_id, task.id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        log.record(s.session_id, "handoff_write_failed", task=task.id, path=str(path),
+                   error=f"{type(exc).__name__}: {exc}")
+    log.record(s.session_id, "handoff", task=task.id, verdict=verdict.verdict,
+               reason=verdict.reason, path=str(path))
+    return path
+
+
+# --- stage A: close the running task ----------------------------------------
+
+
+def _close_running(s: store.Store, event: dict, shadow: bool, claude: str) -> tuple[dict | None, bool]:
+    """Decide the running task's fate. Returns ``(output, proceed)``.
+
+    ``proceed`` is True when the running slot is free and ``choose_next``
+    should run; otherwise ``output`` is the Stop output for this turn (a
+    handback, or ``None`` when the store now waits for the user's answer).
+    """
+    sid = s.session_id
+    running = s.get(s.running_task) if s.running_task else None
+    if running is None:
+        return None, True
+    if running.status == "paused":
+        # A task the user paused mid-turn (amend note "pause", g27) is set
+        # aside, not finished: it keeps its status and nothing that depends
+        # on it becomes ready. Only the running slot is freed.
+        return None, True
+
+    closing = event.get("last_assistant_message")
+    closing = closing if isinstance(closing, str) else ""
+    verdict = done.decide(running, event, _plan_excerpt(s, running), claude=claude)
+
+    if shadow:
+        # Observe only: the verdict is filed and logged, never acted on
+        # (no handback, no wait for an answer).
+        log.record(sid, "shadow_verdict", task=running.id, verdict=verdict.verdict,
+                   reason=verdict.reason, shadow=True)
+        write_handoff(s, running, verdict, closing)
+        return None, True
+
+    if verdict.verdict in ("verify_failed", "not_done") and running.attempts < MAX_ATTEMPTS:
+        running.attempts += 1
+        log.record(sid, "dispatch", task=running.id, verdict=verdict.verdict,
+                   reason=verdict.reason, handback=True, attempts=running.attempts, next=None)
+        if verdict.verdict == "verify_failed":
+            return handback(_verify_failed_text(running, verdict)), False
+        return handback(_not_done_text(running, verdict)), False
+
+    if verdict.verdict == "asked_question":
+        # The turn ends; the user's next message is the answer (or a
+        # confirmation that the task is done). Intake routes it (Task 6).
+        running.closing = closing
+        s.state = "awaiting_answer"
+        s.pending_task = running.id
+        s.running_task = None
+        log.record(sid, "dispatch", task=running.id, verdict="asked_question",
+                   reason=verdict.reason, next=None, waiting="awaiting_answer")
+        return None, False
+
+    if verdict.verdict in ("verify_failed", "not_done"):
+        # Attempts exhausted: close it rather than nag, and say so in the log
+        # and the handoff.
+        verdict = done.Verdict(
+            "gave_up",
+            f"gave up after {running.attempts} handbacks; last {verdict.verdict}: {verdict.reason}",
+            verdict.output_tail,
+        )
+    write_handoff(s, running, verdict, closing)
+    return None, True
+
+
+# --- stage B: after a planning turn -----------------------------------------
+
+
+def _after_planning(s: store.Store) -> tuple[dict | None, bool]:
+    """Record the plan Claude just wrote, or ask again, or give the task back.
+
+    Returns ``(output, proceed)`` like ``_close_running``; ``proceed`` is only
+    True when nothing was actually being planned.
+    """
+    sid = s.session_id
+    task = s.get(s.pending_task) if s.pending_task else None
+    if task is None:
+        log.record(sid, "plan_failed", task=s.pending_task, reason="no pending task")
+        return None, True
+
+    if _plan_written(s, task):
+        task.status = "planned"
+        task.plan_based_on = s.done_ids()
+        task.attempts = 0
+        if task.auto:
+            # Review focus 5: no approval stop; plan and execution in one
+            # continuation.
+            text = start(s, task)
+            log.record(sid, "dispatch", planned=task.id, auto=True, next=task.id)
+            return handback(text), False
+        s.state = "awaiting_approval"
+        log.record(sid, "dispatch", planned=task.id, auto=False, next=None)
+        return None, False
+
+    task.attempts += 1
+    if task.attempts < MAX_ATTEMPTS:
+        log.record(sid, "dispatch", next=task.id, plan_retry=task.attempts)
+        return handback(_planning_text(s, task)), False
+
+    # Review focus 2: Claude stopped twice without a plan (asked something,
+    # hit an error). Give the task back to the queue and end the turn; it is
+    # planned again when a later Stop finds it ready.
+    task.status = "queued"
+    task.attempts = 0
+    s.state = "idle"
+    s.pending_task = None
+    log.record(sid, "plan_failed", task=task.id, attempts=MAX_ATTEMPTS)
+    return None, False
+
+
+# --- stage E: execution handover --------------------------------------------
+
+
+def start(s: store.Store, task: store.Task) -> str:
+    """Apply the execution transition and return the handover text.
+
+    Called from ``_after_planning`` for an ``auto`` task and from intake when
+    the user approves a plan (Task 6); each caller wraps the text in its own
+    hook envelope.
+    """
+    task.status = "running"
+    task.attempts = 0
+    s.running_task = task.id
+    s.state = "running"
+    s.pending_task = None
+    return _execution_text(s, task)
+
+
+# --- stage D: what runs next -------------------------------------------------
 
 
 def _shadow_ready(s: store.Store) -> list[store.Task]:
@@ -28,28 +320,95 @@ def _shadow_ready(s: store.Store) -> list[store.Task]:
     return out
 
 
-def _handoff(task: store.Task) -> dict:
-    """The additionalContext that hands ``task`` to Claude.
+def _planned_ready(s: store.Store) -> list[store.Task]:
+    """Planned tasks whose every dependency is done, in creation order."""
+    done_now = set(s.done_ids())
+    return [
+        t for t in s.tasks
+        if t.status == "planned" and all(d in done_now for d in t.depends_on)
+    ]
 
-    An amend by subject (``intake._amend``) appends to ``task.notes`` rather
-    than rewriting ``task.text``, so the notes travel with the handoff; a
-    task without notes reads exactly as it did in M0.
+
+def _replan_stale(s: store.Store) -> None:
+    """Send a planned task back to ``queued`` when a dependency finished after
+    its plan was written; the old plan file goes."""
+    for t in s.stale_planned():
+        t.status = "queued"
+        t.plan_based_on = []
+        t.attempts = 0
+        with contextlib.suppress(OSError):
+            paths.plan_path(s.session_id, t.id).unlink()
+        log.record(s.session_id, "replan", task=t.id)
+
+
+def choose_next(s: store.Store, stop_hook_active: bool = False, shadow: bool = False) -> str | None:
+    """Stage D: the handover text for what happens next, or ``None``.
+
+    Reached after a task closed or from ``idle``. Intake calls it too, when
+    the user confirms a task done (Task 6). While a plan is on screen
+    (``awaiting_approval``) nothing is chosen: that plan is already next.
     """
-    text = (
-        f"queue-switchclaude: the user queued task {task.id} to run after the "
-        f"previous work. Do it now: {task.text}"
-    )
-    if task.notes:
-        notes = "; ".join(" ".join(n.split()) for n in task.notes)
-        text += f". The user later added: {notes}"
-    return {"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": text}}
+    sid = s.session_id
+    if s.state == "awaiting_approval":
+        return None
+
+    s.state = "idle"
+    s.running_task = None
+    s.pending_task = None
+    _replan_stale(s)
+
+    if s.paused:
+        # `queue: pause`: the running task still closed, but nothing is
+        # handed over (real or shadow) until `queue: resume`.
+        log.record(sid, "dispatch", next=None, shadow=shadow, paused=True)
+        return None
+
+    if shadow:
+        # Report what would run, mark it so the next Stop reports the one after.
+        would = _shadow_ready(s)
+        if would:
+            would[0].status = SHADOW_DISPATCHED
+        log.record(sid, "dispatch", next=would[0].id if would else None, shadow=True)
+        return None
+
+    planned = _planned_ready(s)
+    if planned:
+        # Review focus 1: a plan whose approval was deferred by an unrelated
+        # turn is shown again, never lost and never run unapproved.
+        task = planned[0]
+        s.state = "awaiting_approval"
+        s.pending_task = task.id
+        log.record(sid, "dispatch", next=task.id, shadow=False, represent=True)
+        return _represent_text(s, task)
+
+    ready = s.ready()
+    if not ready:
+        log.record(sid, "dispatch", next=None, shadow=shadow)
+        return None
+    nxt = ready[0]
+
+    # Spin guard: a Stop fired by our own continuation must not push the
+    # same task twice.
+    if stop_hook_active and s.last_dispatched == nxt.id:
+        log.record(sid, "dispatch", next=nxt.id, shadow=shadow, spin_guard=True)
+        return None
+
+    log.record(sid, "dispatch", next=nxt.id, shadow=shadow)
+    s.state = "planning"
+    s.pending_task = nxt.id
+    s.last_dispatched = nxt.id
+    return _planning_text(s, nxt)
 
 
-def handle(event: dict, shadow: bool = False) -> dict | None:
-    """Mark the running task done and dispatch the next ready task, if any."""
+# --- entry point -------------------------------------------------------------
+
+
+def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | None:
+    """Run the stages that apply to the store's state; return the Stop output."""
     session_id = event.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return None
+    active = bool(event.get("stop_hook_active"))
     with store.locked(session_id) as s:
         if s.interrupt:
             # The user asked to stop but no tool call came after the flag was
@@ -59,47 +418,19 @@ def handle(event: dict, shadow: bool = False) -> dict | None:
             log.record(session_id, "interrupt", task=task_id, via=event.get("hook_event_name"))
             return None
 
-        running = s.get(s.running_task) if s.running_task else None
-        if running is not None and running.status != "paused":
-            # A task the user paused mid-turn (amend note "pause", g27) is set
-            # aside, not finished: it keeps its status and nothing that
-            # depends on it becomes ready. Only the running slot is freed.
-            running.status = "done"
-        s.state = "idle"
-        s.running_task = None
-
-        if s.paused:
-            # `queue: pause`: the running task still closes, but nothing is
-            # handed over (real or shadow) until `queue: resume`.
-            log.record(session_id, "dispatch", next=None, shadow=shadow, paused=True)
+        if s.state == "planning":
+            out, proceed = _after_planning(s)
+            if not proceed:
+                return out
+        elif s.state in _WAITING:
+            # The user's turn ran something else, or nothing changed; the
+            # pending plan or question is still waiting on the user.
+            log.record(session_id, "dispatch", next=None, waiting=s.state)
             return None
+        elif s.state == "running" or s.running_task:
+            out, proceed = _close_running(s, event, shadow, claude)
+            if not proceed:
+                return out
 
-        if shadow:
-            # Report what would run, mark it so the next Stop reports the one after.
-            would = _shadow_ready(s)
-            if would:
-                would[0].status = SHADOW_DISPATCHED
-            log.record(session_id, "dispatch", next=would[0].id if would else None, shadow=True)
-            return None
-
-        ready = s.ready()
-        if not ready:
-            log.record(session_id, "dispatch", next=None, shadow=shadow)
-            return None
-        nxt = ready[0]
-
-        # Spin guard: a Stop fired by our own continuation must not push the
-        # same task twice.
-        if event.get("stop_hook_active") and s.last_dispatched == nxt.id:
-            log.record(session_id, "dispatch", next=nxt.id, shadow=shadow, spin_guard=True)
-            return None
-
-        log.record(session_id, "dispatch", next=nxt.id, shadow=shadow)
-        if shadow:
-            return None
-
-        nxt.status = "running"
-        s.running_task = nxt.id
-        s.state = "running"
-        s.last_dispatched = nxt.id
-        return _handoff(nxt)
+        text = choose_next(s, stop_hook_active=active, shadow=shadow)
+        return handback(text) if text else None
