@@ -63,3 +63,33 @@ Rejected: judge only (a passing closing message is not a passing test). Rejected
 When the next message arrives with a new `prompt_id` while state still says `running` and no Stop fired for that task, the harness treats the turn as interrupted: the interrupted task is marked `interrupted`, every `queued` and `ready` task is dropped, and a notice is attached to the next prompt as `additionalContext` listing what was dropped (ids and intents) so the user can re-queue by pasting. Assumption, not yet confirmed: `parked` items survive, because they never dispatch on their own; `done` history survives.
 
 Rejected (my recommendation): pause and keep everything. Rejected: ask on the next message. The user chose drop for simplicity and predictability: Esc means "stop the plan".
+
+The assumption held: `intake._new_turn` drops only `queued` tasks, so `parked` and `done` survive (M1). M3 narrowed the rule by state: a new `prompt_id` while the store says `planning` means Esc cut a planning turn, not work, so nothing is dropped; the task being planned returns to `queued`, its partial plan file is deleted, and the notice reads `the planning turn for pN was interrupted; it is queued again` (spec §6).
+
+---
+
+Decided 2026-10-19, during the M2 and M3 work. The evidence is in the live runs: `m2-acceptance.md`, `m2-fixes-acceptance.md`, and `m0-acceptance.md` for the interrupt path.
+
+## D6. Interrupt hook on `PreToolUse` only
+
+`hooks/hooks.json` registers `scripts/interrupt.py` on `PreToolUse` alone; the `PostToolUse` entry of D2 is gone. Every tool call costs one Python launch for the interrupt check instead of two. Nothing is lost: a `PostToolUse` boundary is always followed either by the next `PreToolUse`, where the flag is honoured, or by `Stop`, where dispatch honours it (`reset_after_interrupt`, nothing dispatched, the same drop as D5). `interrupt.handle` still accepts a `PostToolUse` event for a caller that sends one, and it returns before reading the store when `tool_name` is `AskUserQuestion`: that turn is already handing control to the user, and ending it there would only swallow the question.
+
+Evidence: in every live run the interrupt fired on `PreToolUse` (`m0-acceptance.md`, scenario B: `PreToolUse:Bash hook stopped continuation: queue-switchclaude: stopped as requested`, log `via: PreToolUse`, the turn halted 1.92 s after the send, with echo 6 already running). A hook launch costs 60 to 120 ms on this machine (the rules-only intake delays recorded in `m1-acceptance.md` and `m2-acceptance.md`), and the interrupt check paid it twice per tool call whether or not a stop was pending; the store is read without the lock, so the launch itself is most of the cost.
+
+Rejected: keeping both hooks (double the per-tool-call cost for a boundary that never fired first). Rejected: the mod route's `$.turn.abort` (D2 stands; instant abort would need the JavaScript core).
+
+## D7. Plans and handoffs live under the plugin data dir
+
+`paths.plan_path(session, task)` is `<data dir>/sessions/<session>/plans/<task>.md` and `paths.handoff_path` is `.../handoffs/<task>.md`, next to the session's `<session>.json` store. The original design (D3, spec §4.3) said `plans/pN.md` in the user's repository. Every handover names the absolute path, Claude reads and writes the files there, and `queue: show pN` prints the ones that exist. The data dir is `$CLAUDE_PLUGIN_DATA`, else the newest `~/.claude/plugins/data/queue-switchclaude*` directory, else `~/.claude/queue-switchclaude`.
+
+Evidence: `m2-acceptance.md`, scenario K: "The user's working tree held only `hello.py`; the plan and handoff are under the data dir", with the files at `…/sessions/d9d02c35-…/plans/p2.md` and `.../handoffs/p1.md` and Claude reading `handoffs/p1.md` before writing the plan. The cost surfaced in `m2-fixes-acceptance.md`, S2: a command run by the Bash tool has no `CLAUDE_PLUGIN_DATA`, so `queue_cli.py` answered `no session found` until `commands/queue.md` passed the variable through and `paths.data_dir()` learnt the installed-plugin fallback; the re-run logged `control: approve via queue_cli` against the right session.
+
+Rejected: files in the working tree (they show in `git status` and in the diff side panel, get committed by accident, and in the scratch repo without commits the panel sat over the notification area, `m1-acceptance.md` issue 3). Rejected: a temporary directory per turn (the next task's planning turn reads the previous task's handoff, so the files must outlive the Stop hook that wrote them).
+
+## D8. Prompt turns are not judged
+
+Every turn the user types is registered as a task with `Task.kind = "prompt"`, so queued work can chain after it (`intake._chain_deps`) and D5's Esc detection has a running task to mark. On Stop such a task closes as `stopped` with reason `prompt turn ended` and no model call, unless the user gave it a verify command (`dispatch._verdict_for`). Only work the harness queued (`kind = "task"`) goes through D4's verify-or-judge decision. A handoff file is still written for a prompt turn, so a queued task that depends on it can read what the user's own turn produced.
+
+Evidence: `m2-acceptance.md`, issue 4 (scenario O): a plain question typed while a plan waited cost three model calls (the classifier to route it, the judge to close it as task `p5` with its own `handoffs/p5.md`, and the re-present continuation). After the change, `m2-fixes-acceptance.md`, scenario P: "No judge call: the turn closed with `verdict: stopped, reason: prompt turn ended` 2.2 s after the send (the model's own answer time), store `p1 done` with `kind: prompt`", and every Stop in P to S took under a second except where a judge or a verify command ran for a queued task.
+
+Rejected: judging every turn (about 4 s per Stop, a store lock held for that long while the next message waits, and a handoff written for a question that produced nothing). Rejected: not registering prompt turns at all (the chain rule and Esc detection would have no running task to work from).

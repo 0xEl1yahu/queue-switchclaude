@@ -4,7 +4,7 @@ Diagrams for how the harness behaves. GitHub renders the Mermaid blocks inline. 
 
 ## 1. What the user experiences
 
-The user keeps typing while Claude works. Each message lands in one of five places, and the harness tells them which. Plans and handoffs are files under the plugin data dir (`sessions/<session>/plans/pN.md`, `.../handoffs/pN.md`), written and read by the session's own Claude; the harness only tells it which file.
+The user keeps typing while Claude works. Each message lands in one of five places, and the harness tells them which. Plans and handoffs are files under the plugin data dir (`sessions/<session>/plans/pN.md`, `.../handoffs/pN.md`), written and read by the session's own Claude; the harness only tells it which file (decision D7). At idle the markers change meaning: `later: x` runs `x` now, `maybe later x` parks it, `stop` is a no-op. Harness-generated prompts (system reminders, task notifications, command wrappers) pass through untouched in every state.
 
 ```mermaid
 flowchart LR
@@ -24,29 +24,32 @@ flowchart LR
     R --> QN{Done?<br/>verify command or judge}
     QN -- "asked a question" --> AN[User answers,<br/>task resumes]
     AN --> R
-    QN -- "not done, max 2" --> R
+    QN -- "not done or verify failed, max 2" --> R
+    QN -- "verify failed twice" --> FV[(Set aside as failed_verify,<br/>no handoff, user told)]
     QN -- done --> H[Handoff written<br/>handoffs/pN.md]
     H --> D
     P -. promoted by the user .-> Q
+    FV -. promoted by the user .-> Q
 ```
 
 A task marked `auto` (`queue: auto pN`) still gets a plan and a handoff but skips the approval stop: the plan flows straight into execution.
 
 ## 2. Where the harness sits
 
-Three Claude Code hooks, one store on disk, one classifier call.
+Three Claude Code hooks (the interrupt check on `PreToolUse` only, decision D6), one store on disk, at most one classifier call on intake and one judge call on Stop.
 
 ```mermaid
 flowchart TB
     subgraph CC[Claude Code]
         UPS[UserPromptSubmit hook]
-        PTU[PreToolUse / PostToolUse hooks]
+        PTU[PreToolUse hook]
         STP[Stop hook]
+        CLI[/queue slash command<br/>runs queue_cli.py in a Bash call]
     end
 
     subgraph H[Harness]
         INTAKE[intake.py<br/>filter, detect mid-turn, waiting states, classify]
-        INTR[interrupt.py<br/>check flag]
+        INTR[interrupt.py<br/>check flag, skip AskUserQuestion]
         DISP[dispatch.py<br/>close running task, handoff,<br/>record plan, choose next]
         CLS[[Classifier<br/>claude -p haiku, 15 s, fails open as steer]]
         JUDGE[[Done judge<br/>claude -p haiku, inline, 15 s, fails open as done]]
@@ -54,6 +57,8 @@ flowchart TB
         STORE[(Task store<br/>per-session JSON, file lock, atomic write)]
         FILES[(plans/pN.md, handoffs/pN.md<br/>under the data dir)]
         LOG[(Decision log<br/>JSONL, shadow mode source)]
+        PTR[(Session pointers<br/>last_session and one per cwd)]
+        GC[[Session gc<br/>once per session, 30-day window,<br/>own session protected]]
     end
 
     UPS --> INTAKE
@@ -62,6 +67,11 @@ flowchart TB
     INTAKE --> CLS
     INTAKE --> STORE
     INTAKE --> LOG
+    INTAKE --> PTR
+    CLI --> PTR
+    CLI --> STORE
+    DISP --> GC
+    GC -. deletes stale sessions .-> STORE
     INTR --> STORE
     DISP --> STORE
     DISP --> JUDGE
@@ -83,8 +93,8 @@ The rules that run before the model are cheap and deterministic. The model only 
 
 ```mermaid
 flowchart TD
-    M([Message arrives<br/>UserPromptSubmit]) --> T{Harness traffic?<br/>system reminder,<br/>agent report}
-    T -- yes --> PASS[Pass through<br/>no log entry]
+    M([Message arrives<br/>UserPromptSubmit]) --> T{Harness traffic?<br/>starts with an angle bracket,<br/>system reminder, task notification,<br/>command wrapper, interrupted request}
+    T -- yes --> PASS[Pass through<br/>no log entry, store not read]
     T -- no --> CM{Control?<br/>queue: list, cancel p2,<br/>approve, verify p2 ...}
     CM -- yes --> CB[Run the command,<br/>block with its reply]
     CM -- no --> N{Non-task?<br/>ok, yes, continue,<br/>slash command, lone dot}
@@ -93,9 +103,15 @@ flowchart TD
     WS -- yes --> WAIT[Waiting states,<br/>section 3b]
     N -- no --> WS2{Plan or question<br/>waiting on the user?}
     WS2 -- yes --> WAIT
-    WS2 -- no --> MT{prompt_id equals<br/>running turn's id?}
-    MT -- "no: new turn" --> ST{Harness state}
-    MT -- "yes: mid-turn" --> ST
+    WS2 -- no --> DD{Same text as a task<br/>from the last 10 min?}
+    DD -- yes --> DB[Block: that is already pN]
+    DD -- no --> MT{prompt_id equals<br/>running turn's id?}
+    MT -- "no: new turn" --> ID{Idle, and a marker?}
+    ID -- "later: x" --> NOW[x starts now as the turn,<br/>marker stripped, context says so]
+    ID -- "maybe later x" --> PK
+    ID -- stop --> NOOP0[Block: nothing is running,<br/>no task, no flag]
+    ID -- "no: a plain prompt" --> NT[New turn: the prompt is the running task.<br/>Esc while running: queue dropped with a notice.<br/>Esc while planning: that task queued again]
+    MT -- "yes: mid-turn" --> ST{Harness state}
     ST --> CTX[Build context:<br/>state, current task, queue,<br/>last assistant text from transcript tail]
     CTX --> PG{Paste guard?<br/>150+ words or 12+ lines}
     PG -- yes --> ONE[Treat as one ask,<br/>never split]
@@ -119,7 +135,7 @@ flowchart TD
 
 ### 3b. Intake while the store waits on the user
 
-Two store states park the session on the user: `awaiting_approval` (a plan for `pending_task` is on screen) and `awaiting_answer` (the running task stopped by asking something). Intake reads the state before the non-task pass-through, so "ok" approves a waiting plan but is still a non-task when nothing waits. Control messages win first in every state.
+Two store states park the session on the user: `awaiting_approval` (a plan for `pending_task` is on screen) and `awaiting_answer` (the running task stopped by asking something). Intake reads the state before the non-task pass-through, so "ok" approves a waiting plan but is still a non-task when nothing waits. Control messages win first in every state, and harness traffic passes through before the state is even read.
 
 ```mermaid
 flowchart TD
@@ -129,7 +145,7 @@ flowchart TD
     AP -- no --> RW{Rule?}
     RW -- "stop" --> NOOP[Block: nothing is running,<br/>pN is waiting for approval]
     RW -- "later: x" --> QW[Queue after the pending task,<br/>keep waiting]
-    RW -- "non-task: continue, ." --> PT[Pass through, keep waiting]
+    RW -- "non-task: continue, ." --> RUN
     RW -- none --> CLW[[classifier, state awaiting_approval]]
     CLW -- "steer: approve" --> RUN
     CLW -- "steer: revise plan" --> REV[Pass through with revise instruction,<br/>plan stays planned, keep waiting]
@@ -198,18 +214,23 @@ Two state machines, kept in one store: each task has a status, and the store as 
 stateDiagram-v2
     [*] --> queued: intake classifies queue
     [*] --> parked: intake classifies queue + parked
-    [*] --> running: the prompt of a new turn
+    [*] --> running: the prompt of a new turn (kind prompt)
     parked --> queued: queue promote pN
     queued --> planned: ready, Claude wrote plans/pN.md (store planning)
     queued --> queued: ready, but no plan after two planning turns
+    queued --> queued: Esc cut the planning turn, plan file deleted (M3)
     planned --> running: approved (lgtm, queue approve), or auto
     planned --> queued: a dependency finished after the plan (stale), plan file deleted
     running --> running: verify failed or not done, handed back, at most twice
-    running --> done: verify ok, judge done, stopped, gave up, or user confirmed (D4)
+    running --> done: verify ok, judge done, gave up, user confirmed (D4), or a prompt turn ended (stopped, no judge, D8)
+    running --> failed_verify: verify failed twice, set aside with a notice
+    failed_verify --> queued: queue promote pN or resume pN
+    failed_verify --> cancelled: queue cancel pN
     running --> paused: user says do something else first (g27)
     paused --> queued: queue resume pN or promote pN
-    running --> interrupted: Esc detected on next prompt (D5)
+    running --> interrupted: Esc detected on next prompt (D5), or stop at a tool call
     queued --> dropped: Esc detected (D5), notice lists them
+    planned --> dropped: stop at a tool call, with the queued ones
     interrupted --> [*]
     dropped --> [*]
     queued --> cancelled: amend with note cancel (g16, g43), or queue cancel pN
@@ -230,23 +251,27 @@ stateDiagram-v2
     end note
 ```
 
-`failed_verify` is a status the store, `queue: promote` and `queue: cancel` accept, but nothing sets it yet: a failing verify command is handed back twice and then the task is closed as `done` with verdict `gave_up`.
+`failed_verify` is where a task lands when its verify command failed on both handbacks: it is not done, nothing that depends on it becomes ready, no handoff is written, and the user is told (`queue-switchclaude: pN failed its verify command 2 times and is set aside as failed_verify (send 'queue: promote pN' to retry it, 'queue: cancel pN' to drop it)`). A `not_done` judge verdict twice in a row ends differently: the task is closed as `done` with verdict `gave_up`, and its handoff says so. A turn the user typed (`kind: prompt`) skips the judge altogether and closes as `stopped` (D8).
 
 ### 5b. Store state
 
 ```mermaid
 stateDiagram-v2
     [*] --> idle
-    idle --> running: any new prompt (intake new turn)
+    idle --> running: any new prompt (intake new turn); later x at idle runs x now
+    idle --> idle: maybe later x at idle parks it; stop at idle is a no-op
     idle --> planning: Stop finds a ready task (choose_next)
+    idle --> idle: continuation budget spent (6 in a row), a ready task waits for any message
     running --> running: handback, verify failed or not done
     running --> awaiting_answer: judge says asked_question
     running --> planning: task closed, next ready task handed over for planning
     running --> awaiting_approval: task closed, a planned task is ready again (re-present)
-    running --> idle: task closed, nothing ready or queue paused
-    planning --> awaiting_approval: plan file written, gate on (D3)
+    running --> idle: task closed, nothing ready or queue paused; or verify failed twice (failed_verify)
+    planning --> awaiting_approval: plan file written, gate on (D3); or auto but the budget is spent
     planning --> running: plan file written, task is auto (execute now)
+    planning --> running: a new prompt (Esc cut the planning turn), the task back to queued (M3)
     planning --> planning: no plan file, asked once more
+    planning --> planning: spin guard, an identical handover on a continuation ends the turn
     planning --> idle: no plan file twice, task back to queued
     awaiting_approval --> running: approval (lgtm, ok, queue approve, classifier approve)
     awaiting_approval --> running: unrelated message, a normal turn (plan re-presented after it)
@@ -258,7 +283,7 @@ stateDiagram-v2
 
 ## 6. Dispatch: what happens each time Claude stops
 
-Three stages, one function each in `dispatch.py`: close the running task (`_close_running`), record the plan a planning turn wrote (`_after_planning`), choose what is next (`choose_next`). Which ones run depends on the store state. Every handover is `hookSpecificOutput.additionalContext`, which keeps the turn alive with that text; a Stop in `awaiting_approval` or `awaiting_answer` changes nothing.
+Three stages, one function each in `dispatch.py`: close the running task (`_close_running`), record the plan a planning turn wrote (`_after_planning`), choose what is next (`choose_next`). Which ones run depends on the store state. Every handover is `hookSpecificOutput.additionalContext`, which keeps the turn alive with that text; a Stop in `awaiting_approval` or `awaiting_answer` changes nothing. The verify command or judge runs before the store lock is taken, and a turn the user typed is not judged at all (D8). Two guards bound the harness's own continuations: the spin guard (an identical handover on a continuation is suppressed) and the continuation budget (6 in a row, under Claude Code's cap of 8).
 
 ```mermaid
 sequenceDiagram
@@ -270,16 +295,24 @@ sequenceDiagram
     participant U as User
 
     C->>S: Stop event (last_assistant_message, cwd, stop_hook_active)
+    opt first Stop of the session
+        S->>T: gc.collect with this session protected, gc_at stamped
+    end
     alt store state running: stage A, close the running task
-        S->>D: decide(task, event, plan excerpt)
+        S->>D: decide(task, event, plan excerpt), before the store lock
         alt task has a verify command
-            D->>D: run it in cwd, 120 s timeout
-        else no verify command
+            D->>D: run it in cwd, 120 s timeout, process group killed on timeout
+        else a turn the user typed (kind prompt)
+            D->>D: stopped, no model call (D8)
+        else harness task, no verify command
             D->>D: claude -p haiku judge, 15 s, fails open as done
         end
         D-->>S: verdict
         alt verify_failed or not_done, fewer than 2 handbacks
             S-->>C: additionalContext = fix it / finish it, then stop
+        else verify_failed, attempts spent
+            S->>T: task failed_verify, state idle, no handoff
+            S-->>U: systemMessage = set aside as failed_verify, promote to retry
         else asked_question
             S->>T: state = awaiting_answer, task stays running
             S-->>C: return (the user answers next)
@@ -289,8 +322,10 @@ sequenceDiagram
     else store state planning: stage B, after a planning turn
         alt plans/pN.md exists
             S->>T: task planned, plan_based_on = done ids
-            alt task is auto
-                S-->>C: additionalContext = execute the plan at plans/pN.md
+            alt task is auto and the continuation budget is spent
+                S-->>U: state = awaiting_approval, systemMessage = paused the automatic chain
+            else task is auto
+                S-->>C: additionalContext = execute the plan if not already carried out
             else gate on (D3)
                 S-->>U: state = awaiting_approval, the plan is on screen
                 U-->>S: lgtm / revise / unrelated (next message, via intake)
@@ -307,16 +342,22 @@ sequenceDiagram
             S->>T: state = awaiting_approval
             S-->>C: additionalContext = pN is planned at plans/pN.md, present it and stop
         else a queued task is ready
-            S->>S: spin guard: same task as the last continuation? then return
+            S->>S: continuation budget: 6 in a row? then systemMessage, wait for the user
             S->>T: state = planning, pending_task = pN
             S-->>C: additionalContext = read handoffs of depends_on, write plans/pN.md, present it, stop (or carry on if auto)
         else nothing ready
             S-->>C: return, no additionalContext
         end
     end
+    opt spin guard, on every handover issued
+        S->>T: sha1 of the text against last_handback
+        Note over S,C: a continuation (stop_hook_active) repeating the last text<br/>is suppressed: systemMessage "came back twice", the turn ends,<br/>state kept (a planning spin is requeued by the next prompt)
+    end
 ```
 
 ## 7. Interrupt: why it happens at a tool boundary
+
+The interrupt hook is registered on `PreToolUse` only (decision D6): a `PostToolUse` boundary is always followed by the next `PreToolUse` or by `Stop`, and both honour the flag, so one Python launch per tool call loses nothing. An `AskUserQuestion` call is skipped without reading the store, since that turn is already handing control to the user.
 
 ```mermaid
 sequenceDiagram
@@ -325,16 +366,23 @@ sequenceDiagram
     participant T as Task store
     participant C as Claude (running turn)
     participant P as PreToolUse (interrupt.py)
+    participant S as Stop (dispatch.py)
 
     U->>I: "stop that now" (mid-turn, same prompt_id)
     I->>I: interrupt >= 0.9 and explicit-stop >= 0.9
     I->>T: set interrupt flag
     I-->>C: message blocked, not injected
-    C->>P: next tool call
-    P->>T: flag set?
-    P-->>C: continue:false
-    Note over C: turn ends here. Stop hook does not fire.
-    Note over C,P: A text-only turn has no tool call,<br/>so it cannot be hard-stopped (known limit).
+    alt the turn makes another tool call
+        C->>P: next tool call (not AskUserQuestion)
+        P->>T: flag set? unlocked peek, then lock and reset
+        P-->>C: continue:false, stopReason lists the dropped tasks
+        Note over C: turn ends here. Stop hook does not fire.
+    else text-only turn, no tool call
+        C->>S: Stop
+        S->>T: same reset, nothing dispatched
+        Note over C,S: the turn ended by itself; the flag is cleared<br/>so it cannot end the next turn at its first tool call.
+    end
+    Note over U,S: "stop" at idle, or while a plan or a question waits,<br/>sets no flag: intake answers "nothing is running".
 ```
 
 ## 8. Dependency inference, by example
