@@ -10,9 +10,10 @@ else ``~/.claude/queue-switchclaude``) and prints:
 - the mean wall-clock latency of the ``claude -p`` call where ``latency_ms`` is logged
 - the ten most recent disagreements with their message text
 - hook latency (M3): p50 and p95 of ``hook_ms`` (the time from the hook
-  parsing its event to the log line) for ``intake`` and ``dispatch`` lines,
-  split by whether a model call was made, with the classifier's own
-  ``latency_ms`` percentiles alongside
+  script's first statement to the log line, M4) for ``intake`` and
+  ``dispatch`` lines, split by whether a model call was made, with the
+  classifier's own ``latency_ms`` percentiles alongside, and the python3
+  start-up cost measured at report time (M4), which ``hook_ms`` excludes
 - a count of every intake ``decision`` value (``new_turn``, ``control``,
   ``dedupe``, ``approve``, ``revise``, ``defer_approval``, ``answer``,
   ``confirm``, ``parked_idle``, ``noop``, ...)
@@ -28,7 +29,10 @@ import argparse
 import json
 import math
 import re
+import statistics
+import subprocess
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,6 +46,8 @@ RECENT = 10
 TEXT_WIDTH = 80
 LATENCY_EVENTS = ("intake", "dispatch")
 PERCENTILES = (50, 95)
+STARTUP_RUNS = 5
+STARTUP_COMMAND = ("python3", "-c", "pass")
 
 _SINCE_RE = re.compile(r"^(\d+)\s*([smhdw])$")
 _SINCE_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
@@ -191,12 +197,40 @@ def _pct_text(values: list[float]) -> str:
     return "  ".join(f"p{p} {round(percentile(values, p))} ms" for p in PERCENTILES)
 
 
+def startup_ms(runs: int = STARTUP_RUNS) -> int | None:
+    """Median wall-clock milliseconds of ``python3 -c pass`` over ``runs`` launches.
+
+    This is the interpreter start-up the hook pays before its first statement,
+    which ``hook_ms`` cannot see. ``None`` when ``python3`` cannot be launched.
+    """
+    samples: list[float] = []
+    for _ in range(max(1, runs)):
+        started = time.monotonic()
+        try:
+            subprocess.run(STARTUP_COMMAND, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=True, timeout=30)
+        except Exception:
+            return None
+        samples.append((time.monotonic() - started) * 1000)
+    return round(statistics.median(samples))
+
+
+def startup_lines(ms: int | None) -> list[str]:
+    """The ``python3 start-up`` line and the sentence saying ``hook_ms`` excludes it."""
+    shown = f"{ms} ms" if ms is not None else "n/a"
+    return [
+        f"python3 start-up: {shown} (median of {STARTUP_RUNS} runs of python3 -c pass)",
+        "  hook_ms excludes it: the hook stamps its clock in its first Python statement,"
+        " so end-to-end delay is about hook_ms plus this start-up.",
+    ]
+
+
 def latency_lines(rows: list[dict]) -> list[str]:
     """The ``hook latency`` section: p50/p95 of ``hook_ms`` per event, split by model call.
 
     Lines without ``hook_ms`` (M0 to M2 logs) are left out rather than counted as 0.
     """
-    lines = ["hook latency (hook_ms from parsing the event to the log line):"]
+    lines = ["hook latency (hook_ms from the hook script's first statement to the log line):"]
     for event in LATENCY_EVENTS:
         for with_model in (False, True):
             group = [r for r in rows if r.get("event") == event and model_called(r) is with_model]
@@ -239,13 +273,17 @@ def pct(part: int, whole: int) -> str:
     return f"{100.0 * part / whole:.0f}%" if whole else "n/a"
 
 
-def report(all_rows: list[dict], files: int, since_text: str | None) -> str:
+def report(all_rows: list[dict], files: int, since_text: str | None, startup: int | None = None) -> str:
+    """The whole report; ``startup`` is ``startup_ms()`` measured by the caller."""
     window = f" since {since_text}" if since_text else ""
     rows = [r for r in all_rows if is_decision(r)]
     if not rows:
         lines = [f"shadow report: no intake decisions found in {files} log file(s){window}"]
         if all_rows:
-            lines += latency_lines(all_rows) + decision_lines(all_rows)
+            lines += latency_lines(all_rows)
+        lines += startup_lines(startup)
+        if all_rows:
+            lines += decision_lines(all_rows)
         return "\n".join(lines) + "\n"
     total = len(rows)
     by_rule = sum(1 for r in rows if decided_by(r) == "rule")
@@ -270,7 +308,7 @@ def report(all_rows: list[dict], files: int, since_text: str | None) -> str:
         for row in disagreements[:RECENT]:
             ts = row.get("ts") if isinstance(row.get("ts"), str) else "?"
             lines.append(f"  {ts}  rule={rule_label(row)}  model={model_label(row)}  {message_text(row)}")
-    lines += latency_lines(all_rows) + decision_lines(all_rows)
+    lines += latency_lines(all_rows) + startup_lines(startup) + decision_lines(all_rows)
     return "\n".join(lines) + "\n"
 
 
@@ -286,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(exc))
     try:
         rows, files = load_rows(paths.data_dir() / "log", since)
-        sys.stdout.write(report(rows, files, args.since))
+        sys.stdout.write(report(rows, files, args.since, startup_ms()))
     except Exception as exc:  # never a traceback: this is a reporting tool
         sys.stderr.write(f"shadow_report: {type(exc).__name__}: {exc}\n")
         return 1

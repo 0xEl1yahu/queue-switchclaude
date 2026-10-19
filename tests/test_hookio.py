@@ -90,3 +90,63 @@ def test_log_record_swallows_errors(data_dir, monkeypatch):
     monkeypatch.setenv("CLAUDE_PLUGIN_DATA", "/dev/null/nope")
     log.record("s1", "intake", label="queue")  # must not raise
     log.record("s1", "intake", bad=object())   # not serialisable, must not raise
+
+
+# --- M4 Task 2: honest hook latency ------------------------------------------
+#
+# Each entry script stamps ``time.monotonic()`` as its first statement and
+# hands it to ``read_event(expected, started=_T0)``, so ``hook_ms`` covers the
+# ``qsc`` imports as well as the work. A missing or future stamp reads 0.
+
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_read_event_takes_a_start_stamp(monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"hook_event_name": "Stop"}'))
+    e = hookio.read_event("Stop", started=123.0)
+    assert e["_hook_started"] == 123.0
+
+
+def test_hook_ms_never_negative():
+    assert hookio.hook_ms({"_hook_started": 10**12}) == 0 and hookio.hook_ms({}) == 0     # review focus 2
+
+
+def test_entry_scripts_stamp_before_imports():
+    for name in ("intake", "dispatch", "interrupt", "queue_cli"):
+        src = (ROOT / "scripts" / f"{name}.py").read_text().lstrip()
+        body = src.split('"""', 2)[-1] if src.startswith('"""') else src          # skip the module docstring
+        first = next(l for l in body.splitlines() if l.strip() and not l.startswith("#") and not l.startswith("from __future__"))
+        assert first.startswith("import time; _T0 = time.monotonic()"), name
+
+
+# Additional cases beyond the plan's three.
+
+def test_read_event_without_a_start_stamp_uses_the_parse_clock(monkeypatch):
+    import time
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"hook_event_name": "Stop"}'))
+    before = time.monotonic()
+    e = hookio.read_event("Stop")
+    assert before <= e["_hook_started"] <= time.monotonic()
+
+
+def test_hook_ms_from_an_event_stamp():
+    import time
+    assert 190 <= hookio.hook_ms({"_hook_started": time.monotonic() - 0.2}) < 5000
+    assert hookio.hook_ms({"_hook_started": "yesterday"}) == 0
+    assert hookio.hook_ms({"_hook_started": True}) == 0
+
+
+def test_hook_ms_without_an_event_uses_the_remembered_clock():
+    import time
+    hookio.start_clock({"_hook_started": time.monotonic() - 0.2})
+    assert 190 <= hookio.hook_ms() < 5000
+    hookio.start_clock({})
+    assert hookio.hook_ms() == 0
+
+
+def test_entry_scripts_pass_the_stamp_to_read_event():
+    for name in ("intake", "dispatch", "interrupt"):
+        src = (ROOT / "scripts" / f"{name}.py").read_text()
+        assert "started=_T0" in src, name

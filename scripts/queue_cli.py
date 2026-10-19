@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """The Bash side of the ``/queue`` command: ``queue_cli.py [--session ID] <command words>``.
 
 Runs one ``qsc.control`` command (``list``, ``cancel pN``, ``promote pN``,
@@ -18,6 +17,8 @@ The ``queue:`` prefix in a prompt is the fast path (no model, no turn);
 turn and ends here.
 """
 from __future__ import annotations
+
+import time; _T0 = time.monotonic()  # first statement: hook_ms counts the qsc imports too
 
 import os
 import sys
@@ -114,7 +115,7 @@ def _cwd_chain(cwd: str) -> list[str]:
 def main(argv: list[str]) -> str:
     """Run the command and return the text to print."""
     try:
-        from qsc import control, log, store
+        from qsc import control, hookio, log, store
 
         explicit, command = parse_args(argv)
         session_id = resolve_session(explicit)
@@ -136,7 +137,8 @@ def main(argv: list[str]) -> str:
                 # on it (commands/queue.md tells Claude to follow it).
                 reply = f"{reply}. {dispatch.start(s, s.get(s.running_task))}"
         log.record(session_id, "control", command=command or "list", via="queue_cli",
-                   approved=s.running_task if approved else None)
+                   approved=s.running_task if approved else None,
+                   hook_ms=hookio.hook_ms({"_hook_started": _T0}))
         return reply
     except Exception as exc:  # the reply is the whole answer; never a traceback
         return f"queue-switchclaude: could not run the queue command ({type(exc).__name__}: {exc})"

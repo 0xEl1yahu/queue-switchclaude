@@ -129,9 +129,14 @@ SHADOW_QUEUED = "shadow_queued"
 _UNHANDLED = object()
 
 
+# The event ``handle`` is working on, so ``_record`` can hand it to
+# ``hookio.hook_ms``; None between calls (``hook_ms`` then reads 0).
+_event: dict | None = None
+
+
 def _record(session_id: str, event_name: str, **fields) -> None:
-    """``log.record`` plus ``hook_ms``, the time since the hook parsed its event."""
-    log.record(session_id, event_name, hook_ms=hookio.hook_ms(), **fields)
+    """``log.record`` plus ``hook_ms``, the time since the hook script started."""
+    log.record(session_id, event_name, hook_ms=hookio.hook_ms(_event or {}), **fields)
 
 
 def _block(reason: str) -> dict:
@@ -581,6 +586,8 @@ def _part_label(p: classify.Part) -> str:
 
 def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = False) -> dict | None:
     """Sort one UserPromptSubmit event. Returns the hook output or None to pass through."""
+    global _event
+    _event = event
     hookio.start_clock(event)
     prompt = event.get("prompt")
     if not isinstance(prompt, str):

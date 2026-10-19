@@ -207,3 +207,28 @@ def test_hand_built_events_log_hook_ms_zero(data_dir, monkeypatch):
     logged = [r for r in rows() if r["event"] in ("intake", "dispatch")]
     assert {r["event"] for r in logged} == {"intake", "dispatch"}
     assert all(r["hook_ms"] == 0 for r in logged)
+
+
+# --- M4 Task 2: the start-up cost hook_ms does not see ------------------------
+
+def test_report_prints_startup_line(data_dir):
+    log.record("s1", "intake", decision="new_turn", hook_ms=40)
+    r = subprocess.run([sys.executable, str(ROOT / "eval" / "shadow_report.py")], capture_output=True, text=True, env={**os.environ, "CLAUDE_PLUGIN_DATA": str(data_dir)})
+    assert "python3 start-up:" in r.stdout and "excludes" in r.stdout
+
+
+def test_report_startup_line_shape_and_placement(data_dir):
+    import re
+    log.record("s1", "intake", decision="new_turn", hook_ms=40)
+    log.record("s1", "dispatch", next=None, hook_ms=5)
+    r = run(data_dir)
+    assert r.returncode == 0
+    assert re.search(r"python3 start-up: \d+ ms \(median of 5 runs of python3 -c pass\)", r.stdout)
+    # the p50/p95 lines are unchanged
+    assert "intake p50 40 ms  p95 40 ms  (1 line(s), no model call)" in r.stdout
+    assert "dispatch p50 5 ms  p95 5 ms  (1 line(s), no model call)" in r.stdout
+
+
+def test_report_startup_line_on_an_empty_log(data_dir):
+    r = run(data_dir)
+    assert r.returncode == 0 and "python3 start-up:" in r.stdout
