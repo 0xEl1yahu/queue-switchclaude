@@ -171,3 +171,94 @@ def test_script_shadow_env_does_not_block(data_dir, monkeypatch):
 def test_interrupt_reason_names_running_task(data_dir):
     intake.handle(ev("add a user model"))
     assert "p1" in intake.handle(ev("stop"))["reason"]
+
+
+# --- Task 10: shadow comparison ---------------------------------------------
+
+import dataclasses as _dataclasses
+
+from qsc import hookio
+
+
+def dec(**kw):
+    """A classify.Decision for tests. Accepts the v2 field set (label, confidence,
+    interrupt, parked, depends_on, target, note, parts) and drops any field the
+    installed Decision does not have, so it builds against M0 and v2 alike."""
+    base = dict(label="steer", confidence=0.95, interrupt=False, parked=False, depends_on=[], target=None, note=None, parts=[])
+    base.update(kw)
+    names = {f.name for f in _dataclasses.fields(classify.Decision)}
+    return classify.Decision(**{k: v for k, v in base.items() if k in names})
+
+
+def test_shadow_compare_logs_both(data_dir, monkeypatch):
+    intake.handle(ev("add a user model"))
+    calls = []
+    def clf(p): calls.append(p); return dec(label="steer")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", "true")
+    intake.handle(ev("later: email verification"), classifier=clf, shadow=True)
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert calls and row["rule_label"] == "queue" and row["classifier"]["label"] == "steer" and row["label"] == "queue"
+
+
+def test_shadow_compare_still_records_shadow_queue(data_dir, monkeypatch):
+    intake.handle(ev("add a user model"))
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", "1")
+    # The model says queue after p9; the acted decision stays the rule's (chain deps, shadow_queued).
+    out = intake.handle(ev("later: email verification"), classifier=lambda p: dec(label="queue", depends_on=["p9"]), shadow=True)
+    assert out is None
+    t = store.load("s1").get("p2")
+    assert t.status == "shadow_queued" and t.depends_on == ["p1"]
+
+
+def test_shadow_compare_off_never_calls_classifier_for_rule_decisions(data_dir, monkeypatch):
+    intake.handle(ev("add a user model"))
+    calls = []
+    def clf(p): calls.append(p); return dec(label="steer")
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", raising=False)
+    intake.handle(ev("later: email verification"), classifier=clf, shadow=True)
+    assert calls == []
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["rule_label"] == "queue" and row["classifier"] is None and row["label"] == "queue"
+
+
+def test_shadow_compare_requires_shadow_mode(data_dir, monkeypatch):
+    intake.handle(ev("add a user model"))
+    calls = []
+    def clf(p): calls.append(p); return dec(label="steer")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", "true")
+    out = intake.handle(ev("later: email verification"), classifier=clf, shadow=False)
+    assert calls == [] and out["decision"] == "block"
+
+
+def test_shadow_compare_classifier_error_is_swallowed(data_dir, monkeypatch):
+    intake.handle(ev("add a user model"))
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", "true")
+    def boom(p): raise RuntimeError("no model")
+    assert intake.handle(ev("later: email verification"), classifier=boom, shadow=True) is None
+    assert store.load("s1").get("p2").status == "shadow_queued"
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["classifier"] is None and row["label"] == "queue"
+
+
+def test_intake_logs_classifier_latency_ms(data_dir):
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("add password reset as well"), classifier=lambda p: dec(label="steer"))
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert isinstance(row["latency_ms"], int) and row["latency_ms"] >= 0
+    intake.handle(ev("later: email verification"))
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["latency_ms"] is None and row["rule_label"] == "queue"
+
+
+def test_hookio_shadow_compare_flag(monkeypatch):
+    for v in ("1", "true", "YES"):
+        monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", v); assert hookio.shadow_compare()
+    for v in ("0", "false", ""):
+        monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", v); assert not hookio.shadow_compare()
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE"); assert not hookio.shadow_compare()
+
+
+def test_plugin_manifest_declares_shadow_compare():
+    m = json.load(open(Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"))
+    opt = m["userConfig"]["shadow_compare"]
+    assert opt["type"] == "boolean" and opt["default"] is False and opt["title"] == "Shadow: also ask the model"

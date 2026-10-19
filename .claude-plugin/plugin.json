@@ -11,6 +11,12 @@
       "title": "Shadow mode",
       "description": "Log what the harness would do without acting",
       "default": false
+    },
+    "shadow_compare": {
+      "type": "boolean",
+      "title": "Shadow: also ask the model",
+      "description": "In shadow mode, also run the classifier on messages the rules decided and log both answers",
+      "default": false
     }
   }
 }
