@@ -33,10 +33,13 @@ passes through untouched. The return value is the hook's JSON output, or
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import os
+import tempfile
 from typing import Callable, Optional
 
-from . import classify, control, log, match, rules, store, transcript
+from . import classify, control, log, match, paths, rules, store, transcript
 
 HOOK_EVENT = "UserPromptSubmit"
 PREFIX = "queue-switchclaude"
@@ -84,6 +87,30 @@ def _block(reason: str) -> dict:
 def _context(text: str) -> dict:
     """Pass the prompt through with ``additionalContext`` attached."""
     return {"hookSpecificOutput": {"hookEventName": HOOK_EVENT, "additionalContext": text}}
+
+
+def _write_pointer(session_id: str) -> None:
+    """Record the session id at ``paths.pointer_path()`` for ``queue_cli.py``.
+
+    Best effort on every event: the ``/queue`` command runs as a Bash call
+    with no hook payload, so this file is how it finds the store. Written
+    via a temp file and ``os.replace`` so a concurrent reader never sees a
+    half-written id. Any failure is swallowed; intake never fails over it.
+    """
+    try:
+        path = paths.pointer_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(session_id + "\n")
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+    except Exception:
+        pass
 
 
 def _esc_notice(dropped: list[store.Task]) -> str | None:
@@ -294,6 +321,7 @@ def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = Fa
     if not isinstance(session_id, str) or not session_id:
         return None
     prompt_id = event.get("prompt_id")
+    _write_pointer(session_id)
 
     v = rules.decide(prompt)
     if v.label == "pass":

@@ -51,10 +51,19 @@ def handle(event: dict, shadow: bool = False) -> dict | None:
             return None
 
         running = s.get(s.running_task) if s.running_task else None
-        if running is not None:
+        if running is not None and running.status != "paused":
+            # A task the user paused mid-turn (amend note "pause", g27) is set
+            # aside, not finished: it keeps its status and nothing that
+            # depends on it becomes ready. Only the running slot is freed.
             running.status = "done"
         s.state = "idle"
         s.running_task = None
+
+        if s.paused:
+            # `queue: pause`: the running task still closes, but nothing is
+            # handed over (real or shadow) until `queue: resume`.
+            log.record(session_id, "dispatch", next=None, shadow=shadow, paused=True)
+            return None
 
         if shadow:
             # Report what would run, mark it so the next Stop reports the one after.

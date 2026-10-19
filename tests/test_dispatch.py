@@ -147,3 +147,60 @@ def test_shadow_queued_tasks_never_dispatch_for_real(data_dir):
         b = s.new_task("b", [], "pid"); b.status = "shadow_queued"
     assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"}) is None
     assert store.load("s1").get("p1").status == "shadow_queued"
+
+
+# --- M1 Task 7: pause-aware dispatch ----------------------------------------
+
+
+def test_dispatch_respects_pause(data_dir):
+    with store.locked("s1") as s:
+        s.new_task("b", [], "pid"); s.paused = True
+    assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"}) is None
+    assert store.load("s1").get("p1").status == "queued" and '"paused": true' in paths.log_path("s1").read_text()
+
+
+def test_dispatch_keeps_paused_running_task(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "paused"; s.running_task = "p1"; s.state = "running"
+    dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"})
+    assert store.load("s1").get("p1").status == "paused"
+
+
+def test_dispatch_pause_still_closes_running_task(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; s.running_task = "p1"; s.state = "running"
+        s.new_task("b", ["p1"], "pid"); s.paused = True
+    assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"}) is None
+    s = store.load("s1")
+    assert s.get("p1").status == "done" and s.state == "idle" and s.running_task is None
+    assert s.get("p2").status == "queued" and s.paused is True
+
+
+def test_dispatch_resume_dispatches_again(data_dir):
+    with store.locked("s1") as s:
+        s.new_task("b", [], "pid"); s.paused = True
+    assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"}) is None
+    with store.locked("s1") as s:
+        s.paused = False
+    out = dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"})
+    assert "p1" in out["hookSpecificOutput"]["additionalContext"] and store.load("s1").get("p1").status == "running"
+
+
+def test_dispatch_shadow_respects_pause(data_dir):
+    with store.locked("s1") as s:
+        b = s.new_task("b", [], "pid"); b.status = "shadow_queued"; s.paused = True
+    assert dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"}, shadow=True) is None
+    assert store.load("s1").get("p1").status == "shadow_queued"
+    rows = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()]
+    assert rows[-1]["event"] == "dispatch" and rows[-1]["paused"] is True and rows[-1]["shadow"] is True
+
+
+def test_dispatch_paused_running_task_clears_running_and_dispatches_independent(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "paused"; s.running_task = "p1"; s.state = "running"
+        s.new_task("b", ["p1"], "pid"); s.new_task("c", [], "pid")
+    out = dispatch.handle({"hook_event_name": "Stop", "session_id": "s1"})
+    s = store.load("s1")
+    # p2 waits on the paused p1; p3 has no dependency and runs.
+    assert "p3" in out["hookSpecificOutput"]["additionalContext"]
+    assert s.get("p1").status == "paused" and s.get("p2").status == "queued" and s.running_task == "p3"

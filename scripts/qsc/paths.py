@@ -30,3 +30,13 @@ def store_path(session_id: str) -> Path:
 
 def log_path(session_id: str) -> Path:
     return data_dir() / "log" / f"{safe_id(session_id)}.jsonl"
+
+
+def pointer_path() -> Path:
+    """The file holding the id of the session intake saw last.
+
+    Intake rewrites it on every event, best effort, so ``scripts/queue_cli.py``
+    (the Bash side of ``/queue``) can find the store without being told the
+    session id. One pointer per data dir: the most recent session wins.
+    """
+    return data_dir() / "last_session"

@@ -34,3 +34,15 @@ def test_plugin_manifest_declares_shadow():
     assert m["version"] == "0.1.0"
     assert m["author"]["name"] == "0xEl1yahu"
     assert m["userConfig"]["shadow"]["default"] is False
+
+
+def test_command_file_present_and_wired():
+    text = Path("commands/queue.md").read_text()
+    assert "queue_cli.py" in text and "allowed-tools: Bash(python3 *)" in text
+
+
+def test_command_file_frontmatter_and_script_exist():
+    text = (ROOT / "commands" / "queue.md").read_text()
+    assert text.startswith("---\n") and "description:" in text and "argument-hint:" in text
+    assert "${CLAUDE_PLUGIN_ROOT}/scripts/queue_cli.py" in text and "$ARGUMENTS" in text
+    assert (ROOT / "scripts" / "queue_cli.py").exists()
