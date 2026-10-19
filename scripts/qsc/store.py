@@ -116,6 +116,8 @@ class Store:
     running_task: str | None = None
     next_id: int = 1
     interrupt: bool = False
+    # M0/M1: the id of the task dispatch handed over last. Unused since M3
+    # (the guard it fed could never fire); kept so older store files load.
     last_dispatched: str | None = None
     paused: bool = False  # set by `queue: pause`; dispatch runs nothing while True
     # v3: the task being planned, awaiting approval or awaiting an answer.
@@ -123,6 +125,9 @@ class Store:
     # M3: consecutive Stop-hook continuations the harness has issued; reset
     # by any Stop that is not a continuation. Bounds automatic chains.
     continuations: int = 0
+    # M3: sha1 of the last handover text dispatch issued. A Stop-hook
+    # continuation whose handover hashes the same is a spin and is suppressed.
+    last_handback: str | None = None
     tasks: list[Task] = field(default_factory=list)
 
     def new_task(

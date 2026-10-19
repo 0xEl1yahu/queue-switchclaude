@@ -46,7 +46,7 @@ def test_decide_empty_closing_is_stopped():
 # Additional tests beyond the plan.
 
 def test_verdicts_constant():
-    assert done.VERDICTS == ("verify_ok", "verify_failed", "done", "not_done", "asked_question", "gave_up", "stopped")
+    assert done.VERDICTS == ("verify_ok", "verify_failed", "done", "not_done", "asked_question", "gave_up", "stopped", "confirmed")
 
 
 def test_verdict_dataclass_defaults():
@@ -156,3 +156,45 @@ def test_decide_missing_or_blank_closing_is_stopped(monkeypatch):
     assert done.decide(t, {}, "") == done.Verdict("stopped", "no closing message")
     assert done.decide(t, {"last_assistant_message": "   \n"}, "").verdict == "stopped"
     assert done.decide(t, {"last_assistant_message": None}, "").verdict == "stopped"
+
+
+# --- M3 Task 3: verify runs in its own process group; `confirmed` is a verdict
+
+def test_run_verify_kills_process_group(tmp_path):
+    marker = tmp_path / "alive"
+    cmd = f"(sleep 30; touch {marker}) & sleep 30"
+    v = done.run_verify(cmd, str(tmp_path), timeout=0.5)
+    time.sleep(1.0)
+    assert v.verdict == "verify_failed" and not marker.exists()
+    assert "confirmed" in done.VERDICTS
+
+
+# Additional tests beyond the plan's one.
+
+def test_run_verify_starts_a_new_session(tmp_path):
+    import os
+    cmd = f"python3 -c \"import os, sys; sys.exit(0 if os.getpgid(0) != {os.getpgid(0)} else 1)\""
+    assert done.run_verify(cmd, str(tmp_path)).verdict == "verify_ok"
+
+
+def test_run_verify_background_child_dies_with_the_group(tmp_path):
+    import os
+    pidfile = tmp_path / "pid"
+    # `$$` inside `sh -c` is that inner shell's pid, which `exec` hands to sleep.
+    cmd = f"sh -c 'echo $$ > {pidfile}; exec sleep 30' & sleep 30"
+    t0 = time.time(); v = done.run_verify(cmd, str(tmp_path), timeout=0.5)
+    assert v.verdict == "verify_failed" and time.time() - t0 < 3
+    pid = int(pidfile.read_text().strip())
+    deadline = time.time() + 2
+    alive = True
+    while alive and time.time() < deadline:
+        try:
+            os.kill(pid, 0); time.sleep(0.05)
+        except ProcessLookupError:
+            alive = False
+    assert not alive
+
+
+def test_run_verify_timeout_keeps_partial_output(tmp_path):
+    v = done.run_verify("echo partial; sleep 5", str(tmp_path), timeout=0.5)
+    assert v.verdict == "verify_failed" and "partial" in v.output_tail

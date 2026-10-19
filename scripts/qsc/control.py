@@ -35,6 +35,12 @@ Commands (first word, case-insensitive):
                   becomes ``running`` and so does the store
     help          this list; so does any unknown word
 
+In shadow mode intake records tasks as ``shadow_queued``; ``cancel``,
+``park`` and ``drop`` act on those too, so the control channel can edit what
+shadow mode recorded. A failure reply names every status the command
+accepts: ``pN is not queued, parked, paused, planned or failed_verify``,
+``pN is not parked, paused or failed_verify``.
+
 ``session_id`` is only needed by ``show``, which resolves the plan and
 handoff paths through ``paths``; without it ``show`` omits them.
 """
@@ -57,6 +63,9 @@ HELP = (
 
 # The status word `list` shows for the planned task the session is waiting on.
 AWAITING_APPROVAL = "planned (awaiting approval)"
+
+# What intake records in shadow mode (same literal as intake and dispatch).
+SHADOW_QUEUED = "shadow_queued"
 
 
 def _clip(text: str) -> str:
@@ -130,11 +139,15 @@ def _live(s: store.Store, task_id: str) -> "store.Task | str":
 
 
 def _cancel(s: store.Store, task_id: str) -> str:
-    if s.get(task_id) is None:
+    t = s.get(task_id)
+    if t is None:
         return f"no task {task_id}"
+    if t.status == SHADOW_QUEUED:
+        t.status = "cancelled"
+        return f"cancelled {t.id}: {t.text}"
     t = s.cancel(task_id)
     if t is None:
-        return f"{task_id} is not queued, parked or paused"
+        return f"{task_id} is not queued, parked, paused, planned or failed_verify"
     return f"cancelled {t.id}: {t.text}"
 
 
@@ -143,7 +156,7 @@ def _promote(s: store.Store, task_id: str) -> str:
         return f"no task {task_id}"
     t = s.promote(task_id)
     if t is None:
-        return f"{task_id} is not parked or paused"
+        return f"{task_id} is not parked, paused or failed_verify"
     return f"promoted {t.id} to the queue"
 
 
@@ -151,14 +164,14 @@ def _park(s: store.Store, task_id: str) -> str:
     t = s.get(task_id)
     if t is None:
         return f"no task {task_id}"
-    if t.status != "queued":
+    if t.status not in ("queued", SHADOW_QUEUED):
         return f"{task_id} is not queued"
     t.status = "parked"
     return f"parked {t.id}"
 
 
 def _drop(s: store.Store) -> str:
-    dropped = [t for t in s.tasks if t.status in ("queued", "parked")]
+    dropped = [t for t in s.tasks if t.status in ("queued", "parked", SHADOW_QUEUED)]
     for t in dropped:
         t.status = "dropped"
     n = len(dropped)

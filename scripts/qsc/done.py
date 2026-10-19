@@ -13,18 +13,30 @@ which counts as done.
 """
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import model, store
 
-# Every verdict dispatch can file on a task (`Task.verdict`).
-VERDICTS = ("verify_ok", "verify_failed", "done", "not_done", "asked_question", "gave_up", "stopped")
+# Every verdict dispatch can file on a task (`Task.verdict`). `confirmed` is
+# filed by intake when the user confirms a task done ("ok, merge").
+VERDICTS = (
+    "verify_ok", "verify_failed", "done", "not_done", "asked_question", "gave_up", "stopped",
+    "confirmed",
+)
 
 # What the judge itself may answer; the rest come from the verify runner,
-# from dispatch (`gave_up`) and from an empty closing message (`stopped`).
+# from dispatch (`gave_up`), from an empty closing message (`stopped`) and
+# from the user (`confirmed`).
 JUDGE_VERDICTS = ("done", "not_done", "asked_question")
+
+# After a timed-out verify command's process group is killed, how long to
+# wait for its pipes to close before giving up on the rest of its output.
+_REAP_TIMEOUT = 2.0
 
 # A `not_done` below this confidence is treated as `done`: conservative in
 # the direction of not nagging the user with a "finish it" handback.
@@ -73,25 +85,54 @@ def run_verify(command: str, cwd: str | None, timeout: float = VERIFY_TIMEOUT) -
     within its own budget). A command that cannot be started at all (bad
     ``cwd``, no shell) is also ``verify_failed`` so the task is handed back
     rather than silently closed.
+
+    The shell starts in its own session (``start_new_session=True``), so it
+    leads a fresh process group; on timeout that whole group is killed
+    (``os.killpg``), and a verify that spawned a server or a background job
+    does not outlive the Stop hook. Works on macOS and Linux.
     """
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
             cwd=cwd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
             errors="replace",
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        return Verdict("verify_failed", f"timeout after {timeout:g} s", _tail(exc.stdout, exc.stderr))
     except (OSError, ValueError) as exc:
         return Verdict("verify_failed", f"could not run: {type(exc).__name__}: {exc}")
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_group(proc)
+        # Reap the shell and collect what its group wrote before it died. A
+        # process that escaped the group (its own setsid) could hold the
+        # pipes open, so this wait is bounded too; then the partial output
+        # the exception carries is what goes back.
+        stdout, stderr = exc.stdout, exc.stderr
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError, ValueError):
+            stdout, stderr = proc.communicate(timeout=_REAP_TIMEOUT)
+        return Verdict("verify_failed", f"timeout after {timeout:g} s", _tail(stdout, stderr))
     if proc.returncode == 0:
         return Verdict("verify_ok", "exit 0")
-    return Verdict("verify_failed", f"exit {proc.returncode}", _tail(proc.stdout, proc.stderr))
+    return Verdict("verify_failed", f"exit {proc.returncode}", _tail(stdout, stderr))
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the process group ``proc`` leads, then ``proc`` itself.
+
+    With ``start_new_session=True`` the child's pid is its group id. Every
+    failure is ignored: the group may already be gone, and the hook must
+    return either way.
+    """
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.kill()
 
 
 def _tail(stdout: object, stderr: object) -> str:
