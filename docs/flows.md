@@ -36,7 +36,7 @@ A task marked `auto` (`queue: auto pN`) still gets a plan and a handoff but skip
 
 ## 2. Where the harness sits
 
-Three Claude Code hooks (the interrupt check on `PreToolUse` only, decision D6), one store on disk, at most one classifier call on intake and one judge call on Stop.
+Three Claude Code hooks (the interrupt check on `PreToolUse` only, decision D6), one store on disk, at most one classifier call on intake (plus one in the background when **Shadow: also ask the model** is on, section 9) and one judge call on Stop.
 
 ```mermaid
 flowchart TB
@@ -44,7 +44,7 @@ flowchart TB
         UPS[UserPromptSubmit hook]
         PTU[PreToolUse hook]
         STP[Stop hook]
-        CLI[/queue slash command<br/>runs queue_cli.py in a Bash call]
+        CLI[/queue slash command<br/>caught by the intake rule first;<br/>queue_cli.py runs only without the hook]
     end
 
     subgraph H[Harness]
@@ -114,20 +114,20 @@ flowchart TD
     MT -- "yes: mid-turn" --> ST{Harness state}
     ST --> CTX[Build context:<br/>state, current task, queue,<br/>last assistant text from transcript tail]
     CTX --> PG{Paste guard?<br/>150+ words or 12+ lines}
-    PG -- yes --> ONE[Treat as one ask,<br/>never split]
-    PG -- no --> RL{Rules decide?<br/>stop, pN:, later:,<br/>maybe later, numbered list, lone dot}
+    PG -- yes --> ONE[Skip the rule table,<br/>the model sees it whole]
+    PG -- no --> RL{Rules decide?<br/>stop, pN:, later:, then, after that,<br/>maybe later, someday, lone dot}
     ONE --> RL
     RL -- yes --> R
-    RL -- no --> CL[[claude -p haiku<br/>--json-schema, 15 s timeout<br/>measured 3.6 to 5.5 s]]
+    RL -- no --> CL[[claude -p haiku<br/>--json-schema, 15 s timeout<br/>measured 3.4 to 4.7 s]]
     CL -- "error or timeout" --> FO[Fail open: steer<br/>log classifier=null]
     CL --> R{Result}
     R -- unclear --> FO
     R -- steer --> S[Let through]
     R -- "steer + interrupt" --> I[Block message,<br/>set interrupt flag]
-    R -- queue --> QG{Fake-split guard,<br/>dependency inference,<br/>cycle check}
+    R -- queue --> QG{depends_on from the model,<br/>else chained to the last<br/>queued or running task}
     R -- parked --> PK[Store with parked=true,<br/>never auto-dispatched]
-    R -- amend --> AM[Resolve target task<br/>semantically; apply text,<br/>cancel, or rewire depends_on]
-    R -- split --> SP[Classify each part<br/>with the rules above]
+    R -- amend --> AM[Target: the model's id, else<br/>match.pick; append note, cancel,<br/>pause, or rewire depends_on<br/>when the model named the target]
+    R -- split --> SP[Drop empty and duplicate parts,<br/>gate each at 0.9, apply each]
     QG --> ST2[Store task, block message,<br/>tell the user its id]
     AM --> ST2
     SP --> ST2
@@ -161,16 +161,15 @@ flowchart TD
     RA -- none --> ANS[The answer: task resumes running,<br/>message passes through untouched,<br/>no classifier call]
 ```
 
-Interrupt needs two signals, so a stray "stop" inside a longer sentence does not halt the run:
+Interrupt is explicit, so a stray "stop" inside a longer sentence does not halt the run:
 
 ```mermaid
 flowchart LR
-    A[interrupt score >= 0.9] --> C{both?}
-    B[explicit-stop score >= 0.9] --> C
-    C -- yes --> I[interrupt]
-    C -- no --> Q{queue score >= 0.9<br/>and stop score < 0.5?}
-    Q -- yes --> QU[queue]
-    Q -- no --> S[steer]
+    A[Whole message is stop / halt / abort<br/>with that, this, it, now, everything<br/>or: don't do that] -- rule --> I[interrupt]
+    B[Anything else] --> M[[model]]
+    M -- "steer, interrupt: true,<br/>confidence >= 0.9" --> I
+    M -- "queue, confidence >= 0.9" --> QU[queue]
+    M -- otherwise --> S[steer]
 ```
 
 ## 4. How state changes what a message means
@@ -227,6 +226,7 @@ stateDiagram-v2
     failed_verify --> queued: queue promote pN or resume pN
     failed_verify --> cancelled: queue cancel pN
     running --> paused: user says do something else first (g27)
+    queued --> paused: steer with note pause naming a queued task
     paused --> queued: queue resume pN or promote pN
     running --> interrupted: Esc detected on next prompt (D5), or stop at a tool call
     queued --> dropped: Esc detected (D5), notice lists them
@@ -399,16 +399,18 @@ flowchart LR
 
 The naive "depend on the previous task" rule gets this wrong (p4 would depend only on p3). Case g12 is the same trap in the other direction: "after login's done, add logout" depends on p2 (login), not on p3 (tests), even though p3 was queued last.
 
-## 9. Shadow mode
+## 9. Shadow mode and the background comparison
 
-Milestone M0 runs the whole intake path but acts on nothing. The classifier is `claude -p` (decision D2b), so M0 also measures how often the rules decide without it. Every decision goes to the log; messages pass through untouched. Flip one flag to go active.
+Two switches on the plugin's options screen. **Shadow mode** runs the whole intake path and acts on nothing: every message passes through untouched and the decision goes to the log with what the harness would have done (`shadow_queued`, `shadow_dispatched`). **Shadow: also ask the model** sends a message the rules decided to the classifier as well and logs both answers; inline while in shadow mode, detached (`scripts/compare.py`, a `shadow_compare` log line) while the plugin is active, so the rule path keeps its ~90 ms. `eval/shadow_report.py` counts the disagreements.
 
 ```mermaid
 flowchart LR
-    M([Message]) --> IN[Intake pipeline<br/>filter, context, classify]
+    M([Message]) --> IN[Intake pipeline<br/>filter, context, rules, classify]
     IN --> L[(Decision log)]
-    IN --> G{mode}
-    G -- shadow --> PASS[Pass through,<br/>always]
-    G -- active --> ACT[Block / store / flag<br/>per class]
+    IN --> G{Shadow mode?}
+    G -- on --> PASS[Pass through,<br/>always]
+    G -- off --> ACT[Block / store / flag<br/>per class]
+    IN -- "rule decided and<br/>compare switch on" --> CMP[[claude -p in the background<br/>shadow_compare line]]
+    CMP --> L
     L -. harvested into .-> GS[(golden set)]
 ```

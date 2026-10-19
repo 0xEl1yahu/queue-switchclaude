@@ -1,6 +1,6 @@
 # Decisions
 
-Decided 2026-10-18 in conversation. Each entry: the decision, the options rejected, the evidence.
+Eight decisions that shape the plugin. Each entry: the decision, the options rejected, the evidence. Do not reverse one without reading its entry; each records a measured reason, and D5 records the user's explicit choice over the author's recommendation. D1 to D5 were decided 2026-10-18 in conversation, before the first line of code; D6 to D8 on 2026-10-19 from the live acceptance runs.
 
 ## D1. Base: build fresh
 
@@ -8,7 +8,7 @@ Own code, no fork. Jev_steer_or_queue's hook tricks are now in the official hook
 
 ## D2. Runtime: classic hooks, all Python, packaged as a plugin
 
-The harness is a Claude Code plugin whose `hooks/hooks.json` declares `command` hooks on `UserPromptSubmit`, `Stop` and `PreToolUse`/`PostToolUse`, each running a Python script under `${CLAUDE_PLUGIN_ROOT}`.
+The harness is a Claude Code plugin whose `hooks/hooks.json` declares `command` hooks on `UserPromptSubmit`, `Stop` and `PreToolUse`/`PostToolUse`, each running a Python script under `${CLAUDE_PLUGIN_ROOT}`. (D6 later dropped the `PostToolUse` entry.)
 
 Rejected: a mod (in-process JavaScript hooks module). It would have given instant interrupt (`$.turn.abort`), a clean dispatch turn (`$.prompt.submit`), a live pane, `turn.complete` with Esc detection, and a native mid-turn flag (`turnId` on `prompt.submit`). It was rejected because the core would have to be JavaScript and the mod surface is marked early access. If the classic-hook limits bite (interrupt only at tool boundaries, no Esc signal, dispatch via `additionalContext`), the mod route is the documented upgrade path; the reference is in [libraries.md](libraries.md) and the type declarations at `mods/types/claude-code.d.ts` in the claude-code repo.
 
@@ -44,23 +44,23 @@ That is 3 to 5 s per classified message, against the plan's 1 to 2 s hope, so th
 
 Rejected: Anthropic API key direct (sub-second, but a key on every machine and separate billing); Ollama on the lab PC (latency and quality unproven, server must be reachable).
 
-Open: measure what fraction of the golden set the rules alone decide, and whether `claude -p` start-up can be trimmed (a warm daemon is not available to hooks).
+Measured since: the rules alone decide 8 of the 47 golden cases (`eval/run_golden.py --rules-only`), and in the live acceptance runs a rule-decided message costs about 90 ms of hook time against 3.4 to 4.7 s for a model-decided one. `claude -p` start-up cannot be trimmed from a hook (no warm daemon is available), which is why the rules exist and why 0.4.1 runs the comparison call detached.
 
 ## D3. Dispatch default: approve each plan
 
-When a task becomes ready, the Stop hook writes `plans/pN.md`, has Claude present it, and ends the turn with state `awaiting_approval`. "lgtm" runs it; "looks good but do X first" revises it without approving (golden cases g44 to g47). A task can opt out per message ("run it without asking") or be marked `auto` in the queue.
+When a task becomes ready, the Stop hook asks the session's Claude to write `plans/pN.md` and present it, and ends the turn with state `awaiting_approval` (the harness never writes a plan itself). "lgtm" runs it; "looks good but do X first" revises it without approving (golden cases g44 to g47). A task opts out of the gate with `queue: auto pN`; the per-message opt-out ("run it without asking") in the original decision was never built.
 
 Rejected: auto-run by default (errors in dependency inference compound before the user sees them; the Stop-hook continuation cap of 8 only bounds runaway chains, it does not prevent wrong work). Rejected: size-based auto-run (an extra judgement the golden set does not cover).
 
 ## D4. Done detection: verify command if set, else judge
 
-A task may carry a verify command; if it exits 0 on Stop, the task is done. Otherwise the Stop hook runs a haiku judge through `claude -p` over `last_assistant_message` (and the plan), answering done / not done / asked a question. The user's next message can also confirm: "ok, merge" marks the previous task done. The judge runs inline: the Stop hook has a 600 s default timeout and the call takes about 4 s, so no detached process.
+A task may carry a verify command; if it exits 0 on Stop, the task is done. Otherwise the Stop hook runs a haiku judge through `claude -p` over `last_assistant_message` (and the plan), answering done / not done / asked a question. The user's next message can also confirm: "ok, merge" marks the previous task done. The judge runs inline: `hooks/hooks.json` gives the Stop hook 180 s (Claude Code's default would be 600 s) and the call takes about 4 s, so no detached process.
 
 Rejected: judge only (a passing closing message is not a passing test). Rejected: verify command only (every untested task would wait on the user).
 
 ## D5. Esc: drop with a notice
 
-When the next message arrives with a new `prompt_id` while state still says `running` and no Stop fired for that task, the harness treats the turn as interrupted: the interrupted task is marked `interrupted`, every `queued` and `ready` task is dropped, and a notice is attached to the next prompt as `additionalContext` listing what was dropped (ids and intents) so the user can re-queue by pasting. Assumption, not yet confirmed: `parked` items survive, because they never dispatch on their own; `done` history survives.
+When the next message arrives with a new `prompt_id` while state still says `running` and no Stop fired for that task, the harness treats the turn as interrupted: the interrupted task is marked `interrupted`, every `queued` (and `shadow_queued`) task is dropped, and a notice is attached to the next prompt as `additionalContext` listing what was dropped (ids and intents) so the user can re-queue by pasting. Assumption, not yet confirmed: `parked` items survive, because they never dispatch on their own; `done` history survives.
 
 Rejected (my recommendation): pause and keep everything. Rejected: ask on the next message. The user chose drop for simplicity and predictability: Esc means "stop the plan".
 
@@ -72,7 +72,7 @@ Decided 2026-10-19, during the M2 and M3 work. The evidence is in the live runs:
 
 ## D6. Interrupt hook on `PreToolUse` only
 
-`hooks/hooks.json` registers `scripts/interrupt.py` on `PreToolUse` alone; the `PostToolUse` entry of D2 is gone. Every tool call costs one Python launch for the interrupt check instead of two. Nothing is lost: a `PostToolUse` boundary is always followed either by the next `PreToolUse`, where the flag is honoured, or by `Stop`, where dispatch honours it (`reset_after_interrupt`, nothing dispatched, the same drop as D5). `interrupt.handle` still accepts a `PostToolUse` event for a caller that sends one, and it returns before reading the store when `tool_name` is `AskUserQuestion`: that turn is already handing control to the user, and ending it there would only swallow the question.
+`hooks/hooks.json` registers `scripts/interrupt.py` on `PreToolUse` alone; the `PostToolUse` entry of D2 is gone. Every tool call costs one Python launch for the interrupt check instead of two. Nothing is lost: a `PostToolUse` boundary is always followed either by the next `PreToolUse`, where the flag is honoured, or by `Stop`, where dispatch honours it (`reset_after_interrupt`, nothing dispatched, the same drop as D5). Since 0.4.0 `interrupt.handle` returns before reading the store for any event but `PreToolUse`, and likewise when `tool_name` is `AskUserQuestion`: that turn is already handing control to the user, and ending it there would only swallow the question.
 
 Evidence: in every live run the interrupt fired on `PreToolUse` (`m0-acceptance.md`, scenario B: `PreToolUse:Bash hook stopped continuation: queue-switchclaude: stopped as requested`, log `via: PreToolUse`, the turn halted 1.92 s after the send, with echo 6 already running). A hook launch costs 60 to 120 ms on this machine (the rules-only intake delays recorded in `m1-acceptance.md` and `m2-acceptance.md`), and the interrupt check paid it twice per tool call whether or not a stop was pending; the store is read without the lock, so the launch itself is most of the cost.
 

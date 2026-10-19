@@ -1,10 +1,29 @@
-# Python libraries by problem area
+# Libraries: what the code uses, and what was considered
 
-> **After decision D2b (2026-10-18):** the classifier is called through `claude -p --model haiku --json-schema`, not the `anthropic` SDK, Ollama or the Agent SDK. Those three rows and their sketches below are kept as the rejected alternatives. The hook plumbing, store, DAG, matching and eval rows stand. The mod section at the end is the documented upgrade path if classic hooks prove too limiting.
+## What the code uses (version 0.4.1)
 
-Checked against PyPI on 2026-10-18. Local interpreter is Python 3.14, so every stdlib item below is available. Versions are the current releases on that date; pin at install time.
+Nothing outside the Python standard library. The hooks run on every prompt and every tool call, so a dependency would have to be installed on every machine before the first message could be sorted; none earned that.
 
-The rule for choosing: stdlib first, one small dependency per problem, nothing heavy on the inline hook path (intake has a ~1–2 s budget and runs on every message).
+| Problem area | In the code | Where |
+|---|---|---|
+| Hook I/O | `json` on stdin and stdout, hand-written checks; `hook_ms` from a `time.monotonic()` stamp taken as the first statement of each entry script | `scripts/qsc/hookio.py`, `scripts/*.py` |
+| Task store | `fcntl.flock` on a `.lock` file, `tempfile` + `os.replace` for the atomic save, `dataclasses` for the shape | `scripts/qsc/store.py` |
+| Dependency order | A `queued` task is ready when every `depends_on` id is `done`; first ready task in creation order. No graph library, no cycle check | `store.Store.ready()` |
+| Classifier and judge | `subprocess.run` of `claude -p --model haiku --json-schema …`; the answer is validated by hand | `scripts/qsc/model.py`, `classify.py`, `done.py` |
+| Amend target matching | `difflib` ratio and a Jaccard overlap of stemmed content words, with document-frequency weighting; accept 0.6, margin 0.2; the top three go to the model as candidates | `scripts/qsc/match.py` |
+| Transcript tail | `os.SEEK_END` and `json`, last N KB | `scripts/qsc/transcript.py` |
+| Decision log | `json` lines appended, errors swallowed | `scripts/qsc/log.py` |
+| Verify command | `subprocess` in its own session, `os.killpg` on timeout | `scripts/qsc/done.py` |
+| Eval runner and report | `argparse`, `statistics`, `hashlib` for the answer cache | `eval/run_golden.py`, `eval/shadow_report.py` |
+| CLI | `argparse`-free: one positional argument list parsed by hand | `scripts/queue_cli.py` |
+
+## What was considered (research of 2026-10-18)
+
+Written before the first line of code, when the classifier was still expected to be an API call and the amend matcher a fuzzy-matching library. Decision D2b moved the classifier to `claude -p`; the M1 implementation then found `difflib` enough for the golden set and never reached for `rapidfuzz` or embeddings; `pydantic`, `filelock`, `typer` and `pydantic-evals` were replaced by their stdlib alternatives in the right-hand column. The rows stand as the record of what each package would have bought and why it was not needed; the mod section at the end is still the documented upgrade path if classic hooks prove too limiting.
+
+Checked against PyPI on 2026-10-18. Versions are the releases current on that date. (The shipped code supports Python 3.10 and later, and CI runs 3.10, 3.12 and 3.14.)
+
+The rule for choosing: stdlib first, one small dependency per problem, nothing heavy on the inline hook path (intake has a ~1–2 s budget and runs on every message). [As built: the classifier timeout is 15 s and a model-decided message costs 3.4 to 4.7 s; the 1 to 2 s figure assumed a direct API call, rejected in D2b.]
 
 ## Summary
 
@@ -31,7 +50,7 @@ The official hooks reference (checked 2026-10-18) settles three things the plan 
 
 - `prompt_id` is a documented common input field: "UUID identifying the user prompt currently being processed". The mid-turn test is official, not reverse-engineered.
 - `Stop` and `SubagentStop` input carries `last_assistant_message`. The docs say hooks that need the final assistant text should use it "instead of reading the transcript", because the transcript file "is written asynchronously and may lag". So the transcript-tail reader is only needed for *earlier* context (the `recent` field in the golden set), not for the closing message.
-- Timeouts: command hooks default to 600 s, lowered to 30 s on `UserPromptSubmit`. The "Stop hook has 5 s" constraint quoted from claude-task-manager is not in the current docs. The 2 s classifier budget stays, because the user is waiting, but a detached judge is a choice, not a necessity.
+- Timeouts: command hooks default to 600 s, lowered to 30 s on `UserPromptSubmit`. The "Stop hook has 5 s" constraint quoted from claude-task-manager is not in the current docs. The 2 s classifier budget stays, because the user is waiting, but a detached judge is a choice, not a necessity. [As built: `hooks/hooks.json` sets 25 s on `UserPromptSubmit`, 180 s on `Stop`, 5 s on `PreToolUse`; the judge runs inline.]
 - `continue: false` is a universal output field that "takes precedence over any event-specific decision fields", with `stopReason` shown to the user and kept in the conversation. On Pre/PostToolUse the stop applies even if the tool call fails.
 - `Stop` accepts `hookSpecificOutput.additionalContext` for "non-error feedback that continues the conversation". That is the handover path the plan chose.
 - `UserPromptSubmit` cannot replace the prompt; it can block it (exit 2 or `decision: "block"`) or add `additionalContext` alongside it.
@@ -97,7 +116,7 @@ class Decision(BaseModel):
     part: Part | None = None                       # everything else
 ```
 
-Hosted (D2 option a). The plan names Haiku for the inline call because of the latency budget; Opus 5.5 is the default elsewhere and the right pick for the done judge, where latency does not matter:
+Hosted (D2 option a). The plan names Haiku for the inline call because of the latency budget; Opus 5.5 is the default elsewhere and was the pick here for the done judge, where latency does not matter [as built: the judge uses the `haiku` alias too, `scripts/qsc/model.py`]:
 
 ```python
 import anthropic

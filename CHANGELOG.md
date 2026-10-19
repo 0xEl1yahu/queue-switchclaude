@@ -4,7 +4,7 @@ One section per milestone, newest first. Each milestone was accepted live in Cla
 
 ## 0.4.1 (2026-10-19)
 
-- **Shadow: also ask the model** now works while the plugin is active, not only in shadow mode. For a message the rules decided, intake starts `scripts/compare.py` detached; it asks the classifier and logs the answer as a `shadow_compare` line beside the `intake` line that acted. The rule path keeps its ~90 ms; the comparison costs one background `claude -p` call. `eval/shadow_report.py` counts these lines in "compared" and "disagreements".
+- **Shadow: also ask the model** now works while the plugin is active, not only in shadow mode. For a message the rules decided, intake starts `scripts/compare.py` detached; it asks the classifier and logs the answer as a `shadow_compare` line beside the `intake` line that acted. The rule path keeps its ~90 ms; the comparison costs one background `claude -p` call. `eval/shadow_report.py` counts these lines in "compared" and "disagreements". Checked by hand in the installed plugin (rule path 35 ms, the comparison line 4.6 s later); no written acceptance record.
 
 ## 0.4.0, M4 daily-use polish (2026-10-19)
 
@@ -13,6 +13,7 @@ One section per milestone, newest first. Each milestone was accepted live in Cla
 - Garbage collection prunes `pointers/` files that name a session with no store and no log, and never the pointer of a live session, even one whose first message was a pass-through; `gc.collect` returns `(deleted_sessions, deleted_pointers)`.
 - The interrupt script reads `PreToolUse` only and ignores a `PostToolUse` event; `queue: help` names every control word the rules accept.
 - README rewritten for daily use (install as the UI walks it, requirements, a week of Shadow compare, the known limits in one list); this changelog; the two manifests carry the same description.
+- Live record: `docs/m4-acceptance.md` (scenarios X to AA; AA found the mid-turn block notice is not drawn in 2.1.302 with the side panel open).
 
 ## 0.3.0, M3 hardening (2026-10-19)
 

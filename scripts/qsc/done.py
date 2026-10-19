@@ -169,8 +169,8 @@ def judge(
     The payload is ``{task, notes, plan, closing}``; the answer is validated
     against JUDGE_SCHEMA by hand. ``None`` from ``model.call`` or an answer
     outside the contract fails open as ``done`` (``judge unavailable; fail
-    open``) so the queue keeps moving; the log carries ``judge: null`` in
-    that case. A ``not_done`` with confidence below NOT_DONE_THRESHOLD is
+    open``) so the queue keeps moving; the dispatch log line then carries
+    that reason. A ``not_done`` with confidence below NOT_DONE_THRESHOLD is
     treated as ``done``.
     """
     payload = {
