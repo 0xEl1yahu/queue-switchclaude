@@ -123,6 +123,9 @@ class Store:
     # M3: consecutive Stop-hook continuations the harness has issued; reset
     # by any Stop that is not a continuation. Bounds automatic chains.
     continuations: int = 0
+    # M3: when dispatch ran session garbage collection (``qsc.gc``) on this
+    # session's behalf; None until it has. At most one run per session.
+    gc_at: str | None = None
     tasks: list[Task] = field(default_factory=list)
 
     def new_task(

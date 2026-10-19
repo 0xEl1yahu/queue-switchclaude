@@ -60,3 +60,15 @@ def test_data_dir_env_wins_and_last_resort(monkeypatch, tmp_path):
     monkeypatch.delenv("CLAUDE_PLUGIN_DATA")
     monkeypatch.setattr(paths, "PLUGIN_DATA_ROOT", tmp_path / "nope")
     assert paths.data_dir().name == "queue-switchclaude"
+
+
+# M3 Task 2: one pointer per working directory, so two sessions in different
+# folders never see each other's queue through the CLI (review focus 1).
+
+def test_cwd_pointer_path(data_dir):
+    import hashlib
+    p = paths.cwd_pointer_path("/proj/one")
+    assert p.parent == data_dir / "pointers"
+    assert p.name == hashlib.sha1(b"/proj/one").hexdigest()[:16]
+    assert paths.cwd_pointer_path("/proj/one") == p
+    assert paths.cwd_pointer_path("/proj/two") != p

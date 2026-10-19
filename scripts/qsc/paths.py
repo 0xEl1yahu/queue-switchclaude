@@ -1,6 +1,7 @@
 """Where the plugin keeps per-session state. Stdlib only."""
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -98,3 +99,23 @@ def pointer_path() -> Path:
     session id. One pointer per data dir: the most recent session wins.
     """
     return data_dir() / "last_session"
+
+
+def pointers_dir() -> Path:
+    """The directory of per-working-directory pointers (M3 Task 2)."""
+    return data_dir() / "pointers"
+
+
+def cwd_pointer_path(cwd: str) -> Path:
+    """``pointers/<sha1(cwd)[:16]>``: the id of the session intake saw last
+    in that working directory.
+
+    Two sessions in different folders share one data dir and one global
+    pointer, so ``queue_cli.py`` run from a project would otherwise show
+    whichever session typed last anywhere (M3 review focus 1). Intake writes
+    this pointer from the event's ``cwd``; the CLI reads the one for the
+    directory it runs in. The hash keeps the name short, safe and free of
+    path separators.
+    """
+    digest = hashlib.sha1(str(cwd).encode("utf-8", errors="surrogateescape")).hexdigest()
+    return pointers_dir() / digest[:16]

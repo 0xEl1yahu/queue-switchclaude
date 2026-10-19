@@ -27,9 +27,10 @@ shows as a hook error in the UI. A Stop-hook continuation keeps the original
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime, timezone
 from pathlib import Path
 
-from . import done, log, paths, store
+from . import done, gc, log, paths, store
 from .interrupt import reset_after_interrupt
 
 PREFIX = "queue-switchclaude"
@@ -478,6 +479,31 @@ def choose_next(s: store.Store, stop_hook_active: bool = False, shadow: bool = F
     return _planning_text(s, nxt)
 
 
+# --- housekeeping -------------------------------------------------------------
+
+
+def _maybe_gc(s: store.Store) -> None:
+    """Run session garbage collection once per session (M3 Task 2).
+
+    The first Stop of a session stamps ``gc_at`` and calls ``gc.collect``
+    with this session protected; later Stops skip it. The stamp is written
+    before the call, so a collector that raises is not retried every turn,
+    and every error is swallowed: housekeeping never costs the user a
+    handover. A ``gc`` log line is written only when something was deleted
+    or the run failed; ``gc_at`` already says that it ran.
+    """
+    if s.gc_at:
+        return
+    s.gc_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    try:
+        deleted = list(gc.collect(protect={s.session_id}))
+    except Exception as exc:
+        log.record(s.session_id, "gc", error=f"{type(exc).__name__}: {exc}")
+        return
+    if deleted:
+        log.record(s.session_id, "gc", deleted=deleted)
+
+
 # --- entry point -------------------------------------------------------------
 
 
@@ -491,6 +517,7 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
     # should-fix: a 120 s verify held the session lock and made intake wait).
     pre_id, pre_verify, pre_verdict = _precompute_verdict(session_id, event, claude)
     with store.locked(session_id) as s:
+        _maybe_gc(s)
         s.continuations = s.continuations + 1 if active else 0
         if s.interrupt:
             # The user asked to stop but no tool call came after the flag was

@@ -5,7 +5,9 @@ Runs one ``qsc.control`` command (``list``, ``cancel pN``, ``promote pN``,
 ``park pN``, ``drop``, ``pause``, ``resume``; empty means ``list``) against
 the session's store and prints the reply. The session comes from
 ``--session ID`` (or ``--session=ID``), else ``$QSC_SESSION``, else the
-pointer file intake rewrites on every event (``paths.pointer_path()``).
+pointer intake keeps for the current directory
+(``paths.cwd_pointer_path``), else the global pointer it rewrites on every
+event (``paths.pointer_path()``).
 
 Exit status is always 0: the command's output is the whole answer, and a
 slash command that "fails" would only hide it. With no session to act on it
@@ -51,8 +53,24 @@ def parse_args(argv: list[str]) -> tuple[str | None, str]:
     return (session or None), " ".join(words)
 
 
-def resolve_session(explicit: str | None) -> str | None:
-    """``--session``, else ``$QSC_SESSION``, else the pointer file, else None."""
+def _read_pointer(path) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    text = text.strip()
+    return text or None
+
+
+def resolve_session(explicit: str | None, cwd: str | None = None) -> str | None:
+    """``--session``, else ``$QSC_SESSION``, else the pointer for ``cwd``
+    (the current directory by default), else the global pointer, else None.
+
+    The Bash tool runs the command in the project directory, and intake
+    keys a pointer by each event's ``cwd``, so a session in another folder
+    never answers for this one (M3 review focus 1). The global pointer is
+    the fallback for a directory no session has typed in.
+    """
     if explicit:
         return explicit
     env = os.environ.get("QSC_SESSION", "").strip()
@@ -60,12 +78,16 @@ def resolve_session(explicit: str | None) -> str | None:
         return env
     from qsc import paths
 
-    try:
-        text = paths.pointer_path().read_text(encoding="utf-8")
-    except OSError:
-        return None
-    text = text.strip()
-    return text or None
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = None
+    if cwd:
+        found = _read_pointer(paths.cwd_pointer_path(cwd))
+        if found:
+            return found
+    return _read_pointer(paths.pointer_path())
 
 
 def main(argv: list[str]) -> str:

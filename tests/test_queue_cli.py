@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 from qsc import intake, paths, store
+import queue_cli
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "scripts" / "queue_cli.py"
@@ -14,11 +15,11 @@ def ev(prompt, prompt_id="pid-1", sid="s1"):
     return {"hook_event_name": "UserPromptSubmit", "session_id": sid, "prompt_id": prompt_id, "prompt": prompt, "transcript_path": None}
 
 
-def run_cli(data_dir, *args, **env):
+def run_cli(data_dir, *args, cwd=None, **env):
     full_env = {**os.environ, "CLAUDE_PLUGIN_DATA": str(data_dir)}
     full_env.pop("QSC_SESSION", None)
     full_env.update(env)
-    return subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True, env=full_env)
+    return subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True, env=full_env, cwd=cwd)
 
 
 def test_queue_cli_uses_pointer(data_dir):
@@ -102,3 +103,52 @@ def test_queue_cli_approve_prints_execution_handover(data_dir):
 def test_command_file_tells_claude_to_follow_an_execution_line():
     text = (Path(__file__).resolve().parent.parent / "commands" / "queue.md").read_text()
     assert "queue-switchclaude: task" in text and "approve" in text
+
+
+# M3 Task 2: the per-cwd pointer. Intake writes both the global pointer
+# (newest session anywhere) and one keyed by the event's ``cwd``; the CLI
+# prefers the pointer for the directory it runs in.
+
+def test_cwd_pointer_isolates_sessions(data_dir):
+    intake.handle({**ev("a", sid="s-one"), "cwd": "/proj/one"}); intake.handle({**ev("b", sid="s-two"), "cwd": "/proj/two"})
+    assert queue_cli.resolve_session(None, cwd="/proj/one") == "s-one" and queue_cli.resolve_session(None, cwd="/proj/two") == "s-two"   # review focus 1
+    assert queue_cli.resolve_session(None, cwd="/proj/none") == "s-two"      # global pointer: newest
+
+
+def test_cwd_pointer_written_on_every_event(data_dir):
+    intake.handle({**ev("add a user model", sid="s-one"), "cwd": "/proj/one"})
+    assert paths.cwd_pointer_path("/proj/one").read_text().strip() == "s-one"
+    assert paths.pointer_path().read_text().strip() == "s-one"
+    # A later session in the same folder takes the folder over; a pass-through counts.
+    intake.handle({**ev("ok", sid="s-three"), "cwd": "/proj/one"})
+    assert paths.cwd_pointer_path("/proj/one").read_text().strip() == "s-three"
+    # An event without a cwd still refreshes the global pointer and leaves the cwd pointers alone.
+    intake.handle(ev("later: x", sid="s-four"))
+    assert paths.pointer_path().read_text().strip() == "s-four"
+    assert paths.cwd_pointer_path("/proj/one").read_text().strip() == "s-three"
+
+
+def test_explicit_session_and_env_beat_cwd_pointer(data_dir, monkeypatch):
+    intake.handle({**ev("a", sid="s-one"), "cwd": "/proj/one"})
+    assert queue_cli.resolve_session("s-x", cwd="/proj/one") == "s-x"
+    monkeypatch.setenv("QSC_SESSION", "s-env")
+    assert queue_cli.resolve_session(None, cwd="/proj/one") == "s-env"
+    monkeypatch.delenv("QSC_SESSION")
+    assert queue_cli.resolve_session(None, cwd="/proj/one") == "s-one"
+
+
+def test_resolve_session_defaults_to_the_current_directory(data_dir, monkeypatch, tmp_path):
+    here = tmp_path / "here"; here.mkdir()
+    intake.handle({**ev("a", sid="s-here"), "cwd": str(here)}); intake.handle({**ev("b", sid="s-elsewhere"), "cwd": "/proj/elsewhere"})
+    monkeypatch.chdir(here)
+    assert queue_cli.resolve_session(None) == "s-here"
+
+
+def test_queue_cli_subprocess_uses_the_directory_it_runs_in(data_dir, tmp_path):
+    one = tmp_path / "one"; two = tmp_path / "two"; one.mkdir(); two.mkdir()
+    intake.handle({**ev("add a user model", sid="s-one"), "cwd": str(one)}); intake.handle({**ev("later: email verification", sid="s-one"), "cwd": str(one)})
+    intake.handle({**ev("other work", sid="s-two"), "cwd": str(two)}); intake.handle({**ev("later: write docs", sid="s-two"), "cwd": str(two)})
+    r = run_cli(data_dir, "list", cwd=str(one))
+    assert r.returncode == 0 and "email verification" in r.stdout and "write docs" not in r.stdout
+    r = run_cli(data_dir, "list", cwd=str(two))
+    assert r.returncode == 0 and "write docs" in r.stdout and "email verification" not in r.stdout
