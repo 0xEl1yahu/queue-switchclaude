@@ -324,6 +324,25 @@ def _clean_parts(parts: list[classify.Part]) -> list[classify.Part]:
     return out
 
 
+def _id_number(task_id: str) -> int:
+    try:
+        return int(str(task_id).lstrip("p"))
+    except ValueError:
+        return 0
+
+
+def _next_visible_id(s: store.Store) -> int:
+    """The number of the first id the model will assign to a new split part.
+
+    The prompt tells the model that new tasks are numbered after the highest
+    id it can see, and the payload shows it only the live tasks
+    (``s.candidates()``). The store may hold newer ids it was never shown
+    (cancelled, dropped, done, interrupted), so the model's prediction and
+    ``s.next_id`` can differ; ``_split`` maps one onto the other.
+    """
+    return max([_id_number(t.id) for t in s.candidates()] + [0]) + 1
+
+
 def _part_label(p: classify.Part) -> str:
     """The label a split part is acted on as; anything unsure is steer."""
     if not _confident(p) or p.label not in ("queue", "amend"):
@@ -485,9 +504,19 @@ def _split(
     confirmations: list[str] = []
     steer_texts: list[str] = []
     target_id: str | None = None
+    # A later part may depend on an earlier part by the id the model
+    # predicted for it; translate those predictions to the ids the store
+    # really hands out, or the dependency points at a task that is not the
+    # one meant (and may never finish).
+    predicted = _next_visible_id(s)
+    remap: dict[str, str] = {}
     for p, lbl in zip(parts, labels):
+        p.depends_on = [remap.get(d, d) for d in p.depends_on]
         if lbl == "queue":
+            actual = f"p{s.next_id}"
             confirmations.append(_queue(s, p.text, list(p.depends_on), prompt_id, p.parked, shadow))
+            remap[f"p{predicted}"] = actual
+            predicted += 1
         elif lbl == "amend":
             confirmation, tid = _amend(s, p.text, p, shadow)
             if confirmation is None:

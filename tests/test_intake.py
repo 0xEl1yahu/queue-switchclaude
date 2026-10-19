@@ -252,6 +252,20 @@ def test_split_all_queue_blocks_with_both(data_dir):
     assert out["decision"] == "block" and store.load("s1").get("p3").depends_on == ["p2"]
 
 
+def test_split_remaps_predicted_part_ids_after_a_cancel(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: email verification")); intake.handle(ev("queue: cancel p2"))
+    # The model sees p1 running and an empty queue (p2 is cancelled, so hidden), numbers the
+    # parts p2 and p3, and chains the second to "p2". The store hands out p3 and p4.
+    d = dec(label="split", parts=[part(label="queue", text="login endpoint", depends_on=["p1"]),
+                                  part(label="queue", text="logout endpoint", depends_on=["p2"])])
+    out = intake.handle(ev("1) login endpoint 2) logout endpoint"), classifier=lambda p: d)
+    s = store.load("s1")
+    assert s.get("p3").depends_on == ["p1"] and s.get("p4").depends_on == ["p3"]
+    assert "queued p4 after p3" in out["systemMessage"] and "after p2" not in out["systemMessage"]
+    # A dependency on a task the model could see is left alone.
+    assert s.get("p3").depends_on == ["p1"]
+
+
 def test_low_confidence_amend_is_steer(data_dir):
     intake.handle(ev("x")); intake.handle(ev("later: y"))
     assert intake.handle(ev("tweak y"), classifier=lambda p: dec(label="amend", target="p2", confidence=0.5)) is None
