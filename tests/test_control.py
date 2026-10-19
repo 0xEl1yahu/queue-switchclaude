@@ -103,3 +103,123 @@ def test_help_and_list_are_single_lines():
     assert "\n" not in control.run(s, "help") and "resume [pN]" in control.run(s, "help")
     out = control.run(s, "list")
     assert "\n" not in out and out.endswith("queue is paused, send 'queue: resume' to dispatch again")
+
+
+# --- M2 Task 3: verify, auto, manual, show, approve ---------------------------
+
+from qsc import paths  # noqa: E402
+
+
+def test_verify_auto_manual_show(data_dir):
+    s = seeded()
+    assert control.run(s, "verify p2 pytest -q tests/test_login.py") == "p2 verifies with: pytest -q tests/test_login.py"
+    assert s.get("p2").verify == "pytest -q tests/test_login.py"
+    assert control.run(s, "auto p2") == "p2 will run without approval" and s.get("p2").auto
+    assert control.run(s, "manual p2") == "p2 will wait for approval" and not s.get("p2").auto
+    out = control.run(s, "show p2", session_id="s1")
+    assert out.startswith("p2 queued: write tests for login") and "verify: pytest" in out and "plan:" not in out
+
+
+def test_approve_command(data_dir):
+    s = seeded(); s.state = "awaiting_approval"; s.pending_task = "p2"; s.get("p2").status = "planned"
+    assert control.run(s, "approve") == "approved p2, it runs now" and s.state == "running" and s.running_task == "p2" and s.get("p2").status == "running"
+    assert control.run(s, "approve") == "nothing is waiting for approval"
+
+
+# Additional tests beyond the plan's two.
+
+def test_show_names_plan_and_handoff_files_when_they_exist(data_dir):
+    s = seeded()
+    plan = paths.plan_path("s1", "p2"); plan.parent.mkdir(parents=True); plan.write_text("# plan")
+    handoff = paths.handoff_path("s1", "p2"); handoff.parent.mkdir(parents=True); handoff.write_text("# handoff")
+    out = control.run(s, "show p2", session_id="s1")
+    assert "\n" not in out
+    assert out.startswith("p2 queued: write tests for login")
+    assert f"; plan: {plan}" in out and f"; handoff: {handoff}" in out and "verify:" not in out
+    # Another session's files are not this session's.
+    assert "plan:" not in control.run(s, "show p2", session_id="s2")
+
+
+def test_show_without_session_id_omits_file_paths(data_dir):
+    s = seeded()
+    plan = paths.plan_path("s1", "p2"); plan.parent.mkdir(parents=True); plan.write_text("# plan")
+    assert control.run(s, "show p2") == "p2 queued: write tests for login"
+
+
+def test_show_missing_task_and_usage():
+    s = seeded()
+    assert control.run(s, "show p9") == "no task p9"
+    assert control.run(s, "show") == "usage: show pN"
+    assert control.run(s, "SHOW 2").startswith("p2 queued: write tests for login")
+
+
+def test_show_marks_auto_and_is_one_line():
+    s = seeded(); s.get("p1").text = "add login\n  with   two   factors"
+    control.run(s, "auto p1")
+    out = control.run(s, "show p1")
+    assert out == "p1 running: add login with two factors; auto"
+
+
+def test_verify_keeps_the_rest_of_the_line_verbatim():
+    s = seeded()
+    cmd = 'python3 -c "import sys; sys.exit(1)"  # trailing'
+    assert control.run(s, f"verify p2 {cmd}") == f"p2 verifies with: {cmd}"
+    assert s.get("p2").verify == cmd
+    assert control.run(s, "verify 2 true") == "p2 verifies with: true" and s.get("p2").verify == "true"
+
+
+def test_verify_usage_and_missing_task():
+    s = seeded()
+    assert control.run(s, "verify") == "usage: verify pN <command>"
+    assert control.run(s, "verify p2") == "usage: verify pN <command>"
+    assert control.run(s, "verify p9 true") == "no task p9"
+    assert s.get("p2").verify is None
+
+
+def test_verify_auto_manual_apply_to_live_or_planned_tasks_only():
+    s = seeded()
+    s.get("p2").status = "planned"
+    assert control.run(s, "verify p2 true") == "p2 verifies with: true"
+    assert control.run(s, "verify p1 true") == "p1 verifies with: true"          # running is live
+    d = s.new_task("old", [], None); d.status = "done"
+    assert control.run(s, "verify p4 true") == "p4 is done, not live" and d.verify is None
+    assert control.run(s, "auto p4") == "p4 is done, not live" and not d.auto
+    assert control.run(s, "manual p4") == "p4 is done, not live"
+    assert control.run(s, "auto p9") == "no task p9" and control.run(s, "manual p9") == "no task p9"
+    assert control.run(s, "auto") == "usage: auto pN" and control.run(s, "manual") == "usage: manual pN"
+
+
+def test_list_marks_the_pending_planned_task():
+    s = seeded(); s.get("p2").status = "planned"
+    assert "p2 planned after p1: write tests for login" in control.run(s, "list")
+    s.state = "awaiting_approval"; s.pending_task = "p2"
+    out = control.run(s, "list")
+    assert "p2 planned (awaiting approval) after p1: write tests for login" in out and "\n" not in out
+    # A different planned task is not the one waiting.
+    s.get("p3").status = "planned"
+    assert "p3 planned after p1: social login" in control.run(s, "list")
+
+
+def test_approve_clears_pending_and_ignores_other_states():
+    s = seeded(); s.get("p1").status = "done"; s.running_task = None
+    s.state = "awaiting_answer"; s.pending_task = "p2"
+    assert control.run(s, "approve") == "nothing is waiting for approval" and s.state == "awaiting_answer"
+    s.state = "awaiting_approval"; s.get("p2").status = "planned"
+    assert control.run(s, "approve") == "approved p2, it runs now"
+    assert s.pending_task is None and s.running_task == "p2" and s.state == "running"
+
+
+def test_approve_with_an_id_must_name_the_pending_task():
+    s = seeded(); s.state = "awaiting_approval"; s.pending_task = "p2"; s.get("p2").status = "planned"
+    assert control.run(s, "approve p3") == "p3 is not waiting for approval; p2 is"
+    assert s.state == "awaiting_approval" and s.get("p2").status == "planned"
+    assert control.run(s, "approve p2") == "approved p2, it runs now"
+
+
+def test_help_lists_the_plan_flow_commands():
+    out = control.run(store.Store("s1"), "help")
+    assert "\n" not in out
+    for word in ("show pN", "verify pN <command>", "auto pN", "manual pN", "approve"):
+        assert word in out
+    for word in ("verify", "auto", "manual", "show", "approve"):
+        assert word in control.COMMANDS
