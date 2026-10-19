@@ -256,6 +256,13 @@ def _after_planning(s: store.Store) -> tuple[dict | None, bool]:
     if task is None:
         log.record(sid, "plan_failed", task=s.pending_task, reason="no pending task")
         return None, True
+    if task.status != "queued":
+        # The user cancelled, parked or dropped the task while Claude was
+        # writing its plan (control works in every state). It must not come
+        # back as ``planned``, so the plan file is ignored and ``choose_next``
+        # moves on.
+        log.record(sid, "plan_failed", task=task.id, reason=f"pending task is {task.status}")
+        return None, True
 
     if _plan_written(s, task):
         task.status = "planned"

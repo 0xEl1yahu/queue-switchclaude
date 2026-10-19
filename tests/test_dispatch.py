@@ -446,6 +446,24 @@ def test_planned_task_with_unfinished_dependency_is_not_represented(data_dir):
     assert "Write a short plan for p1" in ctx and s.get("p2").status == "planned" and s.pending_task == "p1"
 
 
+def test_planning_stop_never_resurrects_a_cancelled_or_parked_task(data_dir):
+    # `queue: cancel p1` (or `park p1`) typed while Claude was writing p1's plan: the
+    # plan file still appears, but the task must keep its status, never become
+    # `planned`, and dispatch must move on to the next ready task.
+    for status in ("cancelled", "parked"):
+        with store.locked("s1") as s:
+            s.tasks = []; s.next_id = 1; s.last_dispatched = None
+            a = s.new_task("a", [], "pid"); s.new_task("b", [], "pid")
+            s.state = "planning"; s.pending_task = "p1"; a.status = status
+        p = paths.plan_path("s1", "p1"); p.parent.mkdir(parents=True, exist_ok=True); p.write_text("# plan")
+        out = dispatch.handle(stop(active=True))
+        s = store.load("s1")
+        assert s.get("p1").status == status and s.state == "planning" and s.pending_task == "p2"
+        assert "Write a short plan for p2" in out["hookSpecificOutput"]["additionalContext"]
+        rows = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()]
+        assert any(r["event"] == "plan_failed" and r["task"] == "p1" and status in r["reason"] for r in rows)
+
+
 def test_plan_failed_is_logged(data_dir):
     with store.locked("s1") as s:
         s.new_task("b", [], "pid"); s.state = "planning"; s.pending_task = "p1"
