@@ -73,3 +73,14 @@ Teardown:
 3. Every hook in T to W reported `hook_ms` 1 to 7; end-to-end delays were 66 to 102 ms, except the first hook of the fresh marketplace install (261 ms) and the one classifier call in the discarded U attempt (3.45 s).
 4. The marketplace install walks through a scope picker and the plugin's options screen before it is active; the README install line should say so, or users will think the install hung on the `Plugin Details` page.
 5. The driver's pane-text polling is fragile at 150 columns (the invalid U attempt). Polling the store for `state: planning` worked and is the method to keep.
+
+## Scenario W, GitHub form, run after the push (2026-10-19, 14:52 to 14:56 BST)
+
+Fresh session in `/tmp/qsc-demo-gh` (new `git init`, no `--plugin-dir`), Claude Code 2.1.302, auto permission mode, driven through tmux. The README's two lines as written:
+
+1. `/plugin marketplace add 0xEl1yahu/queue-switchclaude` → `Successfully added marketplace: queue-switchclaude`, followed by an automatic `/reload-plugins`.
+2. `/plugin install queue-switchclaude@queue-switchclaude` → the Plugins panel: Plugin Details with the marketplace description, the trust warning, the scope picker (user scope chosen, the default), then the plugin's options screen (`Shadow mode ◀ false ▶`, `Shadow: also ask the model false`, `Save configuration`), then `✓ Installed and configured queue-switchclaude. Plugin is now active.` Settings gained `enabledPlugins["queue-switchclaude@queue-switchclaude"] = true`, the marketplace under `extraKnownMarketplaces`, and `pluginConfigs["queue-switchclaude@queue-switchclaude"]`.
+3. Session restarted as the README says. Scenario A: first prompt, `later: add a goodbye.py that prints goodbye` 2.2 s later → blocked and shown within 63 ms (`queued p2 after p1`), data dir `~/.claude/plugins/data/queue-switchclaude-queue-switchclaude/`; after the first turn, p1 closed as `stopped` (prompt turn, no judge), p2 planned and presented, state `awaiting_approval`; `lgtm` → executed, `goodbye.py` written, judge `done`, store `p1 done, p2 done`.
+4. `/plugin uninstall queue-switchclaude@queue-switchclaude` asked whether to delete 5.6 KB of persistent data (`y`): the data dir and the `enabledPlugins` and `pluginConfigs` entries were removed. The panel then stayed open, so `/plugin marketplace remove` typed into it did not run; from a shell, `claude plugin marketplace remove queue-switchclaude` printed `Successfully removed marketplace` and cleared `extraKnownMarketplaces`, `known_marketplaces.json` and the marketplace cache. `installed_plugins.json` has no entry.
+
+Result: pass. Two notes for the README: after `/plugin uninstall` press Escape to leave the panel before the next slash command, or run the marketplace removal from the shell; and the install walks through a scope picker and the plugin's options screen, which the README should mention.
