@@ -97,7 +97,7 @@ Tests: `python3 -m pytest -q` (stdlib-only code under `scripts/` and `eval/`; th
 
 The plugin is built to be judged on real sessions, not on the golden set. The way to do that is one week of watching, then a report.
 
-1. Under `/config`, turn on **Shadow mode** and **Shadow: also ask the model** (both take effect on the next prompt; no restart). In shadow mode the plugin blocks nothing and dispatches nothing: Claude Code's stock behaviour runs, and every message is logged with what the harness *would* have done. The second switch makes intake also ask the classifier about the messages the rules decided by themselves, so each of those log lines holds the rule's answer and the model's answer side by side. It costs one `claude -p` call (3 to 5 s, in the background of a turn that runs anyway) per mid-run message.
+1. Under `/config`, turn on **Shadow: also ask the model** and leave **Shadow mode** off. The plugin then works normally (queues, plans, approvals, stop) and, for every mid-run message the rules decided by themselves, also asks the classifier in the background and logs both answers side by side. It costs one `claude -p` call per such message, run detached, so your messages are not delayed. Both switches take effect on the next prompt, no restart. If you would rather watch for a week before letting it act, turn **Shadow mode** on as well: then nothing is blocked or dispatched, every message is logged with what the harness would have done, and the comparison runs inline.
 2. Work as usual for a week. Type `later: …`, `stop`, `maybe later …` and `queue: list` when you mean them; nothing happens, but the decision is recorded. In shadow mode `queue: cancel`, `park` and `drop` still act on the tasks it recorded.
 3. Run the report:
 

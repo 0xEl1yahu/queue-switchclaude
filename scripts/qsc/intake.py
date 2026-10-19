@@ -84,7 +84,10 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -377,6 +380,33 @@ def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
         s.state, running_dict, queue, recent, text,
         candidates=match.candidates(text, s.candidates()),
     )
+
+
+COMPARE_SCRIPT = Path(__file__).resolve().parent.parent / "compare.py"
+
+
+def _spawn_compare(s: store.Store, event: dict, v: rules.Verdict, prompt: str, prompt_id: str | None) -> None:
+    """Start ``compare.py`` detached for a rule-decided message; never raises."""
+    try:
+        job = {
+            "payload": _classifier_payload(s, event, v.text),
+            "message": prompt,
+            "rule": v.rule,
+            "rule_label": v.label,
+            "prompt_id": prompt_id,
+        }
+        jobs = paths.data_dir() / "compare"
+        jobs.mkdir(parents=True, exist_ok=True)
+        fd, path = tempfile.mkstemp(prefix="job-", suffix=".json", dir=jobs)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(job, fh)
+        subprocess.Popen(
+            [sys.executable, str(COMPARE_SCRIPT), s.session_id, path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
 
 
 def _timed(classifier: Classifier, payload: dict, swallow: bool = False) -> tuple[classify.Decision | None, int]:
@@ -834,11 +864,17 @@ def _mid_turn(
                 parked = decision.label == "queue" and decision.parked
     else:
         label = v.label
-        if shadow and hookio.shadow_compare():
-            # Shadow comparison: also ask the model about a message the
-            # rules already decided, so the log holds both answers. The
-            # acted label stays the rule's; ``compared`` is never acted on.
-            compared, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text), swallow=True)
+        if hookio.shadow_compare():
+            if shadow:
+                # Shadow comparison: also ask the model about a message the
+                # rules already decided, so the log holds both answers. The
+                # acted label stays the rule's; ``compared`` is never acted on.
+                compared, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text), swallow=True)
+            else:
+                # Active mode: the same comparison, but detached (scripts/
+                # compare.py) so the rule path keeps its speed; the model's
+                # answer arrives later as a ``shadow_compare`` log line.
+                _spawn_compare(s, event, v, prompt, prompt_id)
 
     # Resolve the branch before logging so the log carries the acted label
     # (a split that is really a steer logs as steer) and the amend target.

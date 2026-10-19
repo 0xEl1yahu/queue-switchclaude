@@ -2,6 +2,10 @@
 
 One section per milestone, newest first. Each milestone was accepted live in Claude Code 2.1.302 and the record is linked from its section. Versions are the `version` field of `.claude-plugin/plugin.json`; M2 shipped on the M1 version number.
 
+## 0.4.1 (2026-10-19)
+
+- **Shadow: also ask the model** now works while the plugin is active, not only in shadow mode. For a message the rules decided, intake starts `scripts/compare.py` detached; it asks the classifier and logs the answer as a `shadow_compare` line beside the `intake` line that acted. The rule path keeps its ~90 ms; the comparison costs one background `claude -p` call. `eval/shadow_report.py` counts these lines in "compared" and "disagreements".
+
 ## 0.4.0, M4 daily-use polish (2026-10-19)
 
 - Pass-throughs that tell Claude something the user should also know now carry a one-line `systemMessage` next to the `additionalContext`, so `nothing was queued, running now: …`, `Esc dropped p2, p3`, `p2 is queued again`, `queued p2 after p1: …` (the split case), `running p2`, `revising the plan for p2` and `p2 confirmed done` appear on screen; what Claude reads is unchanged.

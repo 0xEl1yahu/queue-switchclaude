@@ -1133,3 +1133,38 @@ def test_dispatch_lines_logged_from_intake_carry_hook_ms(data_dir):
     rows = [json.loads(line) for line in paths.log_path("s1").read_text().splitlines()]
     from_dispatch = [r for r in rows if r["event"] in ("dispatch", "handoff")]
     assert len(from_dispatch) == 2 and all(r["hook_ms"] >= 50 for r in from_dispatch), from_dispatch
+
+
+# --- 0.4.1: background comparison in active mode ----------------------------
+
+def test_active_compare_spawns_detached_and_keeps_rule_answer(data_dir, monkeypatch):
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", "true")
+    spawned = []
+    monkeypatch.setattr(intake.subprocess, "Popen", lambda cmd, **kw: spawned.append((cmd, kw)))
+    intake.handle(ev("add a user model"))
+    out = intake.handle(ev("later: email verification"), classifier=lambda p: (_ for _ in ()).throw(AssertionError("inline classifier must not run")))
+    assert out["decision"] == "block" and "queued p2" in out["systemMessage"]
+    assert len(spawned) == 1
+    cmd, kw = spawned[0]
+    assert cmd[1].endswith("scripts/compare.py") and cmd[2] == "s1" and kw["start_new_session"] is True
+    job = json.load(open(cmd[3]))
+    assert job["rule"] == "queue_marker" and job["rule_label"] == "queue" and job["payload"]["message"] == "email verification"
+
+
+def test_active_compare_off_spawns_nothing(data_dir, monkeypatch):
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", raising=False)
+    spawned = []
+    monkeypatch.setattr(intake.subprocess, "Popen", lambda cmd, **kw: spawned.append(cmd))
+    intake.handle(ev("add a user model")); intake.handle(ev("later: email verification"))
+    assert spawned == []
+
+
+def test_shadow_compare_still_inline_in_shadow_mode(data_dir, monkeypatch):
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", "true")
+    spawned = []
+    monkeypatch.setattr(intake.subprocess, "Popen", lambda cmd, **kw: spawned.append(cmd))
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("later: email verification"), classifier=lambda p: dec(label="steer"), shadow=True)
+    assert spawned == []
+    row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
+    assert row["rule_label"] == "queue" and row["classifier"]["label"] == "steer"

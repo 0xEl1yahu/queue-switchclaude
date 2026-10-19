@@ -1,6 +1,6 @@
 {
   "name": "queue-switchclaude",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Sorts messages typed mid-run into steer / queue / amend / split, runs queued tasks after the current one with plans and approvals, and stops the turn when you say stop.",
   "author": {
     "name": "0xEl1yahu"
@@ -18,7 +18,7 @@
     "shadow_compare": {
       "type": "boolean",
       "title": "Shadow: also ask the model",
-      "description": "In shadow mode, also run the classifier on messages the rules decided and log both answers",
+      "description": "Also run the classifier on messages the rules decided and log both answers (inline in shadow mode, in the background when active)",
       "default": false
     }
   }

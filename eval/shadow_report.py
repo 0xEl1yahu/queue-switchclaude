@@ -120,7 +120,14 @@ def model_label(row: dict) -> str | None:
     return label
 
 
+def is_compare_row(row: dict) -> bool:
+    """A background comparison (``scripts/compare.py``) logged beside the acting line."""
+    return row.get("event") == "shadow_compare"
+
+
 def is_compared(row: dict) -> bool:
+    if is_compare_row(row):
+        return model_label(row) is not None
     return decided_by(row) == "rule" and model_label(row) is not None
 
 
@@ -288,9 +295,10 @@ def report(all_rows: list[dict], files: int, since_text: str | None, startup: in
     total = len(rows)
     by_rule = sum(1 for r in rows if decided_by(r) == "rule")
     by_model = total - by_rule
-    compared = [r for r in rows if is_compared(r)]
-    disagreements = [r for r in rows if is_disagreement(r)]
-    mean, calls = mean_latency(rows)
+    compare_rows = [r for r in all_rows if is_compare_row(r)]
+    compared = [r for r in rows + compare_rows if is_compared(r)]
+    disagreements = [r for r in rows + compare_rows if is_disagreement(r)]
+    mean, calls = mean_latency(rows + compare_rows)
 
     lines = [
         f"shadow report: {total} intake decision(s) in {files} log file(s){window}",

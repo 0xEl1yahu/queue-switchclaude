@@ -232,3 +232,12 @@ def test_report_startup_line_shape_and_placement(data_dir):
 def test_report_startup_line_on_an_empty_log(data_dir):
     r = run(data_dir)
     assert r.returncode == 0 and "python3 start-up:" in r.stdout
+
+
+def test_report_counts_background_comparisons(data_dir):
+    log.record("s1", "intake", label="queue", rule="queue_marker", rule_label="queue", hook_ms=90)
+    log.record("s1", "shadow_compare", message="later: x", rule="queue_marker", rule_label="queue",
+               classifier={"label": "steer"}, latency_ms=4100)
+    r = subprocess.run([sys.executable, str(ROOT / "eval" / "shadow_report.py")], capture_output=True, text=True,
+                       env={**os.environ, "CLAUDE_PLUGIN_DATA": str(data_dir)})
+    assert "1 intake decision" in r.stdout and "disagreements: 1 of 1 compared" in r.stdout and "4100 ms" in r.stdout
