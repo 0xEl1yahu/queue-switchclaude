@@ -18,6 +18,18 @@ older than ``keep_days``. Three guards (plan review focus 4):
   and a pointer file that still names a deleted session is dropped with it,
   so the CLI never resolves to a session that no longer exists.
 
+Stale pointers (M4 Task 3): intake writes a per-directory pointer under
+``pointers/`` on every event, before it knows whether the message needs a
+store, so a session whose only message was a pass-through leaves a pointer
+and nothing else, and a data dir wiped by hand leaves pointers naming
+sessions that no longer exist. ``collect`` also removes every file under
+``pointers/`` that names a session with no store, log, lock or directory,
+except one naming a session in ``protect``: the running session may well
+have written its pointer and nothing else yet (M4 review focus 3). The
+global ``last_session`` pointer is only dropped when it names a deleted
+session, as before. ``collect`` returns ``(deleted_sessions,
+deleted_pointers)``, both sorted.
+
 The global constraint that one session's hooks never touch another
 session's files holds for live sessions: what ``collect`` removes has not
 been written for ``keep_days``, long after any hook of that session could
@@ -123,33 +135,69 @@ def _delete(session_id: str) -> bool:
     return ok
 
 
-def _drop_pointers(deleted: set[str]) -> None:
-    """Remove pointer files that still name a deleted session."""
-    candidates = [paths.pointer_path()]
-    with contextlib.suppress(OSError):
-        candidates.extend(p for p in paths.pointers_dir().iterdir() if p.is_file())
-    for pointer in candidates:
+def _drop_global_pointer(deleted: set[str]) -> None:
+    """Remove ``last_session`` when it still names a deleted session."""
+    pointer = paths.pointer_path()
+    try:
+        named = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if named and paths.safe_id(named) in deleted:
+        with contextlib.suppress(OSError):
+            pointer.unlink()
+
+
+def _drop_stale_pointers(protected: set[str]) -> list[str]:
+    """Remove every file under ``pointers/`` that names no session on disk;
+    return the names removed, sorted.
+
+    A pointer is stale when it is empty or names a session with no store,
+    log, lock or directory (``_session_ids`` after this run's deletions, so
+    the pointers of just-deleted sessions go too). A session in
+    ``protected`` keeps its pointer whatever is on disk: the running
+    session's first message may have been a pass-through, which writes the
+    pointer and nothing else (M4 review focus 3). Hidden names and the temp
+    files of an atomic write in progress are skipped, as is anything that
+    is not a plain file.
+    """
+    live = _session_ids() | protected
+    removed: list[str] = []
+    try:
+        entries = list(paths.pointers_dir().iterdir())
+    except OSError:
+        return removed
+    for pointer in entries:
+        name = pointer.name
+        if name.startswith(".") or _TMP_MARK in name or not pointer.is_file():
+            continue
         try:
             named = pointer.read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        if named and paths.safe_id(named) in deleted:
-            with contextlib.suppress(OSError):
-                pointer.unlink()
+        if named and paths.safe_id(named) in live:
+            continue
+        try:
+            pointer.unlink()
+        except OSError:
+            continue
+        removed.append(name)
+    return sorted(removed)
 
 
 def collect(
     keep_days: int = KEEP_DAYS,
     now: float | None = None,
     protect: set[str] = frozenset(),
-) -> list[str]:
-    """Delete every session untouched for more than ``keep_days``; return
-    the deleted ids, sorted.
+) -> tuple[list[str], list[str]]:
+    """Delete every session untouched for more than ``keep_days`` and every
+    stale pointer; return ``(deleted_sessions, deleted_pointers)``, the
+    session ids and the ``pointers/`` file names removed, each sorted.
 
     ``now`` is an epoch timestamp (``time.time()`` by default). ``protect``
     holds session ids (as the hooks see them, before ``paths.safe_id``) that
-    are never deleted. A session is deleted only when its newest file is
-    strictly older than the window; anything at or inside it stays.
+    are never deleted and whose pointers are never dropped. A session is
+    deleted only when its newest file is strictly older than the window;
+    anything at or inside it stays.
     """
     if now is None:
         now = time.time()
@@ -168,5 +216,6 @@ def collect(
         if _delete(sid):
             deleted.append(sid)
     if deleted:
-        _drop_pointers(set(deleted))
-    return deleted
+        _drop_global_pointer(set(deleted))
+    pointers = _drop_stale_pointers(protected)
+    return deleted, pointers

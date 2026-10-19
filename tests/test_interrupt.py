@@ -23,8 +23,8 @@ def test_interrupt_no_flag_passes(data_dir):
 def test_interrupt_logs_event(data_dir):
     with store.locked("s1") as s:
         t = s.new_task("x", [], "pid"); t.status = "running"; s.running_task = "p1"; s.state = "running"; s.interrupt = True
-    interrupt.handle({"hook_event_name": "PostToolUse", "session_id": "s1"})
-    rows = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()]
+    interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1"})
+    rows =[json.loads(l) for l in paths.log_path("s1").read_text().splitlines()]
     assert rows[-1]["event"] == "interrupt" and rows[-1]["task"] == "p1"
 
 
@@ -57,7 +57,7 @@ def test_script_ignores_other_events(data_dir):
 def test_script_emits_stop_on_flag(data_dir):
     with store.locked("s1") as s:
         s.interrupt = True
-    r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps({"hook_event_name": "PostToolUse", "session_id": "s1"}), capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps({"hook_event_name": "PreToolUse", "session_id": "s1"}), capture_output=True, text=True)
     assert r.returncode == 0 and json.loads(r.stdout)["continue"] is False
 
 
@@ -100,3 +100,34 @@ def test_interrupt_still_stops_other_tools_with_tool_name(data_dir):
         s.interrupt = True
     out = interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1", "tool_name": "Bash"})
     assert out["continue"] is False and store.load("s1").interrupt is False
+
+
+# --- M4 Task 3: PreToolUse only -----------------------------------------------
+
+def test_interrupt_ignores_post_tool_use_now(data_dir):
+    with store.locked("s1") as s: s.interrupt = True
+    r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps({"hook_event_name": "PostToolUse", "session_id": "s1"}), capture_output=True, text=True)
+    assert r.stdout == "" and store.load("s1").interrupt is True
+
+
+# Additional tests beyond the plan's one.
+
+def test_handle_returns_none_for_post_tool_use_without_touching_the_store(data_dir, monkeypatch):
+    with store.locked("s1") as s:
+        t = s.new_task("x", [], "pid"); t.status = "running"; s.running_task = "p1"; s.state = "running"; s.interrupt = True
+    def boom(*a, **k):
+        raise AssertionError("store read")
+    original_load = store.load
+    monkeypatch.setattr(store, "load", boom)
+    assert interrupt.handle({"hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Bash"}) is None
+    monkeypatch.setattr(store, "load", original_load)
+    s = store.load("s1"); assert s.interrupt is True and s.get("p1").status == "running"
+    assert not paths.log_path("s1").exists()
+
+
+def test_handle_requires_the_pre_tool_use_name(data_dir):
+    with store.locked("s1") as s: s.interrupt = True
+    assert interrupt.handle({"session_id": "s1"}) is None
+    assert interrupt.handle({"hook_event_name": "Stop", "session_id": "s1"}) is None
+    assert store.load("s1").interrupt is True
+    assert interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1"})["continue"] is False
