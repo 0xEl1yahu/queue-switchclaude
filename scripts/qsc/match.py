@@ -21,7 +21,11 @@ and intake falls through to the model, and from there to ``steer``.
                 the message side is expected to carry unmatched words and
                 only the task side is scored. Coverage ``c`` is Dice-smoothed
                 to ``2c / (1 + c)``: naming one word of a two-word subject
-                scores 0.67, one word of a three-word subject 0.5.
+                scores 0.67, one word of a three-word subject 0.5. Inside
+                ``rank`` a subject word shared by ``n`` candidates weighs
+                ``1/n``, so "add rate limiting to login" (g15) does not
+                resolve to "Write tests for /login" on the strength of a
+                word the running "/login endpoint" task carries too.
 
 The plan's bare ``max(ratio, jaccard)`` scores g23 at 0.46 and g14 at 0.39,
 below the 0.6 accept it also fixes; the subject view is what lets those two
@@ -66,28 +70,59 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(union) if union else 0.0
 
 
-def _subject(message_tokens: set[str], task_tokens: set[str]) -> float:
-    subject = task_tokens - GENERIC_WORDS
+def _subject_words(task_tokens: set[str]) -> set[str]:
+    return task_tokens - GENERIC_WORDS
+
+
+def _document_frequency(task_texts: list[str]) -> dict[str, int]:
+    """How many of the candidate tasks carry each subject word."""
+    df: dict[str, int] = {}
+    for text in task_texts:
+        for word in _subject_words(tokens(text)):
+            df[word] = df.get(word, 0) + 1
+    return df
+
+
+def _subject(
+    message_tokens: set[str],
+    task_tokens: set[str],
+    df: dict[str, int] | None = None,
+) -> float:
+    """Weighted share of the task's subject that the message mentions.
+
+    A subject word shared by ``n`` candidate tasks weighs ``1/n``: "login" in
+    both "Add a /login endpoint" and "Write tests for /login" cannot say which
+    of the two a message is about, while "tests" can. Without ``df`` (a
+    single pair, no candidate list) every word weighs 1.
+    """
+    subject = _subject_words(task_tokens)
     if not subject:
         return 0.0
-    coverage = len(subject & message_tokens) / len(subject)
+    weights = {w: 1.0 / max(1, (df or {}).get(w, 1)) for w in subject}
+    coverage = sum(weights[w] for w in subject & message_tokens) / sum(weights.values())
     return 2 * coverage / (1 + coverage)
 
 
-def score(message: str, task_text: str) -> float:
-    """Similarity of ``message`` to one task text, in [0, 1]; 0.0 when either is empty."""
+def score(message: str, task_text: str, df: dict[str, int] | None = None) -> float:
+    """Similarity of ``message`` to one task text, in [0, 1]; 0.0 when either is empty.
+
+    ``df`` is the subject-word document frequency over the whole candidate
+    list (``rank`` supplies it) so that words common to several candidates
+    count less in the subject view.
+    """
     a, b = store.normalise(message), store.normalise(task_text)
     if not a or not b:
         return 0.0
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
     ta, tb = tokens(a), tokens(b)
-    best = max(ratio, _jaccard(ta, tb), _subject(ta, tb))
+    best = max(ratio, _jaccard(ta, tb), _subject(ta, tb, df))
     return min(1.0, max(0.0, best))
 
 
 def rank(message: str, tasks: list[store.Task]) -> list[tuple[store.Task, float]]:
     """Every task paired with its score, best first; ties keep creation order."""
-    scored = [(t, score(message, t.text)) for t in tasks]
+    df = _document_frequency([t.text for t in tasks])
+    scored = [(t, score(message, t.text, df)) for t in tasks]
     scored.sort(key=lambda pair: pair[1], reverse=True)   # sort is stable
     return scored
 

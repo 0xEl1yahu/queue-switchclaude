@@ -96,3 +96,57 @@ def test_candidates_limit_order_and_rounding():
 def test_non_string_message_fails_open():
     ts = tasks("Add a Stripe webhook handler")
     assert match.pick(None, ts) is None and match.candidates(None, ts)[0]["id"] == "p1"
+
+
+# Task 9: the golden set as regression material for target matching.
+
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+GOLDEN = [json.loads(l) for l in open(ROOT / "eval" / "golden_queue_intake.jsonl") if l.strip()]
+LIVE = ("pending", "queued", "parked", "paused", "running")
+
+
+def live_tasks(row):
+    """The case's amend candidates as store.Task objects: the running task and the live queue."""
+    s = store.Store("g")
+    out = []
+    if row["current_task"]:
+        t = s.new_task(row["current_task"]["intent"], [], None); t.id = row["current_task"]["id"]; t.status = "running"; out.append(t)
+    for q in row["queue"]:
+        if q["status"] in LIVE:
+            t = s.new_task(q["intent"], list(q["depends_on"]), None); t.id = q["id"]; out.append(t)
+    return out
+
+
+def test_pick_discounts_subject_words_shared_by_candidates():
+    # g15 context: "login" names the running endpoint and the queued tests alike, so it must not
+    # resolve to the tests; a word only the tests carry ("tests", g14) still does.
+    ts = tasks("Add a /login endpoint that returns a JWT", "Write tests for /login")
+    assert match.pick("add rate limiting to login", ts) is None
+    assert match.pick("for the tests, include a rate-limit case", ts).id == "p2"
+    # Alone, with no competing candidate, the shared word keeps its full weight.
+    assert match.score("add rate limiting to login", "Write tests for /login") > match.rank("add rate limiting to login", ts)[0][1]
+
+
+def test_golden_amend_targets_resolve_or_abstain():
+    # For every golden amend case, pick returns the expected target or nothing, never another task.
+    amends = [r for r in GOLDEN if r["expected"]["label"] == "amend"]
+    assert len(amends) == 4
+    for r in amends:
+        picked = match.pick(r["message"], live_tasks(r))
+        assert picked is None or picked.id == r["expected"]["target"], r["id"]
+    # The two subject-named cases resolve without the model.
+    by_id = {r["id"]: r for r in GOLDEN}
+    assert match.pick(by_id["g14"]["message"], live_tasks(by_id["g14"])).id == "p3"
+    assert match.pick(by_id["g23"]["message"], live_tasks(by_id["g23"])).id == "p2"
+
+
+def test_golden_steer_cases_never_pick_a_queued_task():
+    # A steer about the running work must not be mistaken for an amend of something queued.
+    for r in GOLDEN:
+        if r["expected"]["label"] != "steer" or not r["current_task"]:
+            continue
+        picked = match.pick(r["message"], live_tasks(r))
+        assert picked is None or picked.id == r["current_task"]["id"], (r["id"], picked and picked.id)

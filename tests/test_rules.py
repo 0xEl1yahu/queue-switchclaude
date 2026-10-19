@@ -112,3 +112,39 @@ def test_numbered_split_needs_two_items_and_stays_under_paste_guard():
 def test_interrupt_and_markers_beat_numbered_split():
     assert rules.decide("later: 1) login 2) logout").rule == "queue_marker"
     assert rules.decide("someday: 1) login 2) logout").rule == "parked_marker"
+
+
+# Task 9: the rules must never contradict the golden set.
+
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+GOLDEN = [json.loads(l) for l in open(ROOT / "eval" / "golden_queue_intake.jsonl") if l.strip()]
+
+
+def test_golden_rule_decisions_agree_with_expected():
+    decided = {}
+    for r in GOLDEN:
+        v = rules.decide(r["message"])
+        if v.label == "undecided":
+            continue
+        decided[r["id"]] = v
+        accepted = [r["expected"], *r.get("also_acceptable", [])]
+        if v.label == "queue":
+            assert any(e["label"] == "queue" and bool(e.get("parked")) == v.parked for e in accepted), (r["id"], v)
+        elif v.label == "interrupt":
+            # g03's expected object carries no flag (docs/m1-eval.md, disputed cases); the label still agrees.
+            assert r["expected"]["label"] == "steer", r["id"]
+        else:
+            raise AssertionError((r["id"], v))
+    assert set(decided) == {"g03", "g05", "g06", "g29", "g30", "g33", "g35"}
+    assert decided["g33"].parked and decided["g33"].text == "we can add social login"
+
+
+def test_golden_undecided_cases_keep_their_text():
+    # The classifier sees the message unchanged whenever no marker fired.
+    for r in GOLDEN:
+        v = rules.decide(r["message"])
+        if v.rule in (None, "numbered_split", "paste_guard"):
+            assert v.text == r["message"], r["id"]
