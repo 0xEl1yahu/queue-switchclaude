@@ -37,10 +37,23 @@ from typing import Optional
 
 LABELS = ("steer", "queue", "interrupt", "control", "pass", "undecided")
 
+# Text Claude Code itself feeds through UserPromptSubmit: a message is
+# harness traffic when it starts with ``<`` (system reminders, task
+# notifications, command wrappers) or carries one of these phrases in its
+# first HARNESS_HEAD characters. Such a message never becomes a task, a
+# dedupe hit or a control command, in any state (M3, review focus 3).
 HARNESS_PHRASES = (
     "Another Claude session sent a message",
     "[Subagent hand-back]",
+    "[Request interrupted by user",
+    "<task-notification>",
+    "<side-sessions-event>",
+    "<ci-monitor-event>",
+    "<command-message>",
+    "<command-name>",
+    "Base directory for this skill:",
 )
+HARNESS_HEAD = 200
 
 NON_TASK_WORDS = frozenset({"ok", "okay", "yes", "y", "continue", "go", "."})
 
@@ -143,7 +156,8 @@ def _normalise(message: str) -> str:
 def _is_harness_traffic(message: str) -> bool:
     if message.lstrip().startswith("<"):
         return True
-    return any(phrase in message for phrase in HARNESS_PHRASES)
+    head = message[:HARNESS_HEAD]
+    return any(phrase in head for phrase in HARNESS_PHRASES)
 
 
 def _control_command(message: str) -> Optional[str]:

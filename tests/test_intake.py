@@ -697,6 +697,28 @@ def test_control_show_names_the_plan_file(data_dir):
     assert str(paths.plan_path("s1", "p2")) in out["systemMessage"] and store.load("s1").state == "awaiting_approval"
 
 
+# --- M3 Task 4: harness traffic never touches a waiting store ----------------
+
+def test_harness_traffic_passes_even_while_waiting(data_dir):
+    waiting()
+    assert intake.handle(ev("<task-notification>x", prompt_id="pid-2")) is None
+    assert store.load("s1").state == "awaiting_approval"                                        # review focus 3
+
+
+def test_harness_traffic_passes_in_every_state_without_a_task(data_dir):
+    # Idle: no store is created. Running: no task, no dedupe, same turn. Waiting for an answer: still waiting.
+    assert intake.handle(ev("[Request interrupted by user for tool use]")) is None
+    assert not paths.store_path("s1").exists()
+    intake.handle(ev("add a user model"))
+    assert intake.handle(ev("Base directory for this skill: /x\n\n# Skill", prompt_id="pid-2")) is None
+    assert intake.handle(ev("<command-message>queue: list</command-message>", prompt_id="pid-3")) is None
+    s = store.load("s1"); assert s.next_id == 2 and s.state == "running" and s.current_prompt_id == "pid-1"
+    waiting("awaiting_answer")
+    with store.locked("s1") as s: s.get("p2").status = "running"
+    assert intake.handle(ev("<task-notification>\n<task-id>t</task-id>", prompt_id="pid-4")) is None
+    s = store.load("s1"); assert s.state == "awaiting_answer" and s.pending_task == "p2" and s.next_id == 3
+
+
 def test_control_list_marks_awaiting_approval(data_dir):
     waiting()
     assert "p2 planned (awaiting approval)" in intake.handle(ev("queue: list", prompt_id="pid-2"))["systemMessage"]

@@ -1,16 +1,28 @@
-"""Interrupt check for PreToolUse / PostToolUse. Stdlib only.
+"""Interrupt check at the tool boundary. Stdlib only.
 
 Intake sets ``Store.interrupt`` when the user says "stop" mid-turn. The
 next tool boundary is the first place the turn can be ended, so this
 handler runs on every tool call: when the flag is set it clears it, marks
 the running task ``interrupted`` and ends the turn with ``continue: false``.
 The Stop hook does not fire after that.
+
+Registered on ``PreToolUse`` only (M3, decision D6): a ``PostToolUse``
+boundary is always followed by the next ``PreToolUse`` or by ``Stop``, and
+dispatch honours the flag there, so one launch per tool call loses
+nothing. ``handle`` still accepts a ``PostToolUse`` event for callers that
+send one. An ``AskUserQuestion`` call is skipped without reading the store:
+that turn is already waiting on the user.
 """
 from __future__ import annotations
 
 from . import log, store
 
 STOP_REASON = "queue-switchclaude: stopped as requested"
+
+# Tools whose call means the turn is already handing control to the user;
+# ending it there would only swallow the question. The flag stays set for
+# the next real tool call or for dispatch at Stop.
+SKIP_TOOLS = frozenset({"AskUserQuestion"})
 
 
 def reset_after_interrupt(s: store.Store) -> tuple[str | None, list[store.Task]]:
@@ -47,6 +59,8 @@ def handle(event: dict) -> dict | None:
     """Return ``{"continue": False, ...}`` when the interrupt flag is set, else None."""
     session_id = event.get("session_id")
     if not isinstance(session_id, str) or not session_id:
+        return None
+    if event.get("tool_name") in SKIP_TOOLS:
         return None
     # Cheap unlocked peek first: this runs on every tool call and the flag
     # is almost always clear, so do not take the lock or touch the file.
