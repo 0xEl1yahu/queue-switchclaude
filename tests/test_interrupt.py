@@ -77,3 +77,26 @@ def test_interrupt_clears_pending_task_and_drops_planned(data_dir):
     out = interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1"})
     assert out["continue"] is False and "p2" in out["stopReason"]
     s = store.load("s1"); assert s.pending_task is None and s.get("p2").status == "dropped" and s.state == "idle"
+
+
+# --- M3 Task 4: the hook's cost ----------------------------------------------
+
+def test_interrupt_skips_ask_user_question(data_dir):
+    with store.locked("s1") as s:
+        s.interrupt = True
+    assert interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1", "tool_name": "AskUserQuestion"}) is None
+    assert store.load("s1").interrupt is True
+
+
+def test_interrupt_skips_ask_user_question_without_reading_the_store(data_dir, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("store read")
+    monkeypatch.setattr(store, "load", boom)
+    assert interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1", "tool_name": "AskUserQuestion"}) is None
+
+
+def test_interrupt_still_stops_other_tools_with_tool_name(data_dir):
+    with store.locked("s1") as s:
+        s.interrupt = True
+    out = interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1", "tool_name": "Bash"})
+    assert out["continue"] is False and store.load("s1").interrupt is False

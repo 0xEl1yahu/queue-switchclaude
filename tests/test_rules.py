@@ -196,3 +196,45 @@ def test_approval_words_are_a_frozenset_including_the_non_task_words():
 def test_bare_control_words_include_m2_commands():
     assert rules.decide("queue approve").control == "approve"
     assert rules.decide("queue show p2").control == "show p2"
+
+
+# --- M3 Task 4: more harness traffic -----------------------------------------
+
+@pytest.mark.parametrize("msg", [
+    "[Request interrupted by user for tool use]",
+    "<task-notification>\n<task-id>x</task-id>",
+    "Base directory for this skill: /x/y\n\n# Brainstorming",
+    "<command-message>foo</command-message>\n<command-name>foo</command-name>",
+])
+def test_more_harness_traffic_passes(msg):
+    assert rules.decide(msg).rule == "harness_traffic"
+
+
+@pytest.mark.parametrize("msg", [
+    "[Request interrupted by user]",
+    "  <side-sessions-event>x</side-sessions-event>",
+    "<ci-monitor-event>run 12 failed</ci-monitor-event>",
+    "Another Claude session sent a message: hi",
+    "[Subagent hand-back] all done",
+])
+def test_every_harness_phrase_passes(msg):
+    v = rules.decide(msg)
+    assert (v.label, v.rule) == ("pass", "harness_traffic")
+
+
+def test_harness_phrases_table_has_the_new_entries():
+    for phrase in ("[Request interrupted by user", "<task-notification>", "<side-sessions-event>",
+                   "<ci-monitor-event>", "<command-message>", "<command-name>", "Base directory for this skill:"):
+        assert phrase in rules.HARNESS_PHRASES
+
+
+def test_harness_phrase_only_counts_in_the_first_200_characters():
+    filler = "write a note that says " + "x" * 200
+    assert rules.decide(filler + " [Request interrupted by user]").rule != "harness_traffic"
+    assert rules.decide("[Request interrupted by user] " + filler).rule == "harness_traffic"
+
+
+def test_harness_traffic_beats_control_and_markers():
+    assert rules.decide("<command-message>queue: list</command-message>").rule == "harness_traffic"
+    assert rules.decide("[Request interrupted by user] later: add logout").rule == "harness_traffic"
+    assert rules.decide("<task-notification>stop</task-notification>").rule == "harness_traffic"
