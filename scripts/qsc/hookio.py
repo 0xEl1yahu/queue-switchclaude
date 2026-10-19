@@ -61,3 +61,13 @@ def shadow() -> bool:
     """True when the plugin's `shadow` user setting is on."""
     value = os.environ.get("CLAUDE_PLUGIN_OPTION_SHADOW", "")
     return value.strip().lower() in _TRUTHY
+
+
+def shadow_compare() -> bool:
+    """True when the plugin's `shadow_compare` user setting is on.
+
+    In shadow mode this makes intake also ask the model about messages the
+    rules already decided, so the log holds both answers (M1 Task 10).
+    """
+    value = os.environ.get("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", "")
+    return value.strip().lower() in _TRUTHY

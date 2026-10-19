@@ -27,6 +27,11 @@ was interrupted by Esc (D5): the running task is marked ``interrupted``,
 queued tasks are ``dropped``, and a notice listing them is attached to the
 new prompt.
 
+In shadow mode with the ``shadow_compare`` option on, a message the rules
+decided is also sent to the classifier; the log then carries ``rule_label``
+and ``classifier`` side by side, and the acted label stays the rule's. Every
+decision line also logs ``latency_ms``, the wall-clock of the classifier call.
+
 Every branch fails open: anything unresolved is ``steer`` and the message
 passes through untouched. The return value is the hook's JSON output, or
 ``None`` for pass-through.
@@ -37,9 +42,10 @@ import contextlib
 import dataclasses
 import os
 import tempfile
+import time
 from typing import Callable, Optional
 
-from . import classify, control, log, match, paths, rules, store, transcript
+from . import classify, control, hookio, log, match, paths, rules, store, transcript
 
 HOOK_EVENT = "UserPromptSubmit"
 PREFIX = "queue-switchclaude"
@@ -169,6 +175,22 @@ def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
         s.state, running_dict, queue, recent, text,
         candidates=match.candidates(text, s.candidates()),
     )
+
+
+def _timed(classifier: Classifier, payload: dict, swallow: bool = False) -> tuple[classify.Decision | None, int]:
+    """Call the classifier and measure it: ``(decision, wall-clock ms)``.
+
+    With ``swallow`` an exception from the classifier counts as no answer, for
+    the shadow comparison, which must never change what intake does.
+    """
+    started = time.monotonic()
+    try:
+        decision = classifier(payload)
+    except Exception:
+        if not swallow:
+            raise
+        decision = None
+    return decision, int(round((time.monotonic() - started) * 1000))
 
 
 def _chain_deps(s: store.Store) -> list[str]:
@@ -381,9 +403,11 @@ def _mid_turn(
 ) -> dict | None:
     session_id = s.session_id
     decision: classify.Decision | None = None
+    compared: classify.Decision | None = None
+    latency_ms: int | None = None
     parked = v.parked
     if v.label == "undecided":
-        decision = classifier(_classifier_payload(s, event, v.text))
+        decision, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text))
         label = "steer"
         if decision is not None and _confident(decision):
             if decision.label == "steer" and decision.interrupt:
@@ -393,6 +417,11 @@ def _mid_turn(
                 parked = decision.label == "queue" and decision.parked
     else:
         label = v.label
+        if shadow and hookio.shadow_compare():
+            # Shadow comparison: also ask the model about a message the
+            # rules already decided, so the log holds both answers. The
+            # acted label stays the rule's; ``compared`` is never acted on.
+            compared, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text), swallow=True)
 
     # Resolve the branch before logging so the log carries the acted label
     # (a split that is really a steer logs as steer) and the amend target.
@@ -422,12 +451,15 @@ def _mid_turn(
         assert decision is not None
         output, label, target_id = _split(s, decision, prompt_id, shadow)
 
+    logged = decision if decision is not None else compared
     log.record(
         session_id, "intake",
         message=prompt,
         rule=v.rule,
-        classifier=dataclasses.asdict(decision) if decision is not None else None,
+        rule_label=v.label,
+        classifier=dataclasses.asdict(logged) if logged is not None else None,
         label=label,
+        latency_ms=latency_ms,
         target=target_id,
         parts=_parts_for_log(decision),
         parked=parked if label == "queue" else False,
