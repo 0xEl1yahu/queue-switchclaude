@@ -191,3 +191,8 @@ def test_is_confirmation(msg, expected):
 def test_approval_words_are_a_frozenset_including_the_non_task_words():
     assert isinstance(rules.APPROVE_WORDS, frozenset)
     assert {"ok", "okay", "yes", "y", "go"} <= rules.APPROVE_WORDS
+
+
+def test_bare_control_words_include_m2_commands():
+    assert rules.decide("queue approve").control == "approve"
+    assert rules.decide("queue show p2").control == "show p2"

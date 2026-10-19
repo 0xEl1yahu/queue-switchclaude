@@ -68,3 +68,12 @@ def test_interrupt_drops_queued_tasks_and_says_so(data_dir):
     out = interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1"})
     assert out["continue"] is False and "dropped queued tasks: p2 (write tests)" in out["stopReason"]
     s = store.load("s1"); assert s.get("p2").status == "dropped" and s.ready() == []
+
+
+def test_interrupt_clears_pending_task_and_drops_planned(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; s.running_task = "p1"; s.state = "running"; s.interrupt = True
+        b = s.new_task("b", ["p1"], "pid"); b.status = "planned"; s.pending_task = "p2"
+    out = interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1"})
+    assert out["continue"] is False and "p2" in out["stopReason"]
+    s = store.load("s1"); assert s.pending_task is None and s.get("p2").status == "dropped" and s.state == "idle"

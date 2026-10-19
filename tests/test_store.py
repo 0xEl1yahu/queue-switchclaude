@@ -368,3 +368,8 @@ def test_ready_excludes_planned_and_failed_verify(data_dir):
     b = s.new_task("b", [], None); b.status = "failed_verify"
     s.new_task("c", [], None)
     assert [t.id for t in s.ready()] == ["p3"]
+
+
+def test_task_kind_defaults_and_survives_roundtrip(data_dir):
+    s = store.load("s1"); s.new_task("typed", [], None, kind="prompt"); s.new_task("queued", [], None); store.save(s)
+    s = store.load("s1"); assert s.get("p1").kind == "prompt" and s.get("p2").kind == "task" and s.continuations == 0

@@ -26,12 +26,13 @@ def reset_after_interrupt(s: store.Store) -> tuple[str | None, list[store.Task]]
     task = s.get(task_id) if task_id else None
     if task is not None:
         task.status = "interrupted"
-    dropped = [t for t in s.tasks if t.status == "queued"]
+    dropped = [t for t in s.tasks if t.status in ("queued", "planned")]
     for t in dropped:
         t.status = "dropped"
     s.interrupt = False
     s.state = "idle"
     s.running_task = None
+    s.pending_task = None  # a task being planned or awaiting approval is dropped above
     return task_id, dropped
 
 

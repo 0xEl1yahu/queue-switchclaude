@@ -87,3 +87,18 @@ def test_queue_cli_bad_pointer_is_no_session(data_dir):
     paths.pointer_path().write_text("   \n")
     r = run_cli(data_dir, "list")
     assert r.returncode == 0 and r.stdout.strip() == "no session found"
+
+
+def test_queue_cli_approve_prints_execution_handover(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        b = s.new_task("add login", ["p1"], "pid-1"); b.status = "planned"; s.get("p1").status = "done"
+        s.state = "awaiting_approval"; s.pending_task = "p2"; s.running_task = None
+    r = run_cli(data_dir, "approve")
+    assert r.returncode == 0 and "approved p2" in r.stdout and "Execute the plan at" in r.stdout
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p2"
+
+
+def test_command_file_tells_claude_to_follow_an_execution_line():
+    text = (Path(__file__).resolve().parent.parent / "commands" / "queue.md").read_text()
+    assert "queue-switchclaude: task" in text and "approve" in text

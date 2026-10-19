@@ -43,6 +43,9 @@ _SATISFIED = ("done", SHADOW_DISPATCHED)
 # without a plan file before the task returns to the queue. Well under the
 # Stop-hook continuation cap of 8.
 MAX_ATTEMPTS = 2
+# Consecutive Stop-hook continuations the harness may issue before it stops
+# driving the chain and waits for the user (Claude Code's own cap is 8).
+MAX_CONTINUATIONS = 6
 
 # How much of the plan file the judge sees.
 PLAN_EXCERPT_CHARS = 1500
@@ -53,9 +56,26 @@ _WAITING = ("awaiting_approval", "awaiting_answer")
 # --- envelopes and handover texts --------------------------------------------
 
 
-def handback(text: str) -> dict:
-    """The Stop output that keeps the turn alive with ``text`` as context."""
-    return {"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": text}}
+def handback(text: str, system_message: str | None = None) -> dict:
+    """The Stop output that keeps the turn alive with ``text`` as context.
+
+    ``system_message`` is shown to the user (the universal hook field).
+    """
+    out: dict = {"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": text}}
+    if system_message:
+        out["systemMessage"] = system_message
+    return out
+
+
+def _failed_verify_message(task: store.Task) -> str:
+    return (
+        f"{PREFIX}: {task.id} failed its verify command {MAX_ATTEMPTS} times and is set aside as "
+        f"failed_verify (send 'queue: promote {task.id}' to retry it, 'queue: cancel {task.id}' to drop it)"
+    )
+
+
+def _budget_message(n: int) -> str:
+    return f"{PREFIX}: paused the automatic chain after {n} continuations; send any message to carry on"
 
 
 def _notes(task: store.Task) -> str:
@@ -182,7 +202,13 @@ def write_handoff(
 # --- stage A: close the running task ----------------------------------------
 
 
-def _close_running(s: store.Store, event: dict, shadow: bool, claude: str) -> tuple[dict | None, bool]:
+def _close_running(
+    s: store.Store,
+    event: dict,
+    shadow: bool,
+    claude: str,
+    verdict: done.Verdict | None = None,
+) -> tuple[dict | None, bool]:
     """Decide the running task's fate. Returns ``(output, proceed)``.
 
     ``proceed`` is True when the running slot is free and ``choose_next``
@@ -201,7 +227,8 @@ def _close_running(s: store.Store, event: dict, shadow: bool, claude: str) -> tu
 
     closing = event.get("last_assistant_message")
     closing = closing if isinstance(closing, str) else ""
-    verdict = done.decide(running, event, _plan_excerpt(s, running), claude=claude)
+    if verdict is None:
+        verdict = _verdict_for(s, running, event, claude)
 
     if shadow:
         # Observe only: the verdict is filed and logged, never acted on
@@ -230,16 +257,52 @@ def _close_running(s: store.Store, event: dict, shadow: bool, claude: str) -> tu
                    reason=verdict.reason, next=None, waiting="awaiting_answer")
         return None, False
 
-    if verdict.verdict in ("verify_failed", "not_done"):
+    if verdict.verdict == "verify_failed":
+        # The verify command never passed: the task is set aside, not done,
+        # so nothing that depends on it becomes ready (plan review focus 3).
+        running.status = "failed_verify"
+        running.verdict = "verify_failed"
+        running.closing = closing
+        s.running_task = None
+        s.state = "idle"
+        log.record(sid, "dispatch", task=running.id, verdict="verify_failed", reason=verdict.reason,
+                   failed_verify=True, next=None)
+        return {"systemMessage": _failed_verify_message(running)}, True
+    if verdict.verdict == "not_done":
         # Attempts exhausted: close it rather than nag, and say so in the log
         # and the handoff.
         verdict = done.Verdict(
             "gave_up",
-            f"gave up after {running.attempts} handbacks; last {verdict.verdict}: {verdict.reason}",
+            f"gave up after {running.attempts} handbacks; last not_done: {verdict.reason}",
             verdict.output_tail,
         )
     write_handoff(s, running, verdict, closing)
     return None, True
+
+
+def _verdict_for(s: store.Store, task: store.Task, event: dict, claude: str) -> done.Verdict:
+    """The verdict for ``task``: its verify command, the judge for harness
+    tasks, and ``stopped`` for a turn the user typed (no model call)."""
+    if task.verify or task.kind != "prompt":
+        return done.decide(task, event, _plan_excerpt(s, task), claude=claude)
+    return done.Verdict("stopped", "prompt turn ended")
+
+
+def _precompute_verdict(session_id: str, event: dict, claude: str) -> tuple[str | None, str | None, done.Verdict | None]:
+    """Decide the running task's fate before taking the store lock.
+
+    A verify command can run for 120 s and the judge for 15 s; holding the
+    lock that long makes intake wait and lets a mid-run message through
+    unsorted. Returns ``(task id, verify command, verdict)`` so the locked
+    stage can check the store did not change underneath.
+    """
+    s = store.load(session_id)
+    if s.interrupt or s.state != "running" or not s.running_task:
+        return None, None, None
+    task = s.get(s.running_task)
+    if task is None or task.status == "paused":
+        return None, None, None
+    return task.id, task.verify, _verdict_for(s, task, event, claude)
 
 
 # --- stage B: after a planning turn -----------------------------------------
@@ -268,6 +331,11 @@ def _after_planning(s: store.Store) -> tuple[dict | None, bool]:
         task.status = "planned"
         task.plan_based_on = s.done_ids()
         task.attempts = 0
+        if task.auto and s.continuations >= MAX_CONTINUATIONS:
+            s.state = "awaiting_approval"
+            log.record(sid, "dispatch", planned=task.id, auto=True, next=None,
+                       continuation_budget=s.continuations)
+            return {"systemMessage": _budget_message(s.continuations)}, False
         if task.auto:
             # Review focus 5: no approval stop; plan and execution in one
             # continuation.
@@ -399,6 +467,9 @@ def choose_next(s: store.Store, stop_hook_active: bool = False, shadow: bool = F
     if stop_hook_active and s.last_dispatched == nxt.id:
         log.record(sid, "dispatch", next=nxt.id, shadow=shadow, spin_guard=True)
         return None
+    if s.continuations >= MAX_CONTINUATIONS:
+        log.record(sid, "dispatch", next=nxt.id, shadow=shadow, continuation_budget=s.continuations)
+        return None
 
     log.record(sid, "dispatch", next=nxt.id, shadow=shadow)
     s.state = "planning"
@@ -416,7 +487,11 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
     if not isinstance(session_id, str) or not session_id:
         return None
     active = bool(event.get("stop_hook_active"))
+    # The verify command or judge runs before the lock is taken (review
+    # should-fix: a 120 s verify held the session lock and made intake wait).
+    pre_id, pre_verify, pre_verdict = _precompute_verdict(session_id, event, claude)
     with store.locked(session_id) as s:
+        s.continuations = s.continuations + 1 if active else 0
         if s.interrupt:
             # The user asked to stop but no tool call came after the flag was
             # set; the turn is ending now, so apply the same reset and dispatch
@@ -425,6 +500,7 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
             log.record(session_id, "interrupt", task=task_id, via=event.get("hook_event_name"))
             return None
 
+        extra: dict | None = None
         if s.state == "planning":
             out, proceed = _after_planning(s)
             if not proceed:
@@ -435,9 +511,16 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
             log.record(session_id, "dispatch", next=None, waiting=s.state)
             return None
         elif s.state == "running" or s.running_task:
-            out, proceed = _close_running(s, event, shadow, claude)
+            running = s.get(s.running_task) if s.running_task else None
+            same = running is not None and running.id == pre_id and running.verify == pre_verify
+            out, proceed = _close_running(s, event, shadow, claude, verdict=pre_verdict if same else None)
             if not proceed:
                 return out
+            extra = out  # a systemMessage to carry (failed_verify), or None
 
         text = choose_next(s, stop_hook_active=active, shadow=shadow)
-        return handback(text) if text else None
+        if text:
+            return handback(text, (extra or {}).get("systemMessage"))
+        if s.continuations >= MAX_CONTINUATIONS and s.ready():
+            return {"systemMessage": _budget_message(s.continuations)}
+        return extra or None

@@ -185,7 +185,7 @@ def _new_turn(s: store.Store, event: dict, prompt: str, prompt_id: str | None) -
     # A planned task whose approval this turn defers keeps its status;
     # dispatch finds it again through ``_planned_ready`` after the turn.
     s.pending_task = None
-    t = s.new_task(prompt, [], prompt_id)
+    t = s.new_task(prompt, [], prompt_id, kind="prompt")
     t.status = "running"
     s.running_task = t.id
 
@@ -934,10 +934,10 @@ def _approval_state(
         return _approve(s, v, t, prompt, prompt_id, shadow)
 
     if v.label == "pass":
-        # A non-task word that is not an approval ("continue", "."): Claude
-        # reads it, the plan keeps waiting.
-        _log_waiting(s, v, prompt, prompt_id, shadow, state=s.state, decision="pass", label="pass", task=t.id)
-        return None
+        # A non-task word while the plan is on screen ("continue", ".") is
+        # the user saying go on: treat it as an approval, or Claude would
+        # execute the plan while the store still says awaiting_approval.
+        return _approve(s, v, t, prompt, prompt_id, shadow)
 
     handled, output = _rule_while_waiting(s, v, t, prompt, prompt_id, shadow)
     if handled:

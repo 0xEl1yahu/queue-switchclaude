@@ -675,10 +675,11 @@ def test_harness_traffic_and_slash_commands_pass_while_waiting(data_dir):
     s = store.load("s1"); assert s.state == "awaiting_answer" and s.pending_task == "p2" and s.next_id == 3
 
 
-def test_non_approval_non_task_passes_while_awaiting_approval(data_dir):
+def test_non_task_word_while_awaiting_approval_is_an_approval(data_dir):
     waiting()
-    assert intake.handle(ev("continue", prompt_id="pid-2")) is None
-    s = store.load("s1"); assert s.state == "awaiting_approval" and s.next_id == 3
+    out = intake.handle(ev("continue", prompt_id="pid-2"))
+    assert "Execute the plan at" in out["hookSpecificOutput"]["additionalContext"]
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p2" and s.next_id == 3
 
 
 def test_control_approve_hands_over_execution(data_dir):

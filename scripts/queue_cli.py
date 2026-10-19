@@ -77,9 +77,23 @@ def main(argv: list[str]) -> str:
         session_id = resolve_session(explicit)
         if not session_id:
             return NO_SESSION
+        from qsc import dispatch
         with store.locked(session_id) as s:
-            reply = control.run(s, command)
-        log.record(session_id, "control", command=command or "list", via="queue_cli")
+            before_state, before_pending = s.state, s.pending_task
+            reply = control.run(s, command, session_id=session_id)
+            approved = (
+                before_state == "awaiting_approval"
+                and s.state == "running"
+                and s.running_task is not None
+                and s.running_task == before_pending
+            )
+            if approved:
+                # The slash command runs inside a Claude turn: the printed
+                # reply is what Claude reads, so the execution handover rides
+                # on it (commands/queue.md tells Claude to follow it).
+                reply = f"{reply}. {dispatch.start(s, s.get(s.running_task))}"
+        log.record(session_id, "control", command=command or "list", via="queue_cli",
+                   approved=s.running_task if approved else None)
         return reply
     except Exception as exc:  # the reply is the whole answer; never a traceback
         return f"queue-switchclaude: could not run the queue command ({type(exc).__name__}: {exc})"

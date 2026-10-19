@@ -265,13 +265,16 @@ def test_running_done_writes_handoff_and_asks_for_plan(data_dir, monkeypatch):
     assert "Write a short plan for p2" in ctx and str(paths.plan_path("s1", "p2")) in ctx and str(paths.handoff_path("s1", "p1")) in ctx
 
 
-def test_running_verify_failed_hands_back_twice_then_gives_up(data_dir):
+def test_running_verify_failed_hands_back_twice_then_sets_aside(data_dir):
     with store.locked("s1") as s:
         a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "exit 2"; s.running_task = "p1"; s.state = "running"
     assert "failed its verify command" in dispatch.handle(stop())["hookSpecificOutput"]["additionalContext"]
     assert "failed its verify command" in dispatch.handle(stop(active=True))["hookSpecificOutput"]["additionalContext"]
-    assert dispatch.handle(stop(active=True)) is None
-    assert store.load("s1").get("p1").status == "done" and store.load("s1").get("p1").verdict == "gave_up"
+    out = dispatch.handle(stop(active=True))
+    # Fix 3: a verify that never passes sets the task aside, never closes it as done.
+    assert "hookSpecificOutput" not in out and "set aside as failed_verify" in out["systemMessage"]
+    t = store.load("s1").get("p1"); assert t.status == "failed_verify" and t.verdict == "verify_failed"
+    assert not paths.handoff_path("s1", "p1").exists()
 
 
 def test_running_asked_question_waits_for_answer(data_dir, monkeypatch):
@@ -478,3 +481,57 @@ def test_shadow_closes_running_task_without_handback(data_dir):
     assert dispatch.handle(stop(), shadow=True) is None
     t = store.load("s1").get("p1")
     assert t.status == "done" and t.verdict == "verify_failed" and paths.handoff_path("s1", "p1").exists()
+
+
+# --- M3 review follow-ups ----------------------------------------------------
+
+def test_prompt_turn_closes_without_judge(data_dir, monkeypatch):
+    def boom(*a, **k): raise AssertionError("judge must not run for a user prompt turn")
+    monkeypatch.setattr(done, "judge", boom)
+    with store.locked("s1") as s:
+        a = s.new_task("what tz?", [], "pid", kind="prompt"); a.status = "running"; s.running_task = "p1"; s.state = "running"
+    assert dispatch.handle(stop(closing="UTC.")) is None
+    t = store.load("s1").get("p1"); assert t.status == "done" and t.verdict == "stopped"
+
+
+def test_harness_task_is_judged(data_dir, monkeypatch):
+    calls = []
+    monkeypatch.setattr(done, "judge", lambda *a, **k: (calls.append(1), done.Verdict("done", "r"))[1])
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; s.running_task = "p1"; s.state = "running"
+    dispatch.handle(stop())
+    assert calls and store.load("s1").get("p1").verdict == "done"
+
+
+def test_verify_runs_without_holding_the_store_lock(data_dir):
+    lock = str(paths.store_path("s1")) + ".lock"
+    probe = (f"python3 -c \"import fcntl,sys; f=open('{lock}','a+'); "
+             "fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(0)\"")
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = probe; s.running_task = "p1"; s.state = "running"
+    assert dispatch.handle(stop()) is None
+    assert store.load("s1").get("p1").verdict == "verify_ok"        # the probe took the lock, so it was free
+
+
+def test_failed_verify_blocks_dependants_and_can_be_promoted(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "exit 1"; a.attempts = 2; s.running_task = "p1"; s.state = "running"
+        s.new_task("b", ["p1"], "pid")
+    out = dispatch.handle(stop(active=True))
+    assert "failed_verify" in out["systemMessage"]
+    s = store.load("s1"); assert s.ready() == [] and s.get("p2").status == "queued"
+    assert s.promote("p1").status == "queued"
+
+
+def test_continuation_budget_pauses_an_auto_chain(data_dir, monkeypatch):
+    monkeypatch.setattr(done, "judge", judge_as("done"))
+    with store.locked("s1") as s:
+        for i in range(10):
+            t = s.new_task(f"t{i}", [f"p{i}"] if i else [], "pid"); t.auto = True
+        s.get("p1").status = "running"; s.running_task = "p1"; s.state = "running"; s.continuations = dispatch.MAX_CONTINUATIONS - 1
+    out = dispatch.handle(stop(active=True))
+    assert "hookSpecificOutput" not in out and "paused the automatic chain" in out["systemMessage"]
+    s = store.load("s1"); assert s.state == "idle" and s.get("p2").status == "queued"
+    out = dispatch.handle(stop(active=False))                       # a real user turn resets the budget
+    assert "Write a short plan for p2" in out["hookSpecificOutput"]["additionalContext"]
+    assert store.load("s1").continuations == 0

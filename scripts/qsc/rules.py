@@ -79,7 +79,8 @@ _TRAILING_PUNCT = ".,;:!?"
 # Three forms are control: the slash command, `queue:` with a colon, and a
 # bare `queue <command>` whose first word is a known command. Prose that
 # merely starts with "queue" ("queue the login endpoint first") is a task.
-CONTROL_WORDS = ("list", "cancel", "promote", "park", "drop", "pause", "resume", "help")
+CONTROL_WORDS = ("list", "cancel", "promote", "park", "drop", "pause", "resume", "help",
+                 "show", "verify", "auto", "manual", "approve")
 _CONTROL_SLASH_RE = re.compile(r"^/queue(-switchclaude:queue)?\b\s*:?\s*(.*)$", re.IGNORECASE | re.DOTALL)
 _CONTROL_COLON_RE = re.compile(r"^queue\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
 _CONTROL_BARE_RE = re.compile(r"^queue\s+([A-Za-z]+)\b(.*)$", re.IGNORECASE | re.DOTALL)

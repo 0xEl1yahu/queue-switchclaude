@@ -102,6 +102,10 @@ class Task:
     # v3: verify_ok | verify_failed | done | not_done | asked_question |
     # gave_up | stopped (and `confirmed` when the user confirms a task done).
     verdict: str | None = None
+    # M3: "prompt" for a turn the user typed (registered so queued work can
+    # chain after it), "task" for work the harness queued. Only tasks are
+    # judged; a prompt turn closes as `stopped` without a model call.
+    kind: str = "task"
 
 
 @dataclass
@@ -116,6 +120,9 @@ class Store:
     paused: bool = False  # set by `queue: pause`; dispatch runs nothing while True
     # v3: the task being planned, awaiting approval or awaiting an answer.
     pending_task: str | None = None
+    # M3: consecutive Stop-hook continuations the harness has issued; reset
+    # by any Stop that is not a continuation. Bounds automatic chains.
+    continuations: int = 0
     tasks: list[Task] = field(default_factory=list)
 
     def new_task(
@@ -124,6 +131,7 @@ class Store:
         depends_on: list[str],
         prompt_id: str | None,
         status: str = "queued",
+        kind: str = "task",
     ) -> Task:
         """Append a task with the next id ``p{next_id}``; ids are never reused.
 
@@ -137,6 +145,7 @@ class Store:
             depends_on=list(depends_on),
             prompt_id=prompt_id,
             norm_text=normalise(text),
+            kind=kind,
         )
         self.next_id += 1
         self.tasks.append(task)
