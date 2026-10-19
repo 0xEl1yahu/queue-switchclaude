@@ -8,6 +8,12 @@ chain dependencies when the model names none, amend targets by the model or by
 ``qsc.match``) but without a store, then scores each result with
 ``eval/scoring.py`` and applies the M1 gate.
 
+Context E (M2, ``state == "awaiting_approval"``) follows intake's waiting
+branch: a control message still wins, then an approval word (``lgtm``, ``ok``,
+``ship it``: ``rules.is_approval``) is ``steer`` + ``note: approve`` before the
+non-task pass-through can swallow it, and only then does the classifier see
+the message. A split with an approve part keeps the golden ``parts`` shape.
+
     python3 eval/run_golden.py [--rules-only] [--cases g01,g05] [--no-cache]
                                [--report eval/reports/<ts>.md] [--claude PATH]
 
@@ -81,6 +87,40 @@ def _steer(interrupt: bool = False, note: str | None = None) -> dict:
     if note:
         out["note"] = note
     return out
+
+
+# Task 6's approval table (`rules.APPROVE_WORDS`); the runner carries the same
+# words so it decides g44 before Task 6 merges, and defers to `rules` after.
+APPROVE_WORDS = frozenset({
+    "lgtm", "approve", "approved", "go", "go ahead", "yes", "ok", "okay", "y",
+    "ship it", "do it", "looks good", "sounds good",
+})
+
+
+def is_approval(message: str) -> bool:
+    """``rules.is_approval``: a message that *is* an approval word, nothing more."""
+    fn = getattr(rules, "is_approval", None)
+    if callable(fn):
+        return bool(fn(message))
+    words = getattr(rules, "APPROVE_WORDS", APPROVE_WORDS)
+    text = " ".join(str(message).replace("’", "'").split()).lower()
+    return text.rstrip(".,;:!? ") in words
+
+
+def _waiting_steer(note: str | None = None) -> dict:
+    """A steer in the golden shape of context E: no flag unless one is set."""
+    out = {"label": "steer"}
+    if note:
+        out["note"] = note
+    return out
+
+
+def _golden_shape(got: dict) -> dict:
+    """Drop a false ``interrupt`` flag from a steer (and from split parts)."""
+    for d in [got, *(got.get("parts") or [])]:
+        if isinstance(d, dict) and d.get("label") == "steer" and not d.get("interrupt"):
+            d.pop("interrupt", None)
+    return got
 
 
 def _id_number(task_id: str) -> int:
@@ -250,31 +290,72 @@ class _Case:
         return _steer()
 
 
+def _ask_model(case: _Case, v: rules.Verdict, classifier: Classifier):
+    """The classifier's answer when the rules left the message undecided and
+    the model is confident enough to act on; ``None`` otherwise (steer)."""
+    if v.label != "undecided" or classifier is None:
+        return None
+    d = classifier(case.payload(v.text))
+    if d is None:
+        return None
+    confidence = getattr(d, "confidence", 0.0)
+    if not isinstance(confidence, (int, float)) or confidence < THRESHOLD:
+        return None
+    return d
+
+
+def _awaiting_approval(case: _Case, row: dict, v: rules.Verdict, classifier: Classifier) -> tuple[dict, str | None]:
+    """Context E: intake's waiting branch for a plan awaiting approval.
+
+    An approval word is decided before the ``non_task`` pass-through (review
+    focus 4: "ok" approves here, and is a non-task when idle). Explicit
+    markers keep their meaning; everything else is the model's, in the golden
+    shape of the context (a steer carries no false ``interrupt`` flag).
+    """
+    if is_approval(row["message"]):
+        return _waiting_steer("approve"), "approval"
+    if v.label == "interrupt":
+        return _steer(True), v.rule
+    if v.label == "queue":
+        return case.queue_task(None, bool(getattr(v, "parked", False))), v.rule
+    if v.label == "pass":
+        return _waiting_steer(), v.rule
+    d = _ask_model(case, v, classifier)
+    if d is None:
+        return _waiting_steer(), None
+    return _golden_shape(case.apply(d, v.text)), None
+
+
+def decide_with_rule(row: dict, classifier: Classifier) -> tuple[dict, str | None]:
+    """``decide`` plus the name of the rule that decided without the model
+    (``None`` when the model answered, failed, or was not available)."""
+    case = _Case(row)
+    v = rules.decide(row["message"])
+    if v.label == "control":
+        return {"label": "control", "interrupt": False}, v.rule
+    if v.label == "pass" and v.rule == "harness_traffic":
+        return _steer(), v.rule
+    if row.get("state") == "awaiting_approval":
+        return _awaiting_approval(case, row, v, classifier)
+    if v.label == "pass":
+        return _steer(), v.rule
+    if v.label == "interrupt":
+        return _steer(True), v.rule
+    if v.label == "queue":
+        return case.queue_task(None, bool(getattr(v, "parked", False))), v.rule
+    d = _ask_model(case, v, classifier)
+    if d is None:
+        return _steer(), (v.rule if v.label != "undecided" else None)
+    return case.apply(d, v.text), None
+
+
 def decide(row: dict, classifier: Classifier) -> dict:
     """The harness decision for one golden row, in the golden ``expected`` shape.
 
     ``classifier`` maps a payload to a ``classify.Decision`` (or ``None``);
     ``None`` means rules only, so every ``undecided`` message is ``steer``.
     """
-    case = _Case(row)
-    v = rules.decide(row["message"])
-    if v.label == "pass":
-        return _steer()
-    if v.label == "interrupt":
-        return _steer(True)
-    if v.label == "queue":
-        return case.queue_task(None, bool(getattr(v, "parked", False)))
-    if v.label == "control":
-        return {"label": "control", "interrupt": False}
-    if v.label != "undecided" or classifier is None:
-        return _steer()
-    d = classifier(case.payload(v.text))
-    if d is None:
-        return _steer()
-    confidence = getattr(d, "confidence", 0.0)
-    if not isinstance(confidence, (int, float)) or confidence < THRESHOLD:
-        return _steer()
-    return case.apply(d, v.text)
+    return decide_with_rule(row, classifier)[0]
 
 
 # --- the cached model classifier ---------------------------------------------
@@ -327,17 +408,16 @@ def load_golden(path: Path = GOLDEN_PATH) -> list[dict]:
 
 
 def run_case(row: dict, rules_only: bool, claude: str, use_cache: bool, cache_dir: Path) -> dict:
-    v = rules.decide(row["message"])
     stats: dict = {"called": False, "cached": False, "error": False, "latency_ms": None}
     if rules_only:
         classifier = None
     else:
         def classifier(payload: dict):
             return classify_cached(row["id"], payload, claude=claude, use_cache=use_cache, cache_dir=cache_dir, stats=stats)
-    got = decide(row, classifier)
+    got, rule = decide_with_rule(row, classifier)
     score, reason = scoring.score_case(row, got)
-    if v.label != "undecided":
-        by = f"rule:{v.rule}"
+    if rule is not None:
+        by = f"rule:{rule}"
     elif not stats["called"]:
         by = "none"
     elif stats["error"]:
@@ -349,7 +429,7 @@ def run_case(row: dict, rules_only: bool, claude: str, use_cache: bool, cache_di
     return {
         "id": row["id"], "context": row.get("context", ""), "difficulty": row.get("difficulty", ""),
         "expected": row["expected"]["label"], "got": got.get("label"), "score": score, "reason": reason,
-        "by": by, "rule_decided": v.label != "undecided", "model_error": stats["error"],
+        "by": by, "rule_decided": rule is not None, "model_error": stats["error"],
         "latency_ms": stats["latency_ms"], "interrupt_case": bool(row["expected"].get("interrupt")),
         "decision": got,
     }

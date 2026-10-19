@@ -12,6 +12,9 @@ Run on 2026-10-19 from the Task 9 worktree (branch `worktree-wf_b008e350-354-12`
 | 1, v2 prompt, cold cache | `python3 eval/run_golden.py --report eval/reports/m1-run1.md` | 44 / 47 | +44.0 | 0 | 2 / 2 | 7 / 47 (15%) | PASS |
 | 2, same prompt, `--no-cache` | `python3 eval/run_golden.py --no-cache --report eval/reports/m1-run2.md` | 44 / 47 | +44.0 | 0 | 2 / 2 | 7 / 47 (15%) | PASS |
 | 3, gate, after the `match.py` change | `python3 eval/run_golden.py --report eval/reports/m1-gate.md` | 44 / 47 | +44.0 | 0 | 2 / 2 | 7 / 47 (15%) | PASS (exit 0) |
+| M2, Task 7, context E decided like intake | `python3 eval/run_golden.py --report eval/reports/m2.md` | 44 / 47 | +44.0 | 0 | 2 / 2 | 8 / 47 (17%) | PASS (exit 0) |
+
+The M2 row was run on 2026-10-19 from the Task 7 worktree (branch `worktree-wf_ced451a8-e68-9`, main at `abb5689`) after `run_golden.decide` learnt the `awaiting_approval` state: an approval word (`rules.is_approval`, the runner carries the same table until Task 6 merges) is `steer` + `note: approve` before the non-task pass-through, then the classifier. g44 `lgtm` is now rule-decided (`rule:approval`), which takes the rules-only run to 25 / 47 passed and 8 / 47 decided by rules; g45 to g47 still reach the model. The model run made no fresh call: all 39 model-decided cases came from the M1 cache (the prompt and payloads are unchanged), and the same three cases fail as in the gate run (g03, g08, g25).
 
 Runs 1 and 2 each made 40 `claude -p` calls (mean 4.1 s and 3.9 s, about 2 min 45 s wall-clock, roughly $0.02 each). Run 3 made 7 fresh calls (g10 to g16: the `match.py` change altered the candidate scores in their payloads, so their cache keys changed) and took the other 33 model answers from run 2's cache; the remaining 7 cases are rule-decided and never reach the model. The reports are under `eval/reports/` (gitignored, like `eval/cache/`).
 
