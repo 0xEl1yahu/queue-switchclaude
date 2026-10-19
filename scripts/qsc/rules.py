@@ -9,10 +9,14 @@ merely contains "stop": only a message that *is* a stop phrase interrupts.
 Rule order and labels:
 
     harness_traffic  -> pass
+    control          -> control   (control = the command after the prefix)
     non_task         -> pass
     paste_guard      -> undecided
     interrupt        -> interrupt
+    parked_marker    -> queue, parked=True (text = the captured remainder);
+                        undecided when the remainder has no content
     queue_marker     -> queue   (text = the captured remainder)
+    numbered_split   -> undecided (rule name only; the model does the split)
     (none)           -> undecided
 
 Stdlib only.
@@ -24,7 +28,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-LABELS = ("steer", "queue", "interrupt", "pass", "undecided")
+LABELS = ("steer", "queue", "interrupt", "control", "pass", "undecided")
 
 HARNESS_PHRASES = (
     "Another Claude session sent a message",
@@ -44,6 +48,30 @@ _INTERRUPT_PHRASES = frozenset({"don't do that", "do not do that"})
 # Trailing punctuation stripped before the interrupt match ("stop!", "Stop.").
 _TRAILING_PUNCT = ".,;:!?"
 
+# `queue: list`, `/queue cancel p2`, `/queue-switchclaude:queue promote p3`.
+# The remainder is the command; empty means `list`. The word boundary keeps
+# "queued ..." and "queues ..." out of the control channel.
+_CONTROL_RE = re.compile(
+    r"^(queue|/queue(-switchclaude:queue)?)\b\s*:?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Tentative markers: the item is recorded as `parked`, never dispatched
+# until promoted (spec section 3, g33).
+_PARKED_MARKER_RE = re.compile(
+    r"^(maybe later|someday|at some point|one day|if we have time)\b[,:]?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# A remainder whose object is a bare pronoun has no content of its own
+# ("maybe later we can add this", g34): the referent lives in the recent
+# turn, which only the classifier sees.
+_PRONOUNS = frozenset({"this", "that", "it"})
+
+# Two or more list items mark a probable split; the rule only names it for
+# the log, the classifier does the split.
+_LIST_ITEM_RE = re.compile(r"(^|\s)(\d+[).]|[-*])\s+\S")
+
 _QUEUE_MARKER_RES = (
     re.compile(r"^p\d+:\s*(.+)$", re.IGNORECASE | re.DOTALL),
     re.compile(r"^later:\s*(.+)$", re.IGNORECASE | re.DOTALL),
@@ -61,15 +89,20 @@ _QUEUE_MARKER_RES = (
 class Verdict:
     """Outcome of the rule table for one message.
 
-    label: one of LABELS.
-    rule:  name of the rule that fired, or None when no rule matched.
-    text:  the task text with any marker stripped (the message itself when
-           no marker applies).
+    label:   one of LABELS.
+    rule:    name of the rule that fired, or None when no rule matched.
+    text:    the task text with any marker stripped (the message itself when
+             no marker applies).
+    parked:  True when a tentative marker fired (label `queue`).
+    control: the control command after the `queue:` prefix (label
+             `control`), empty for a bare prefix; None otherwise.
     """
 
     label: str
     rule: Optional[str]
     text: str
+    parked: bool = False
+    control: Optional[str] = None
 
 
 def _normalise(message: str) -> str:
@@ -82,6 +115,13 @@ def _is_harness_traffic(message: str) -> bool:
     if message.lstrip().startswith("<"):
         return True
     return any(phrase in message for phrase in HARNESS_PHRASES)
+
+
+def _control_command(message: str) -> Optional[str]:
+    m = _CONTROL_RE.match(message.strip())
+    if m is None:
+        return None
+    return m.group(m.lastindex).strip()
 
 
 def _is_non_task(message: str) -> bool:
@@ -104,6 +144,23 @@ def _is_interrupt(message: str) -> bool:
     return _INTERRUPT_RE.match(phrase) is not None
 
 
+def _parked_remainder(message: str) -> Optional[str]:
+    """The text after a tentative marker, "" when it carries no content."""
+    text = message.strip().replace("\u2019", "'").replace("\u2018", "'")
+    m = _PARKED_MARKER_RE.match(text)
+    if m is None:
+        return None
+    remainder = m.group(m.lastindex).strip()
+    words = _normalise(remainder).rstrip(_TRAILING_PUNCT + " ").split()
+    if not words or words[-1] in _PRONOUNS:
+        return ""
+    return remainder
+
+
+def _is_numbered_split(message: str) -> bool:
+    return len(_LIST_ITEM_RE.findall(message)) >= 2
+
+
 def _queue_remainder(message: str) -> Optional[str]:
     text = message.strip().replace("’", "'").replace("‘", "'")
     for pattern in _QUEUE_MARKER_RES:
@@ -123,6 +180,10 @@ def decide(message: str) -> Verdict:
     if _is_harness_traffic(message):
         return Verdict("pass", "harness_traffic", message)
 
+    command = _control_command(message)
+    if command is not None:
+        return Verdict("control", "control", message, control=command)
+
     if _is_non_task(message):
         return Verdict("pass", "non_task", message)
 
@@ -132,8 +193,17 @@ def decide(message: str) -> Verdict:
     if _is_interrupt(message):
         return Verdict("interrupt", "interrupt", message)
 
+    parked = _parked_remainder(message)
+    if parked is not None:
+        if not parked:
+            return Verdict("undecided", "parked_marker", message)
+        return Verdict("queue", "parked_marker", parked, parked=True)
+
     remainder = _queue_remainder(message)
     if remainder is not None:
         return Verdict("queue", "queue_marker", remainder)
+
+    if _is_numbered_split(message):
+        return Verdict("undecided", "numbered_split", message)
 
     return Verdict("undecided", None, message)
