@@ -1,0 +1,75 @@
+# M3 live acceptance
+
+Run on 2026-10-19 (13:59 to 14:09 UTC, 14:59 to 15:09 BST) against commit `b3a905f` (plugin version 0.3.0). Claude Code 2.1.302, Fable 5.1 (high effort), auto permission mode, tmux 150x45 in `/tmp/qsc-demo` with `--plugin-dir` from the main checkout (data dir `~/.claude/plugins/data/queue-switchclaude-inline/`); scenario V added a second session in `/tmp/qsc-demo-2`, scenario W a third in `/tmp/qsc-demo-3` without `--plugin-dir`. Same method as `docs/m2-fixes-acceptance.md`: each scenario after `/clear`; the driver clears the input line with Ctrl-U before every send because a blocked prompt returns its text to the input box; sends timestamped in UTC just before Enter; pane captured 1.5 s after each send and again when the turn ended (polled every 3 s until `esc to interrupt` was gone and the pane was stable for 4 s). Delay is send-to-log-line. Scenarios T to W of the M3 plan (`docs/superpowers/plans/2026-10-19-m3-hardening.md`, Task 8). No plugin code was changed; 596 tests passed before the run. Scenario U was run twice because the first attempt was invalid (driver error, recorded under U); the others once.
+
+The account was at 96% of its weekly limit, so prompts were kept to one short line and scenario V used the no-model-call way of putting a task in the queue (below).
+
+## Summary
+
+| Scenario | Result | Evidence |
+|---|---|---|
+| T, idle markers | Pass. `later: write i.txt containing iota` at idle ran now: `i.txt` written, log `decision: new_turn, task: p1, marker_stripped: true`, store `p1 done` with text `write i.txt containing iota` (marker stripped). `maybe later we can add a README` was blocked with `parked p2: we can add a README (send 'queue: promote p2' to run it)`, log `decision: parked_idle`, store `p2 parked`, state `idle`, nothing ran. `stop` was blocked with `nothing is running`, log `decision: noop`, no task created, `interrupt: false`. | `later:` 102 ms; parked 76 ms; `stop` 68 ms |
+| U, Esc during planning | Pass. Esc 4.5 s into the planning turn (`Interrupted · What should Claude do instead?`), then `what time is it`: log `decision: new_turn, task: p3, interrupted_planning: "p2"`; the question ran as a normal turn; at its Stop `dispatch next: p2` issued the planning handover again and `planned: p2` followed 10 s later; store `p2 planned`, state `awaiting_approval`, `pending_task: p2`, `plans/p2.md` present, handoffs `p1.md` and `p3.md`. The notice is `additionalContext`, so it is not shown on screen (observation 1). | `later:` 71 ms; question 74 ms (no classifier) |
+| V, two sessions | Pass. A task parked in each session (`alpha` in `/tmp/qsc-demo`, `beta` in `/tmp/qsc-demo-2`); `/queue-switchclaude:queue list` in the first showed only `p1 parked: we can add alpha`, in the second only `p1 parked: we can add beta`. Two cwd pointer files, one per session. `queue_cli.py list` run from each directory gave the same per-session answer; from `/tmp` (no pointer) it gave the newest session, `beta`. | park 94 ms and 93 ms; list 66 ms and 66 ms |
+| W, marketplace install | Pass, local path form (the GitHub form needs the push, which has not happened). `/plugin marketplace add <checkout path>` → `Successfully added marketplace: queue-switchclaude`; `/plugin install queue-switchclaude@queue-switchclaude` → scope picker, then the plugin's options screen (Shadow mode, Shadow: also ask the model), then `✓ Installed and configured queue-switchclaude. Plugin is now active.` Scenario A then queued `p2` (`queued p2 after p1` on screen, `rule: queue_marker`), closed `p1` at the Stop and planned `p2` (`planned: p2`, state `awaiting_approval`) from the marketplace data dir `~/.claude/plugins/data/queue-switchclaude-queue-switchclaude/`. Uninstalled and marketplace removed; `~/.claude/settings.json` has no leftover `enabledPlugins` or `extraKnownMarketplaces` entry, no edit was needed. | first prompt 261 ms (first hook after install); `later:` 86 ms |
+
+## Scenario T: idle markers
+
+Session `2e492513`. Typed `later: write i.txt containing iota` at idle, then `maybe later we can add a README`, then `stop`.
+
+Observed:
+- The `later:` message passed through: Claude wrote `i.txt` (`printf 'iota\n' > i.txt`) and confirmed it, 6 s turn. Log `intake new_turn, task: p1, marker_stripped: true` (13:59:13.649), then at the Stop `handoff p1, verdict: stopped, reason: prompt turn ended` and `dispatch next: null`. Store `p1 done`, `kind: prompt`, text `write i.txt containing iota`. The `additionalContext` (`nothing is running, so this starts now: …`) is not visible on screen; Claude did not mention it.
+- `maybe later we can add a README`: blocked at 1.5 s with `UserPromptSubmit operation blocked by hook: queue-switchclaude: parked p2: we can add a README (send 'queue: promote p2' to run it)`. Log `decision: parked_idle, state: idle, task: p2, rule: parked_marker, parked: true`. Store `p2 parked`, text `we can add a README`, state still `idle`, `running_task: null`. No model call, no file.
+- `stop`: blocked with `queue-switchclaude: nothing is running`. Log `decision: noop, state: idle, rule: interrupt`. Store unchanged (`next_id: 3`, `interrupt: false`).
+- Delays: `later:` 13:59:13.547 → 13.649 (102 ms); parked 13:59:35.228 → 35.304 (76 ms); `stop` 13:59:41.192 → 41.260 (68 ms). `hook_ms: 1` on all three.
+
+## Scenario U: Esc during planning
+
+First attempt (session `fed735bd`) was invalid: the driver polled the pane for the planning handover text `Write a short plan`, which the 150-column pane wrapped across two lines, so the poll never matched and timed out at 150 s; by then the planning turn had finished (`planned: p2` at 14:01:03, 56 s after the first prompt) and Esc landed on an idle prompt in `awaiting_approval`. The `what time is it` that followed was classified `steer` (0.95, 3.45 s) and logged `decision: defer_approval`, ran as `p3`, and at its Stop dispatch re-presented the plan (`represent: true`, `waiting: awaiting_approval`), the M2 scenario O behaviour. Discarded.
+
+Second attempt (session `b6e5eecb`). Scratch files removed and `/clear`. Typed `write hello.py that prints hello and run it`, `later: add goodbye.py that prints goodbye` 2.5 s later; the driver then polled the store every 0.5 s for `state: planning`, waited 4 s and sent Escape, then `what time is it`.
+
+Observed:
+- `later:` blocked at 71 ms, `queued p2 after p1` shown at 1.5 s. Stop of the `hello.py` turn at 14:03:33.635: `handoff p1, verdict: stopped`, `dispatch next: p2` with the planning handover (`Read the handoff … Write a short plan for p2 to …/plans/p2.md …`). Store `state: planning` seen at 14:03:34.2.
+- Escape at 14:03:38.197. The screen showed `Reading the handoff for the previous task, then drafting the plan for p2.` / `Read 1 file` / `Interrupted · What should Claude do instead?`. Claude had read `handoffs/p1.md` but not yet written the plan.
+- `what time is it` at 14:03:40.141: log 14:03:40.215 `intake new_turn, task: p3, interrupted_planning: "p2", interrupted: null, dropped: []` (74 ms, `hook_ms: 1`, no classifier). Claude ran `date` and answered `It is 15:03 BST on Monday, 19 October 2026.` without mentioning the interruption (the notice rides on `additionalContext`, which the UI does not display).
+- Stop of that turn at 14:03:44.578: `handoff p3, verdict: stopped`, then `dispatch next: p2` and the planning handover again (`Stop hook feedback: … next task is p2 …`). Claude said `I already read the p1 handoff earlier. Writing the plan for p2 now.`, wrote `plans/p2.md` and presented it (goal, two steps, verify); `dispatch planned: p2, auto: false, next: null` at 14:03:54.771.
+- Store: `p1 done`, `p2 planned`, `p3 done` (`what time is it`), state `awaiting_approval`, `pending_task: p2`, `running_task: null`. `plans/p2.md` present; `handoffs/p1.md`, `p3.md`. The half-plan deletion could not be observed because Esc came before the plan file existed; the requeue and the fresh plan are the evidence.
+- Delays: first prompt 14:03:27.527 → 27.620 (93 ms); `later:` 14:03:30.059 → 30.130 (71 ms); question 14:03:40.141 → 40.215 (74 ms).
+
+## Scenario V: two sessions
+
+Sessions `9067e4c4` (`/tmp/qsc-demo`, after `/clear`) and `abcf634b` (`/tmp/qsc-demo-2`, fresh `git init`, folder trust accepted). To keep the model calls down, each session's task went in through the idle parked marker, which creates the task without a turn: `maybe later we can add alpha` in the first, `maybe later we can add beta` in the second (both blocked with `parked p1: …`, `decision: parked_idle`). Then `/queue-switchclaude:queue list` in the first and 1.9 s later in the second.
+
+Observed:
+- First session: `queue-switchclaude: p1 parked: we can add alpha`. Second session: `queue-switchclaude: p1 parked: we can add beta`. Neither showed the other's task.
+- Both list commands were handled by intake's control rule at idle (`decision: control, command: list`) and answered through the blocked-prompt `systemMessage`; the slash command's CLI did not run and no model turn was spent. To cover the CLI path (review focus 1), `python3 scripts/queue_cli.py list` was run from the shell with each directory as cwd: from `/tmp/qsc-demo` → `p1 parked: we can add alpha`; from `/tmp/qsc-demo-2` → `p1 parked: we can add beta`; from `/tmp` (no cwd pointer) → `p1 parked: we can add beta`, the global pointer's newest session.
+- `pointers/` held two files, `954dce2b11cc7995` → `9067e4c4…` and `04b9f68f051e0e54` → `abcf634b…`, both written at the park event.
+- Delays: park 14:05:25.697 → 25.791 (94 ms) and 14:05:27.612 → 27.705 (93 ms); list 14:05:29.502 → 29.568 (66 ms) and 14:05:31.409 → 31.475 (66 ms).
+
+## Scenario W: marketplace install
+
+Session in `/tmp/qsc-demo-3` (fresh `git init`, folder trust accepted) started as `claude --permission-mode auto`, no `--plugin-dir`. The GitHub form `/plugin marketplace add 0xEl1yahu/queue-switchclaude` needs the push, which has not happened, so the local path form was used.
+
+What the UI said, in order:
+- `/plugin marketplace add /Users/elibelilty/Documents/GitHub/queue-switchclaude` → `Successfully added marketplace: queue-switchclaude`, then Claude Code ran `/reload-plugins` on its own: `Reloaded: 7 plugins · 82 skills · 7 agents · 1 hook · 2 plugin MCP servers · 1 plugin LSP server`.
+- `/plugin install queue-switchclaude@queue-switchclaude` → the Plugins UI opened on `Plugin Details`: name, the manifest description, `By: 0xEl1yahu`, `Will install: · Components will be discovered at installation`, the standard trust warning, and the scope picker `Install for you (user scope)` / `Install for all collaborators on this repository (project scope)` / `Install for you, in this repo only (local scope)` / `Open homepage` / `Back to plugin list`. Enter on user scope.
+- Then `Configure queue-switchclaude` / `Plugin options`: `Shadow mode ◀ false ▶`, `Shadow: also ask the model false`, `Save configuration` (the `userConfig` from `plugin.json`). Saved with the defaults.
+- Back at the prompt: `/plugin install queue-switchclaude@queue-switchclaude` / `✓ Installed and configured queue-switchclaude. Plugin is now active.` No restart was needed. `~/.claude/settings.json` gained `enabledPlugins."queue-switchclaude@queue-switchclaude": true` and `extraKnownMarketplaces.queue-switchclaude` (`source: directory`, the checkout path); a data dir `~/.claude/plugins/data/queue-switchclaude-queue-switchclaude/` appeared on the first hook.
+
+Scenario A (session `aa9a3df0`): `write a python script hello.py that prints hello, then run it`, then `later: add a goodbye.py that prints goodbye` 2.5 s later.
+- `queue-switchclaude: queued p2 after p1: add a goodbye.py that prints goodbye` above the input box at 1.5 s; log `rule: queue_marker, classifier: null` (`hook_ms: 7`).
+- Claude wrote and ran `hello.py` (`Allowed by auto mode classifier` on the Bash call). Stop at 14:07:37.105: `handoff p1, verdict: stopped`, `dispatch next: p2`; on screen `Ran 2 stop hooks` / `Stop hook feedback: queue-switchclaude: next task is p2 …` naming the marketplace data dir paths. Claude read the handoff, wrote `plans/p2.md` and presented it (goal, steps, verify, `Waiting for your approval before starting.`); `dispatch planned: p2, auto: false, next: null` at 14:07:52.300. Store `p1 done`, `p2 planned`, state `awaiting_approval`. The scratch folder held only `hello.py`. Stopped here (the plan was not approved) to save usage; the M3 expectation, that the plugin loads from the marketplace and queues the task, was met.
+- Delays: first prompt 14:07:28.018 → 28.279 (261 ms, the first hook invocation of a fresh install; `hook_ms: 1`, so the rest is process start); `later:` 14:07:30.554 → 30.640 (86 ms).
+
+Teardown:
+- `/plugin uninstall queue-switchclaude@queue-switchclaude` → the Plugins UI asked `queue-switchclaude has 3.4KB of persistent data / Delete it along with the plugin? /Users/elibelilty/.claude/plugins/data/queue-switchclaude-queue-switchclaude / y to delete · n to keep · esc to cancel`. Answered `y` (test data from this run only); the UI moved to the Installed tab, Esc returned to the prompt. The `enabledPlugins` entry and the data dir were gone.
+- `/plugin marketplace remove queue-switchclaude` → `✔ Removed 1 marketplace`, then `/reload-plugins` again (`7 plugins · 82 skills · 7 agents · 1 hook …`). The `extraKnownMarketplaces` entry was gone; `~/.claude/plugins/marketplaces/` no longer has `queue-switchclaude`; `known_marketplaces.json` and `installed_plugins.json` have no mention. The only remaining `queue-switchclaude` key in `settings.json` is the pre-existing `pluginConfigs."queue-switchclaude@inline"` from the M0 shadow test, which was there before this run and was not touched. No Python edit was needed.
+
+## Observations
+
+1. The two notices that ride on `additionalContext` (`nothing is running, so this starts now: …` in T and `the planning turn for p2 was interrupted; it is queued again` in U) reach the model but not the screen. The user sees the file get written, or the plan come back after the question, with no line explaining why. A `systemMessage` next to the context would make both visible; the blocked-prompt messages (`parked p2`, `nothing is running`) already are.
+2. `/queue-switchclaude:queue list` at idle never reaches the command file: intake's control rule answers it as a blocked prompt. That is cheaper and faster (66 ms, no model turn) than the M2-fixes S1 path, and it made scenario V's isolation check free; the CLI's cwd-pointer resolution was checked from the shell instead.
+3. Every hook in T to W reported `hook_ms` 1 to 7; end-to-end delays were 66 to 102 ms, except the first hook of the fresh marketplace install (261 ms) and the one classifier call in the discarded U attempt (3.45 s).
+4. The marketplace install walks through a scope picker and the plugin's options screen before it is active; the README install line should say so, or users will think the install hung on the `Plugin Details` page.
+5. The driver's pane-text polling is fragile at 150 columns (the invalid U attempt). Polling the store for `state: planning` worked and is the method to keep.
