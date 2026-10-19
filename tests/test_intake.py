@@ -1118,3 +1118,18 @@ def test_shadow_pass_throughs_show_nothing(data_dir):
     intake.handle(ev("later: a"), shadow=True)
     out = intake.handle(ev("something else", prompt_id="pid-2"), shadow=True)
     assert "systemMessage" not in out and "dropped queued tasks: p2 (a)" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_dispatch_lines_logged_from_intake_carry_hook_ms(data_dir):
+    # A confirmation runs dispatch.write_handoff and dispatch.choose_next inside
+    # the intake process; their log lines must count from the same start stamp
+    # instead of reading 0 (M4 review: dispatch._record saw no event of its own).
+    import time
+    waiting("awaiting_answer")
+    with store.locked("s1") as s:
+        s.get("p2").status = "running"; s.new_task("add logout", ["p2"], "pid-1")
+    e = ev("ok, merge", prompt_id="pid-3"); e["_hook_started"] = time.monotonic() - 0.05
+    intake.handle(e)
+    rows = [json.loads(line) for line in paths.log_path("s1").read_text().splitlines()]
+    from_dispatch = [r for r in rows if r["event"] in ("dispatch", "handoff")]
+    assert len(from_dispatch) == 2 and all(r["hook_ms"] >= 50 for r in from_dispatch), from_dispatch

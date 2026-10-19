@@ -129,14 +129,16 @@ SHADOW_QUEUED = "shadow_queued"
 _UNHANDLED = object()
 
 
-# The event ``handle`` is working on, so ``_record`` can hand it to
-# ``hookio.hook_ms``; None between calls (``hook_ms`` then reads 0).
-_event: dict | None = None
-
-
 def _record(session_id: str, event_name: str, **fields) -> None:
-    """``log.record`` plus ``hook_ms``, the time since the hook script started."""
-    log.record(session_id, event_name, hook_ms=hookio.hook_ms(_event or {}), **fields)
+    """``log.record`` plus ``hook_ms``, the time since the hook script started.
+
+    The stamp is the one ``hookio.start_clock`` remembered at the top of the
+    running ``handle``, whichever module's it is: intake confirms a task
+    through ``dispatch.write_handoff`` and ``dispatch.choose_next``, and
+    their lines must count from the same start as intake's own (M4 review;
+    a module-level copy of the event went stale and read 0 there).
+    """
+    log.record(session_id, event_name, hook_ms=hookio.hook_ms(), **fields)
 
 
 def _block(reason: str) -> dict:
@@ -586,8 +588,6 @@ def _part_label(p: classify.Part) -> str:
 
 def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = False) -> dict | None:
     """Sort one UserPromptSubmit event. Returns the hook output or None to pass through."""
-    global _event
-    _event = event
     hookio.start_clock(event)
     prompt = event.get("prompt")
     if not isinstance(prompt, str):

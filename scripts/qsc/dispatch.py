@@ -68,14 +68,16 @@ _WAITING = ("awaiting_approval", "awaiting_answer")
 # --- envelopes and handover texts --------------------------------------------
 
 
-# The event ``handle`` is working on, so ``_record`` can hand it to
-# ``hookio.hook_ms``; None between calls (``hook_ms`` then reads 0).
-_event: dict | None = None
-
-
 def _record(session_id: str, event_name: str, **fields) -> None:
-    """``log.record`` plus ``hook_ms``, the time since the hook script started."""
-    log.record(session_id, event_name, hook_ms=hookio.hook_ms(_event or {}), **fields)
+    """``log.record`` plus ``hook_ms``, the time since the hook script started.
+
+    The stamp is the one ``hookio.start_clock`` remembered at the top of the
+    running ``handle``, whichever module's it is: intake confirms a task
+    through ``dispatch.write_handoff`` and ``dispatch.choose_next``, and
+    their lines must count from the same start as intake's own (M4 review;
+    a module-level copy of the event went stale and read 0 there).
+    """
+    log.record(session_id, event_name, hook_ms=hookio.hook_ms(), **fields)
 
 
 def handback(text: str, system_message: str | None = None) -> dict:
@@ -588,8 +590,6 @@ def _issue(s: store.Store, out: dict | None, stop_hook_active: bool) -> dict | N
 
 def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | None:
     """Run the stages that apply to the store's state; return the Stop output."""
-    global _event
-    _event = event
     hookio.start_clock(event)
     session_id = event.get("session_id")
     if not isinstance(session_id, str) or not session_id:
