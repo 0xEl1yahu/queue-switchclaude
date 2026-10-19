@@ -19,12 +19,52 @@ from typing import Iterator
 
 from . import log, paths
 
-TASK_STATUSES = ("queued", "running", "done", "interrupted", "dropped")
+TASK_STATUSES = (
+    "queued", "parked", "running", "paused", "done", "interrupted",
+    "dropped", "cancelled", "shadow_queued", "shadow_dispatched",
+)
 STORE_STATES = ("idle", "running")
+
+# Statuses a task can be cancelled from (control "cancel pN", amend note "cancel").
+CANCELLABLE = ("queued", "parked", "paused")
+# Statuses that make a task a live candidate for amend targets and listings.
+CANDIDATE_STATUSES = ("queued", "parked", "paused", "running")
+# Statuses find_recent() never matches: the task is gone, so resubmitting
+# the same text is a fresh request, not a duplicate.
+_NOT_RECENT = ("dropped", "cancelled")
+
+_CURLY = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
+_TRAILING_PUNCT = ".,;:!?"
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_iso(value: object) -> datetime | None:
+    """A timezone-aware datetime from a store timestamp, or None when unreadable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def normalise(text: str) -> str:
+    """The comparison form of a task text: lowercase, curly quotes straightened,
+    whitespace collapsed, trailing ``.,;:!?`` stripped.
+
+    Dedupe compares on this (plan: exact after normalisation only), so
+    "later: add goodbye.py" and "later: add a goodbye.py" stay distinct.
+    """
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    collapsed = " ".join(text.translate(_CURLY).split()).lower()
+    return collapsed.rstrip(_TRAILING_PUNCT + " ")
 
 
 @dataclass
@@ -35,6 +75,10 @@ class Task:
     depends_on: list[str] = field(default_factory=list)
     prompt_id: str | None = None
     created_at: str = field(default_factory=_now_iso)
+    # v2: filled by Store.new_task via normalise(); "" in stores written by M0.
+    norm_text: str = ""
+    # v2: amend appendices ("the webhook handler should verify signatures").
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -48,14 +92,25 @@ class Store:
     last_dispatched: str | None = None
     tasks: list[Task] = field(default_factory=list)
 
-    def new_task(self, text: str, depends_on: list[str], prompt_id: str | None) -> Task:
-        """Append a queued task with the next id ``p{next_id}``; ids are never reused."""
+    def new_task(
+        self,
+        text: str,
+        depends_on: list[str],
+        prompt_id: str | None,
+        status: str = "queued",
+    ) -> Task:
+        """Append a task with the next id ``p{next_id}``; ids are never reused.
+
+        ``status`` defaults to ``queued``; intake passes ``parked`` for a
+        maybe-later item and ``shadow_queued`` in shadow mode.
+        """
         task = Task(
             id=f"p{self.next_id}",
             text=text,
-            status="queued",
+            status=status,
             depends_on=list(depends_on),
             prompt_id=prompt_id,
+            norm_text=normalise(text),
         )
         self.next_id += 1
         self.tasks.append(task)
@@ -70,7 +125,8 @@ class Store:
     def ready(self) -> list[Task]:
         """Queued tasks whose every dependency is done, in creation order.
 
-        A dependency that names no known task is never satisfied.
+        A dependency that names no known task is never satisfied. Parked and
+        paused tasks are never ready: only ``queued`` counts.
         """
         done = {t.id for t in self.tasks if t.status == "done"}
         return [
@@ -78,9 +134,66 @@ class Store:
             if t.status == "queued" and all(dep in done for dep in t.depends_on)
         ]
 
+    def find_recent(
+        self,
+        norm_text: str,
+        within_seconds: int,
+        now: datetime | None = None,
+    ) -> Task | None:
+        """The newest task with equal ``norm_text`` created within the window.
+
+        Dropped and cancelled tasks never match. A task whose ``created_at``
+        cannot be parsed is skipped rather than guessed at.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        for task in reversed(self.tasks):
+            if task.norm_text != norm_text or task.status in _NOT_RECENT:
+                continue
+            created = _parse_iso(task.created_at)
+            if created is None:
+                continue
+            if 0 <= (now - created).total_seconds() <= within_seconds:
+                return task
+        return None
+
+    def cancel(self, task_id: str) -> Task | None:
+        """Mark a queued, parked or paused task ``cancelled``; else ``None``."""
+        task = self.get(task_id)
+        if task is None or task.status not in CANCELLABLE:
+            return None
+        task.status = "cancelled"
+        return task
+
+    def promote(self, task_id: str) -> Task | None:
+        """Move a parked task back to the queue; ``None`` unless it was parked."""
+        task = self.get(task_id)
+        if task is None or task.status != "parked":
+            return None
+        task.status = "queued"
+        return task
+
+    def candidates(self) -> list[Task]:
+        """Live tasks (queued, parked, paused, running) in creation order.
+
+        These are the amend targets and what ``queue: list`` shows.
+        """
+        return [t for t in self.tasks if t.status in CANDIDATE_STATUSES]
+
+
+_TASK_FIELDS = frozenset(f.name for f in dataclasses.fields(Task))
+_STORE_FIELDS = frozenset(f.name for f in dataclasses.fields(Store)) - {"session_id", "tasks"}
+
 
 def _from_dict(session_id: str, data: object) -> Store:
-    """Build a Store from parsed JSON; raises KeyError/TypeError on a bad shape."""
+    """Build a Store from parsed JSON; raises KeyError/TypeError on a bad shape.
+
+    Unknown keys on the store or a task are ignored, so a file written by a
+    newer version still loads. A missing required key (``tasks``, a task's
+    ``id`` or ``text``) is still a bad shape.
+    """
     if not isinstance(data, dict):
         raise TypeError("store file is not a JSON object")
     raw_tasks = data["tasks"]
@@ -90,8 +203,8 @@ def _from_dict(session_id: str, data: object) -> Store:
     for raw in raw_tasks:
         if not isinstance(raw, dict):
             raise TypeError("task is not a JSON object")
-        tasks.append(Task(**raw))
-    fields = {k: v for k, v in data.items() if k not in ("tasks", "session_id")}
+        tasks.append(Task(**{k: v for k, v in raw.items() if k in _TASK_FIELDS}))
+    fields = {k: v for k, v in data.items() if k in _STORE_FIELDS}
     return Store(session_id=session_id, tasks=tasks, **fields)
 
 
