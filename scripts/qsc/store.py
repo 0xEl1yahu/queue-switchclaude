@@ -90,6 +90,7 @@ class Store:
     next_id: int = 1
     interrupt: bool = False
     last_dispatched: str | None = None
+    paused: bool = False  # set by `queue: pause`; dispatch runs nothing while True
     tasks: list[Task] = field(default_factory=list)
 
     def new_task(
