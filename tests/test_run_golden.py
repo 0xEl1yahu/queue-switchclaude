@@ -158,3 +158,60 @@ def test_amend_rewire_only_when_model_named_target():
     d = classify.Decision(label="amend", confidence=0.95, interrupt=False, parked=False, depends_on=[], target=None, note=None, parts=[])
     got = run_golden.decide(row, classifier=lambda p: d)
     assert got["label"] == "amend" and got["target"] == "p2" and "depends_on" not in got
+
+
+# --- Task 7 (M2): context E, a plan awaiting approval ---------------------
+
+def test_awaiting_approval_rules_only():
+    assert run_golden.decide(G["g44"], classifier=None) == {"label": "steer", "note": "approve"}
+    assert run_golden.decide(G["g45"], classifier=None) == {"label": "steer"}      # undecided without the model
+
+
+def test_awaiting_approval_ok_is_an_approval_not_a_non_task():
+    # review focus 4: "ok" while a plan waits approves; the non_task pass must not win first
+    assert run_golden.decide({**G["g44"], "message": "ok"}, classifier=None) == {"label": "steer", "note": "approve"}
+    assert run_golden.decide({**G["g44"], "message": "Ship it!"}, classifier=None) == {"label": "steer", "note": "approve"}
+    # idle: "ok" is still a plain pass-through steer
+    assert run_golden.decide({**G["g17"], "message": "ok"}, classifier=None) == {"label": "steer", "interrupt": False}
+
+
+def test_awaiting_approval_approval_never_calls_the_classifier():
+    calls = []
+    run_golden.decide(G["g44"], classifier=lambda p: calls.append(p))
+    assert calls == []
+
+
+def test_awaiting_approval_control_still_wins():
+    assert run_golden.decide({**G["g44"], "message": "queue: list"}, classifier=None) == {"label": "control", "interrupt": False}
+
+
+def test_awaiting_approval_model_revise_and_approve_notes():
+    seen = {}
+
+    def clf(p):
+        seen.update(p)
+        return dec(label="steer", note="revise plan")
+
+    assert run_golden.decide(G["g45"], classifier=clf) == {"label": "steer", "note": "revise plan"}
+    assert seen["state"] == "awaiting_approval" and seen["running_task"]["id"] == "p2"
+    assert run_golden.decide(G["g47"], classifier=lambda p: dec(label="steer", note="approve")) == {"label": "steer", "note": "approve"}
+    # an unsure or failed model answer is a bare steer, never an approval
+    assert run_golden.decide(G["g47"], classifier=lambda p: dec(label="steer", note="approve", confidence=0.5)) == {"label": "steer"}
+    assert run_golden.decide(G["g47"], classifier=lambda p: None) == {"label": "steer"}
+
+
+def test_g46_split_with_approve_part_scores_as_golden_parts():
+    d = classify.Decision(label="split", confidence=0.95, interrupt=False, parked=False, depends_on=[], target=None, note=None,
+                          parts=[classify.Part(label="steer", text="go", confidence=0.95, note="approve"),
+                                 classify.Part(label="queue", text="add logout", confidence=0.95, depends_on=["p2"])])
+    got = run_golden.decide(G["g46"], classifier=lambda p: d)
+    assert got == {"label": "split", "parts": [{"label": "steer", "note": "approve"},
+                                                {"label": "queue", "id": "p3", "depends_on": ["p2"], "parked": False, "interrupt": False}]}
+    assert run_golden.scoring.score_case(G["g46"], got) == (1.0, "ok")
+
+
+def test_run_case_counts_approval_as_rule_decided():
+    r = run_golden.run_case(G["g44"], rules_only=True, claude="claude", use_cache=False, cache_dir=Path("/nonexistent"))
+    assert r["score"] == 1.0 and r["rule_decided"] is True and r["by"] == "rule:approval"
+    summary = run_golden.summarise([run_golden.run_case(row, True, "claude", False, Path("/nonexistent")) for row in G.values()], True, True)
+    assert summary["rule_decided"] == 8 and summary["gate_pass"]
