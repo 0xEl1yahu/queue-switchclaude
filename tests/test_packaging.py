@@ -37,7 +37,7 @@ def test_plugin_manifest_declares_shadow():
 
 
 def test_command_file_present_and_wired():
-    text = Path("commands/queue.md").read_text()
+    text = (ROOT / "commands" / "queue.md").read_text()
     assert "queue_cli.py" in text and "allowed-tools: Bash(python3 *)" in text
 
 
