@@ -70,6 +70,15 @@ first in every state. ``_waiting`` then sorts the message:
 Every branch fails open: anything unresolved is ``steer`` and the message
 passes through untouched. The return value is the hook's JSON output, or
 ``None`` for pass-through.
+
+M4: a pass-through whose ``additionalContext`` tells Claude something the
+user should also know (an idle ``later:`` that starts now, an Esc that
+dropped or requeued tasks, a split's queued parts, an approval, a revise, a
+confirmation, a pause) carries a one-line ``systemMessage`` next to it,
+since the UI shows ``systemMessage`` but not ``additionalContext``
+(docs/m3-acceptance.md, observation 1). The context is never changed by it.
+An answer to the running task's question says nothing: there is nothing to
+say.
 """
 from __future__ import annotations
 
@@ -79,7 +88,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 from . import classify, control, dispatch, done, hookio, log, match, paths, rules, store, transcript
 
@@ -145,9 +154,35 @@ def _block(reason: str) -> dict:
     }
 
 
-def _context(text: str) -> dict:
-    """Pass the prompt through with ``additionalContext`` attached."""
-    return {"hookSpecificOutput": {"hookEventName": HOOK_EVENT, "additionalContext": text}}
+def _context(text: str, show: str | None = None) -> dict:
+    """Pass the prompt through with ``additionalContext`` attached.
+
+    ``show`` is a one-line ``systemMessage`` for the user (M4): the context
+    reaches the model but never the screen (docs/m3-acceptance.md,
+    observation 1), so a pass-through that changed the queue, or started
+    something the user did not ask to start now, says so next to the
+    context. The context itself is never altered by it (review focus 1).
+    """
+    out = {"hookSpecificOutput": {"hookEventName": HOOK_EVENT, "additionalContext": text}}
+    if show is not None:
+        out["systemMessage"] = show
+    return out
+
+
+def _show(*parts: str | None) -> str | None:
+    """One ``systemMessage`` line from the parts that are not empty, or None."""
+    kept = [p for p in parts if p]
+    if not kept:
+        return None
+    return f"{PREFIX}: " + "; ".join(kept)
+
+
+class Notice(NamedTuple):
+    """What an Esc reset tells the model (``context``, the full line) and the
+    user (``show``, the short form, without the prefix)."""
+
+    context: str
+    show: str
 
 
 def _write_atomic(path: Path, text: str) -> None:
@@ -189,17 +224,23 @@ def _write_pointer(session_id: str, cwd: object = None) -> None:
             pass
 
 
-def _esc_notice(dropped: list[store.Task]) -> str | None:
-    """The additionalContext line for an Esc-interrupted turn; None when nothing was queued."""
+def _esc_notice(dropped: list[store.Task]) -> Notice | None:
+    """The notice for an Esc-interrupted turn; None when nothing was queued."""
     if not dropped:
         return None
     listed = ", ".join(f"{t.id} ({t.text})" for t in dropped)
-    return f"{PREFIX}: the previous turn was interrupted, dropped queued tasks: {listed}"
+    return Notice(
+        f"{PREFIX}: the previous turn was interrupted, dropped queued tasks: {listed}",
+        "Esc dropped " + ", ".join(t.id for t in dropped),
+    )
 
 
-def _planning_notice(task_id: str) -> str:
-    """The additionalContext line for an Esc that cut a planning turn (M3)."""
-    return f"{PREFIX}: the planning turn for {task_id} was interrupted; it is queued again"
+def _planning_notice(task_id: str) -> Notice:
+    """The notice for an Esc that cut a planning turn (M3)."""
+    return Notice(
+        f"{PREFIX}: the planning turn for {task_id} was interrupted; it is queued again",
+        f"{task_id} is queued again",
+    )
 
 
 def _interrupt_planning(s: store.Store) -> str | None:
@@ -230,12 +271,16 @@ def _new_turn(
     *,
     text: str | None = None,
     marker_stripped: bool = False,
-    notice: str | None = None,
+    notice: Notice | None = None,
+    shadow: bool = False,
 ) -> dict | None:
     """Register a fresh turn: handle a missed Esc, then make the prompt the running task.
 
     ``text`` is the running task's text when it differs from the prompt (an
     idle ``later: x`` runs as ``x``); ``marker_stripped`` says so in the log.
+    An Esc notice rides on the prompt as context and, outside shadow mode,
+    as a ``systemMessage`` (in shadow the dropped tasks were never shown as
+    queued, so nothing on screen changes).
     """
     interrupted = None
     interrupted_planning = None
@@ -265,10 +310,10 @@ def _new_turn(
     )
     if notice is None:
         return None
-    return _context(notice)
+    return _context(notice.context, show=None if shadow else _show(notice.show))
 
 
-def _reset_turn_details(s: store.Store) -> tuple[str | None, str | None, list[store.Task], str | None]:
+def _reset_turn_details(s: store.Store) -> tuple[Notice | None, str | None, list[store.Task], str | None]:
     """A new prompt arrived while the store said running or planning: the
     user pressed Esc. Returns ``(notice, interrupted id, dropped tasks,
     interrupted planning id)`` and leaves the store idle.
@@ -302,7 +347,7 @@ def _reset_turn_details(s: store.Store) -> tuple[str | None, str | None, list[st
     return notice, interrupted, dropped, interrupted_planning
 
 
-def _reset_turn(s: store.Store) -> str | None:
+def _reset_turn(s: store.Store) -> Notice | None:
     """The Esc reset alone, for a marker typed right after Esc; logs it."""
     notice, interrupted, dropped, interrupted_planning = _reset_turn_details(s)
     _record(s.session_id, "intake", decision="esc_reset", interrupted=interrupted,
@@ -605,7 +650,7 @@ def _control(s: store.Store, v: rules.Verdict, prompt: str, prompt_id: str | Non
         text = dispatch.start(s, task)
         s.current_prompt_id = prompt_id
         s.interrupt = False
-        return _context(f"{PREFIX}: {reply}. {text}")
+        return _context(f"{PREFIX}: {reply}. {text}", show=_show(f"running {task.id}"))
     return _block(f"{PREFIX}: {reply}")
 
 
@@ -653,7 +698,7 @@ def _turn(
                              run_now=not _waiting_work(s), notice=notice)
             if out is not _UNHANDLED:
                 return out
-        return _new_turn(s, event, prompt, prompt_id, notice=notice)
+        return _new_turn(s, event, prompt, prompt_id, notice=notice, shadow=shadow)
 
     return _mid_turn(s, event, v, prompt, prompt_id, classifier, shadow)
 
@@ -684,8 +729,8 @@ def _is_marker(v: rules.Verdict) -> bool:
     return v.label == "interrupt" or v.rule in ("queue_marker", "parked_marker")
 
 
-def _with_notice(notice: str | None, text: str) -> str:
-    return f"{notice}; {text}" if notice else text
+def _with_notice(notice: Notice | None, text: str) -> str:
+    return f"{notice.context}; {text}" if notice else text
 
 
 def _idle_turn(
@@ -696,7 +741,7 @@ def _idle_turn(
     prompt_id: str | None,
     shadow: bool,
     run_now: bool = True,
-    notice: str | None = None,
+    notice: Notice | None = None,
 ) -> object:
     """A rule verdict at idle, where the markers mean something else than
     mid-turn. Returns the hook output, or ``_UNHANDLED`` for an ordinary
@@ -704,7 +749,8 @@ def _idle_turn(
 
     * ``later: x`` (``queue_marker``): there is nothing to run it after, so
       ``x`` starts now as the running task's text and the prompt passes
-      through with a context line saying so.
+      through with a context line saying so, and a ``systemMessage`` so the
+      user sees why their "later" started at once (M4).
     * ``maybe later x`` (``parked_marker``): parked and blocked; nothing
       runs until ``queue: promote``.
     * "stop" (``interrupt``): nothing is running, so it is answered and
@@ -721,7 +767,7 @@ def _idle_turn(
         _record(sid, "intake", decision="noop", state="idle", message=prompt, rule=v.rule,
                    rule_label=v.label, label="interrupt", shadow=shadow, prompt_id=prompt_id)
         if shadow:
-            return _new_turn(s, event, prompt, prompt_id, notice=notice)
+            return _new_turn(s, event, prompt, prompt_id, notice=notice, shadow=True)
         return _block(_with_notice(notice, f"{PREFIX}: nothing is running"))
 
     if v.label == "queue" and v.parked:
@@ -730,12 +776,12 @@ def _idle_turn(
                    message=prompt, rule=v.rule, rule_label=v.label, label="queue", parked=True,
                    shadow=shadow, prompt_id=prompt_id)
         if shadow:
-            return _new_turn(s, event, prompt, prompt_id, notice=notice)
+            return _new_turn(s, event, prompt, prompt_id, notice=notice, shadow=True)
         return _block(_with_notice(notice, f"{PREFIX}: {confirmation}"))
 
     if v.label == "queue":
         if shadow:
-            return _new_turn(s, event, prompt, prompt_id, notice=notice)
+            return _new_turn(s, event, prompt, prompt_id, notice=notice, shadow=True)
         if not run_now:
             # Work is waiting (paused queue, exhausted budget, a blocked
             # dependency): this belongs after it, not in front of it.
@@ -746,7 +792,10 @@ def _idle_turn(
             return _block(_with_notice(
                 notice, f"{PREFIX}: {confirmation} (nothing is running; send 'queue: list' to see why)"))
         _new_turn(s, event, prompt, prompt_id, text=v.text, marker_stripped=True)
-        return _context(_with_notice(notice, f"{PREFIX}: nothing is running, so this starts now: {v.text}"))
+        return _context(
+            _with_notice(notice, f"{PREFIX}: nothing is running, so this starts now: {v.text}"),
+            show=_show(notice.show if notice else None, f"nothing was queued, running now: {v.text}"),
+        )
 
     return _UNHANDLED
 
@@ -797,8 +846,9 @@ def _mid_turn(
     elif label == "pause":
         assert decision is not None
         confirmation, target_id = (None, None) if shadow else _pause(s, decision.target)
-        # The message still reaches Claude: it says what to do instead.
-        output = _context(f"{PREFIX}: {confirmation}") if confirmation else None
+        # The message still reaches Claude: it says what to do instead; the
+        # user sees that the task was paused.
+        output = _context(f"{PREFIX}: {confirmation}", show=_show(confirmation)) if confirmation else None
         label = "pause" if confirmation else "steer"
 
     elif label == "queue":
@@ -908,9 +958,11 @@ def _split(
     if shadow:
         return None, "split", target_id
     if steer_texts:
+        # The user sees the confirmations only; the steer text is their own.
         return _context(
             f"{PREFIX}: handled the rest of this message: {handled}; "
-            f"act only on: {' '.join(steer_texts)}"
+            f"act only on: {' '.join(steer_texts)}",
+            show=_show(handled),
         ), "split", target_id
     return _block(f"{PREFIX}: {handled}"), "split", target_id
 
@@ -1054,7 +1106,8 @@ def _approve(
     and its handover text on this message as ``additionalContext``.
 
     The message itself passes through, so the turn that executes the plan
-    is the user's own; its ``prompt_id`` becomes the current one.
+    is the user's own; its ``prompt_id`` becomes the current one. The user
+    sees ``running pN`` (and what else the message queued or amended).
     """
     text = dispatch.start(s, t)
     s.current_prompt_id = prompt_id
@@ -1063,7 +1116,7 @@ def _approve(
     _log_waiting(s, v, prompt, prompt_id, shadow, state="awaiting_approval", decision="approve",
                  label=label, task=t.id, classifier=classifier, latency_ms=latency_ms,
                  handled=list(confirmations or []))
-    return _context(text)
+    return _context(text, show=_show(f"running {t.id}", *(confirmations or [])))
 
 
 def _revise(
@@ -1094,7 +1147,7 @@ def _revise(
     _log_waiting(s, v, prompt, prompt_id, shadow, state="awaiting_approval", decision="revise",
                  label=label, task=t.id, classifier=classifier, latency_ms=latency_ms,
                  handled=list(confirmations or []))
-    return _context(text)
+    return _context(text, show=_show(f"revising the plan for {t.id}", *(confirmations or [])))
 
 
 def _defer(
@@ -1110,23 +1163,26 @@ def _defer(
     classifier: classify.Decision | None = None,
     latency_ms: int | None = None,
     context: str | None = None,
+    show: str | None = None,
 ) -> dict | None:
     """An unrelated message while a plan waits: a normal turn (review focus 1).
 
     The plan keeps its ``planned`` status and only loses the pending slot;
     dispatch finds it through ``_planned_ready`` after this turn and asks
     for approval again. It is never run unapproved and never lost.
+    ``context`` (and its on-screen ``show``) name what else a split message
+    carried.
     """
     _log_waiting(s, v, prompt, prompt_id, shadow, state="awaiting_approval", decision="defer_approval",
                  label=label, task=t.id, classifier=classifier, latency_ms=latency_ms)
     s.pending_task = None
-    out = _new_turn(s, event, prompt, prompt_id)
+    out = _new_turn(s, event, prompt, prompt_id, shadow=shadow)
     if context is None:
         return out
     # ``_new_turn`` attaches a notice only after an Esc, which needs state
     # ``running`` or ``planning``; here the state was ``awaiting_approval``,
     # so ``out`` is None.
-    return _context(context)
+    return _context(context, show=show)
 
 
 def _approval_state(
@@ -1233,7 +1289,8 @@ def _split_while_waiting(
             return None
         return _defer(s, event, v, t, prompt, prompt_id, shadow, **kw,
                       context=f"{PREFIX}: handled the rest of this message: {handled}; "
-                              f"act only on: {' '.join(steer_texts)}")
+                              f"act only on: {' '.join(steer_texts)}",
+                      show=_show(handled))
     return None if shadow else _block(f"{PREFIX}: {handled}")
 
 
@@ -1257,7 +1314,8 @@ def _confirm(
     Stop, and this message is the turn. The message passes through with the
     confirmation and the planning (or re-present) handover as context, so
     Claude both acts on it and plans what is next. With nothing to plan, the
-    message starts an ordinary turn that carries the confirmation.
+    message starts an ordinary turn that carries the confirmation. Either
+    way the user sees ``pN confirmed done``.
     """
     dispatch.write_handoff(s, t, done.Verdict("confirmed", "user confirmed"))
     s.state = "idle"
@@ -1269,9 +1327,9 @@ def _confirm(
     if text:
         s.current_prompt_id = prompt_id
         s.interrupt = False
-        return _context(f"{notice}. {text}")
-    _new_turn(s, event, prompt, prompt_id)
-    return _context(notice)
+        return _context(f"{notice}. {text}", show=notice)
+    _new_turn(s, event, prompt, prompt_id, shadow=shadow)
+    return _context(notice, show=notice)
 
 
 def _answer_state(

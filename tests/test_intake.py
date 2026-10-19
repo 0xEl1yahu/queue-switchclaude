@@ -978,3 +978,143 @@ def test_later_right_after_esc_runs_with_marker_stripped(data_dir):
     ctx = out["hookSpecificOutput"]["additionalContext"]
     assert "starts now: add goodbye.py" in ctx
     s = store.load("s1"); assert s.get("p1").status == "interrupted" and s.get("p2").text == "add goodbye.py" and s.get("p2").status == "running"
+
+
+# --- M4 Task 1: visible notices ----------------------------------------------
+
+def test_idle_run_now_shows_a_message(data_dir):
+    out = intake.handle(ev("later: add goodbye.py"))
+    assert out["systemMessage"] == "queue-switchclaude: nothing was queued, running now: add goodbye.py"
+    assert out["hookSpecificOutput"]["additionalContext"].endswith("starts now: add goodbye.py")   # review focus 1
+
+
+def test_esc_drop_shows_a_message(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: a")); intake.handle(ev("later: b"))
+    out = intake.handle(ev("something else", prompt_id="pid-2"))
+    assert out["systemMessage"] == "queue-switchclaude: Esc dropped p2, p3"
+
+
+def test_approval_shows_a_message(data_dir):
+    waiting()
+    assert intake.handle(ev("lgtm", prompt_id="pid-2"))["systemMessage"] == "queue-switchclaude: running p2"
+
+
+def test_split_shows_the_confirmations_only(data_dir):
+    intake.handle(ev("add a user model"))
+    d = dec(label="split", parts=[part(label="steer", text="use argon2 instead"), part(label="queue", text="add password reset", depends_on=["p1"])])
+    out = intake.handle(ev("use argon2 instead, and after that add password reset"), classifier=lambda p: d)
+    assert out["systemMessage"] == "queue-switchclaude: queued p2 after p1: add password reset"
+
+
+def test_answer_has_no_message(data_dir):
+    waiting("awaiting_answer")
+    with store.locked("s1") as s: s.get("p2").status = "running"
+    assert intake.handle(ev("use postgres", prompt_id="pid-2")) is None
+
+
+# --- additional Task 1 tests beyond the plan ---------------------------------
+
+def test_notices_keep_additional_context_byte_identical(data_dir):
+    # Review focus 1: the systemMessage sits next to the context, never inside it.
+    out = intake.handle(ev("later: add goodbye.py"))
+    assert out["hookSpecificOutput"] == {"hookEventName": "UserPromptSubmit",
+                                         "additionalContext": "queue-switchclaude: nothing is running, so this starts now: add goodbye.py"}
+    assert set(out) == {"hookSpecificOutput", "systemMessage"} and "\n" not in out["systemMessage"]
+
+
+def test_esc_drop_context_is_unchanged_by_the_message(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: a")); intake.handle(ev("later: b"))
+    out = intake.handle(ev("something else", prompt_id="pid-2"))
+    assert out["hookSpecificOutput"]["additionalContext"] == \
+        "queue-switchclaude: the previous turn was interrupted, dropped queued tasks: p2 (a), p3 (b)"
+
+
+def test_esc_with_nothing_queued_shows_nothing(data_dir):
+    intake.handle(ev("add a user model"))
+    assert intake.handle(ev("something else", prompt_id="pid-2")) is None
+
+
+def test_esc_during_planning_shows_a_message(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: add login"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.state = "planning"; s.pending_task = "p2"; s.running_task = None
+    out = intake.handle(ev("something else", prompt_id="pid-2"))
+    assert out["systemMessage"] == "queue-switchclaude: p2 is queued again"
+    assert out["hookSpecificOutput"]["additionalContext"] == "queue-switchclaude: the planning turn for p2 was interrupted; it is queued again"
+
+
+def test_esc_then_idle_later_shows_both_on_one_line(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: write tests"))
+    out = intake.handle(ev("later: add goodbye.py", prompt_id="pid-2"))
+    assert out["systemMessage"] == "queue-switchclaude: Esc dropped p2; nothing was queued, running now: add goodbye.py"
+    assert out["hookSpecificOutput"]["additionalContext"] == (
+        "queue-switchclaude: the previous turn was interrupted, dropped queued tasks: p2 (write tests); "
+        "queue-switchclaude: nothing is running, so this starts now: add goodbye.py")
+
+
+def test_control_approve_shows_running(data_dir):
+    waiting()
+    out = intake.handle(ev("queue: approve", prompt_id="pid-2"))
+    assert out["systemMessage"] == "queue-switchclaude: running p2" and "Execute the plan at" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_continue_approval_shows_running(data_dir):
+    waiting()
+    assert intake.handle(ev("continue", prompt_id="pid-2"))["systemMessage"] == "queue-switchclaude: running p2"
+
+
+def test_revise_shows_a_message(data_dir):
+    waiting()
+    out = intake.handle(ev("looks good but do the rate limiter before the endpoint", prompt_id="pid-2"), classifier=lambda p: dec(label="steer", note="revise plan"))
+    assert out["systemMessage"] == "queue-switchclaude: revising the plan for p2"
+    assert out["hookSpecificOutput"]["additionalContext"].startswith("queue-switchclaude: revise the plan at")
+
+
+def test_confirmation_shows_done_with_and_without_a_next_task(data_dir):
+    waiting("awaiting_answer")
+    with store.locked("s1") as s: s.get("p2").status = "running"
+    out = intake.handle(ev("ok", prompt_id="pid-2"))
+    assert out["systemMessage"] == "queue-switchclaude: p2 confirmed done"
+    waiting("awaiting_answer")
+    with store.locked("s1") as s:
+        s.get("p2").status = "running"; s.new_task("add logout", ["p2"], "pid-1")
+    out = intake.handle(ev("ok, merge", prompt_id="pid-3"))
+    assert out["systemMessage"] == "queue-switchclaude: p2 confirmed done"
+    assert "Write a short plan for" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_g46_approve_plus_queue_shows_both(data_dir):
+    waiting()
+    d = dec(label="split", parts=[part(label="steer", text="go", note="approve"), part(label="queue", text="add logout", depends_on=["p2"])])
+    out = intake.handle(ev("go, and once it's in add logout", prompt_id="pid-2"), classifier=lambda p: d)
+    assert out["systemMessage"] == "queue-switchclaude: running p2; queued p3 after p2: add logout"
+
+
+def test_split_while_waiting_with_steer_text_shows_the_confirmations(data_dir):
+    waiting()
+    d = dec(label="split", parts=[part(label="steer", text="what time zone is it"), part(label="queue", text="add logout", depends_on=["p2"])])
+    out = intake.handle(ev("what time zone is it, and add logout", prompt_id="pid-2"), classifier=lambda p: d)
+    assert out["systemMessage"] == "queue-switchclaude: queued p3 after p2: add logout"
+    assert out["hookSpecificOutput"]["additionalContext"].endswith("act only on: what time zone is it")
+
+
+def test_split_with_amend_and_steer_shows_the_confirmation(data_dir):
+    intake.handle(ev("add a user model")); intake.handle(ev("later: write tests for login"))
+    d = dec(label="split", parts=[part(label="steer", text="use argon2"), part(label="amend", text="skip the tests", target="p2", note="cancel")])
+    out = intake.handle(ev("use argon2, and skip the tests"), classifier=lambda p: d)
+    assert out["systemMessage"] == "queue-switchclaude: cancelled p2: write tests for login"
+
+
+def test_pause_pass_through_shows_the_confirmation(data_dir):
+    intake.handle(ev("refactor billing"))
+    out = intake.handle(ev("hold the refactor, something came up"), classifier=lambda p: dec(label="steer", note="pause", target="p1"))
+    assert out["systemMessage"] == "queue-switchclaude: paused p1 (send 'queue: resume p1' to run it again)"
+
+
+def test_shadow_pass_throughs_show_nothing(data_dir):
+    # Shadow mode changes nothing on screen: the Esc notice still reaches Claude
+    # as context (unchanged), but the dropped tasks were never shown as queued.
+    assert intake.handle(ev("later: add goodbye.py"), shadow=True) is None
+    intake.handle(ev("later: a"), shadow=True)
+    out = intake.handle(ev("something else", prompt_id="pid-2"), shadow=True)
+    assert "systemMessage" not in out and "dropped queued tasks: p2 (a)" in out["hookSpecificOutput"]["additionalContext"]
