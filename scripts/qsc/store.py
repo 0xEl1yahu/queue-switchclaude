@@ -128,6 +128,9 @@ class Store:
     # M3: sha1 of the last handover text dispatch issued. A Stop-hook
     # continuation whose handover hashes the same is a spin and is suppressed.
     last_handback: str | None = None
+    # M3: when dispatch ran session garbage collection (``qsc.gc``) on this
+    # session's behalf; None until it has. At most one run per session.
+    gc_at: str | None = None
     tasks: list[Task] = field(default_factory=list)
 
     def new_task(
