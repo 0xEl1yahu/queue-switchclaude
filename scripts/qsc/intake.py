@@ -93,7 +93,7 @@ import time
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
-from . import classify, control, dispatch, done, hookio, log, match, paths, rules, store, transcript
+from . import classify, control, dispatch, done, hookio, interrupt, log, match, paths, rules, store, transcript
 
 HOOK_EVENT = "UserPromptSubmit"
 PREFIX = "queue-switchclaude"
@@ -253,26 +253,6 @@ def _planning_notice(task_id: str) -> Notice:
     )
 
 
-def _interrupt_planning(s: store.Store) -> str | None:
-    """Esc during planning: give the task being planned back to the queue.
-
-    Returns the id of the task requeued, or ``None`` when nothing was really
-    being planned (no pending task, or one the user cancelled, parked or
-    dropped meanwhile: control works in every state, and ``_after_planning``
-    makes the same exception, so a cancelled task is never resurrected).
-    The half-written plan file goes with it; dispatch asks for a fresh plan
-    when a later Stop finds the task ready again.
-    """
-    task = s.get(s.pending_task) if s.pending_task else None
-    if task is None or task.status != "queued":
-        return None
-    task.status = "queued"
-    task.attempts = 0
-    with contextlib.suppress(OSError):
-        paths.plan_path(s.session_id, task.id).unlink()
-    return task.id
-
-
 def _new_turn(
     s: store.Store,
     event: dict,
@@ -328,33 +308,17 @@ def _reset_turn_details(s: store.Store) -> tuple[Notice | None, str | None, list
     user pressed Esc. Returns ``(notice, interrupted id, dropped tasks,
     interrupted planning id)`` and leaves the store idle.
 
-    Running: no Stop fired for the task that was running, so the turn was
-    cut by Esc (D5): the task is interrupted and queued tasks are dropped.
-    Planning: the user interrupted planning, not work, so D5's drop does not
-    apply; the task being planned rejoins the queue.
+    The reset itself is ``interrupt.reset_turn``, the one "stop" uses too:
+    running, the task is interrupted and queued tasks are dropped (D5);
+    planning, the task being planned rejoins the queue and nothing is
+    dropped; a plan waiting for approval is kept either way.
     """
-    notice = None
-    interrupted = None
-    interrupted_planning = None
-    dropped: list[store.Task] = []
-    if s.state == "running":
-        running = s.get(s.running_task) if s.running_task else None
-        if running is not None and running.status == "running":
-            running.status = "interrupted"
-            interrupted = running.id
-        dropped = [t for t in s.tasks if t.status in ("queued", SHADOW_QUEUED)]
-        for t in dropped:
-            t.status = "dropped"
-        notice = _esc_notice(dropped)
-    elif s.state == "planning":
-        interrupted_planning = _interrupt_planning(s)
-        if interrupted_planning is not None:
-            notice = _planning_notice(interrupted_planning)
-    s.state = "idle"
-    s.running_task = None
-    s.pending_task = None
-    s.interrupt = False
-    return notice, interrupted, dropped, interrupted_planning
+    reset = interrupt.reset_turn(s)
+    if reset.requeued is not None:
+        notice = _planning_notice(reset.requeued)
+    else:
+        notice = _esc_notice(reset.dropped)
+    return notice, reset.interrupted, reset.dropped, reset.requeued
 
 
 def _reset_turn(s: store.Store) -> Notice | None:

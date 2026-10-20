@@ -229,8 +229,7 @@ stateDiagram-v2
     queued --> paused: steer with note pause naming a queued task
     paused --> queued: queue resume pN or promote pN
     running --> interrupted: Esc detected on next prompt (D5), or stop at a tool call
-    queued --> dropped: Esc detected (D5), notice lists them
-    planned --> dropped: stop at a tool call, with the queued ones
+    queued --> dropped: Esc detected (D5) or stop at a tool call, notice lists them
     interrupted --> [*]
     dropped --> [*]
     queued --> cancelled: amend with note cancel (g16, g43), or queue cancel pN

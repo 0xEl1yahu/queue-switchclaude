@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import done, gc, hookio, log, paths, store
-from .interrupt import reset_after_interrupt
+from .interrupt import reset_turn
 
 PREFIX = "queue-switchclaude"
 
@@ -610,8 +610,9 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
             # The user asked to stop but no tool call came after the flag was
             # set; the turn is ending now, so apply the same reset and dispatch
             # nothing.
-            task_id, _dropped = reset_after_interrupt(s)
-            _record(session_id, "interrupt", task=task_id, via=event.get("hook_event_name"))
+            reset = reset_turn(s)
+            _record(session_id, "interrupt", task=reset.interrupted, dropped=[t.id for t in reset.dropped],
+                    requeued=reset.requeued, via=event.get("hook_event_name"))
             return None
 
         extra: dict | None = None
