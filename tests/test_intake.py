@@ -1225,3 +1225,36 @@ def test_idle_later_runs_after_a_cancel_unblocks_the_queue(data_dir):
         s.get("p1").status = "done"; s.state = "idle"; s.running_task = None
     intake.handle(ev("queue: cancel p2", prompt_id="pid-2"))
     s = store.load("s1"); assert [t.id for t in s.ready()] == ["p3"]
+
+
+# --- 2026-10-20 review fix 4: split ids are predicted from what the model saw --
+
+def test_split_remap_ignores_a_planned_task_the_payload_never_showed(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.new_task("add login", [], "pid-0").status = "planned"            # p2: deferred plan, not in the payload
+    seen = {}
+    def clf(payload):
+        seen["ids"] = [payload["running_task"]["id"]] + [q["id"] for q in payload["queue"]]
+        # The model numbers new parts after the highest id it can see (p1): p2, p3.
+        return dec(label="split", parts=[
+            part(label="queue", text="add an email field"),
+            part(label="queue", text="write tests for the email field", depends_on=["p2"]),
+        ])
+    out = intake.handle(ev("add an email field and then write tests for it"), classifier=clf)
+    assert seen["ids"] == ["p1"] and out["decision"] == "block"
+    s = store.load("s1")
+    assert s.get("p3").text == "add an email field" and s.get("p4").depends_on == ["p3"]
+
+
+def test_visible_ids_match_the_payload(data_dir):
+    s = store.Store("s1")
+    a = s.new_task("a", [], None); a.status = "running"; s.running_task = "p1"
+    s.new_task("b", [], None)
+    s.new_task("c", [], None).status = "failed_verify"
+    s.new_task("d", [], None, status="parked")
+    payload = intake._classifier_payload(s, {"transcript_path": None}, "x")
+    shown = [payload["running_task"]["id"]] + [q["id"] for q in payload["queue"]]
+    assert intake._next_visible_id(s) == max(int(i[1:]) for i in shown) + 1 == 5
+    s.get("p4").status = "done"
+    assert intake._next_visible_id(s) == 3

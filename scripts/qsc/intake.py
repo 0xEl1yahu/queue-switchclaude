@@ -329,15 +329,29 @@ def _reset_turn(s: store.Store) -> Notice | None:
     return notice
 
 
-def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
-    # While a plan or a question waits, the pending task is what the message
-    # is about (the prompt's context E shows it as ``running_task``).
+# Statuses the payload's ``queue`` shows the model.
+PAYLOAD_QUEUE_STATUSES = ("queued", "parked", "paused")
+
+
+def _payload_tasks(s: store.Store) -> tuple[store.Task | None, list[store.Task]]:
+    """The tasks the payload shows as ``running_task`` and ``queue``.
+
+    While a plan or a question waits, the pending task is what the message
+    is about (the prompt's context E shows it as ``running_task``). The
+    prompt numbers new split parts after the highest id in these two, so
+    ``_next_visible_id`` reads the same set.
+    """
     current = s.running_task or s.pending_task
     running = s.get(current) if current else None
+    return running, [t for t in s.tasks if t.status in PAYLOAD_QUEUE_STATUSES]
+
+
+def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
+    running, queued = _payload_tasks(s)
     running_dict = {"id": running.id, "text": running.text} if running else None
     queue = [
         {"id": t.id, "text": t.text, "status": t.status, "depends_on": list(t.depends_on)}
-        for t in s.tasks if t.status in ("queued", "parked", "paused")
+        for t in queued
     ]
     recent = transcript.recent(event.get("transcript_path"))
     return classify.payload(
@@ -568,12 +582,15 @@ def _next_visible_id(s: store.Store) -> int:
     """The number of the first id the model will assign to a new split part.
 
     The prompt tells the model that new tasks are numbered after the highest
-    id it can see, and the payload shows it only the live tasks
-    (``s.candidates()``). The store may hold newer ids it was never shown
-    (cancelled, dropped, done, interrupted), so the model's prediction and
-    ``s.next_id`` can differ; ``_split`` maps one onto the other.
+    id visible in ``running_task`` and ``queue``, and those are exactly
+    ``_payload_tasks``. The store may hold newer ids it was never shown
+    (planned, failed_verify, cancelled, dropped, done, interrupted), so the
+    model's prediction and ``s.next_id`` can differ; ``_split`` maps one onto
+    the other.
     """
-    return max([_id_number(t.id) for t in s.candidates()] + [0]) + 1
+    running, queued = _payload_tasks(s)
+    shown = queued + ([running] if running is not None else [])
+    return max([_id_number(t.id) for t in shown] + [0]) + 1
 
 
 def _part_label(p: classify.Part) -> str:
