@@ -1171,3 +1171,198 @@ def test_shadow_compare_still_inline_in_shadow_mode(data_dir, monkeypatch):
     assert spawned == []
     row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
     assert row["rule_label"] == "queue" and row["classifier"]["label"] == "steer"
+
+
+# --- 2026-10-20 review fix 1: stuck dependants ---------------------------------
+
+def test_model_depends_on_an_unknown_id_is_filtered_out(data_dir):
+    intake.handle(ev("add a user model"))
+    out = intake.handle(ev("add password reset as well"), classifier=lambda p: dec(label="queue", depends_on=["p9"]))
+    assert out["decision"] == "block"
+    # p9 does not exist: the dependency falls back to the chain rule (after the running task).
+    assert store.load("s1").get("p2").depends_on == ["p1"]
+
+
+def test_model_depends_on_a_cancelled_task_is_resolved(data_dir):
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("later: email verification"))
+    intake.handle(ev("queue: cancel p2"))
+    intake.handle(ev("add password reset as well"), classifier=lambda p: dec(label="queue", depends_on=["p2", "p1"]))
+    assert store.load("s1").get("p3").depends_on == ["p1"]
+
+
+def test_model_depends_on_is_filtered_while_a_plan_waits(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"
+        b = s.new_task("add login", ["p1"], "pid-1"); b.status = "planned"
+        s.state = "awaiting_approval"; s.pending_task = "p2"; s.running_task = None
+    out = intake.handle(ev("add a logout button too", prompt_id="pid-2"),
+                        classifier=lambda p: dec(label="queue", depends_on=["p2", "p7"]))
+    assert out["decision"] == "block" and store.load("s1").get("p3").depends_on == ["p2"]
+
+
+def test_amend_rewire_to_unknown_ids_keeps_only_known_ones(data_dir):
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("later: email verification"))
+    out = intake.handle(ev("make the email one wait for nothing in particular"),
+                        classifier=lambda p: dec(label="amend", target="p2", depends_on=["p1", "p8"]))
+    assert store.load("s1").get("p2").depends_on == ["p1"]
+
+
+def test_amend_cancel_rewires_dependants_and_says_so(data_dir):
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("later: email verification"))
+    intake.handle(ev("later: password reset"))
+    out = intake.handle(ev("forget the email verification"),
+                        classifier=lambda p: dec(label="amend", target="p2", note="cancel"))
+    assert out["decision"] == "block" and "cancelled p2" in out["reason"] and "p3 now after p1" in out["reason"]
+    s = store.load("s1"); assert s.get("p3").depends_on == ["p1"]
+
+
+def test_idle_later_runs_after_a_cancel_unblocks_the_queue(data_dir):
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("later: email verification"))
+    intake.handle(ev("later: password reset"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.state = "idle"; s.running_task = None
+    intake.handle(ev("queue: cancel p2", prompt_id="pid-2"))
+    s = store.load("s1"); assert [t.id for t in s.ready()] == ["p3"]
+
+
+# --- 2026-10-20 review fix 4: split ids are predicted from what the model saw --
+
+def test_split_remap_ignores_a_planned_task_the_payload_never_showed(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.new_task("add login", [], "pid-0").status = "planned"            # p2: deferred plan, not in the payload
+    seen = {}
+    def clf(payload):
+        seen["ids"] = [payload["running_task"]["id"]] + [q["id"] for q in payload["queue"]]
+        # The model numbers new parts after the highest id it can see (p1): p2, p3.
+        return dec(label="split", parts=[
+            part(label="queue", text="add an email field"),
+            part(label="queue", text="write tests for the email field", depends_on=["p2"]),
+        ])
+    out = intake.handle(ev("add an email field and then write tests for it"), classifier=clf)
+    assert seen["ids"] == ["p1"] and out["decision"] == "block"
+    s = store.load("s1")
+    assert s.get("p3").text == "add an email field" and s.get("p4").depends_on == ["p3"]
+
+
+def test_visible_ids_match_the_payload(data_dir):
+    s = store.Store("s1")
+    a = s.new_task("a", [], None); a.status = "running"; s.running_task = "p1"
+    s.new_task("b", [], None)
+    s.new_task("c", [], None).status = "failed_verify"
+    s.new_task("d", [], None, status="parked")
+    payload = intake._classifier_payload(s, {"transcript_path": None}, "x")
+    shown = [payload["running_task"]["id"]] + [q["id"] for q in payload["queue"]]
+    assert intake._next_visible_id(s) == max(int(i[1:]) for i in shown) + 1 == 5
+    s.get("p4").status = "done"
+    assert intake._next_visible_id(s) == 3
+
+
+# --- 2026-10-20 review fix 2: the classifier runs without the store lock ------
+
+import fcntl  # noqa: E402
+
+
+def _lock_is_free(sid="s1"):
+    lock = paths.store_path(sid).with_name(paths.store_path(sid).name + ".lock")
+    with open(lock, "a+") as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return True
+
+
+def test_mid_turn_classifier_runs_without_the_lock(data_dir):
+    intake.handle(ev("add a user model"))
+    free = []
+    def clf(payload):
+        free.append(_lock_is_free()); return dec(label="queue")
+    out = intake.handle(ev("add password reset as well"), classifier=clf)
+    assert free == [True] and out["decision"] == "block" and store.load("s1").get("p2").status == "queued"
+
+
+def test_approval_classifier_runs_without_the_lock(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"
+        b = s.new_task("add login", ["p1"], "pid-1"); b.status = "planned"
+        s.state = "awaiting_approval"; s.pending_task = "p2"; s.running_task = None
+    free = []
+    def clf(payload):
+        free.append(_lock_is_free()); return dec(label="steer", note="approve")
+    out = intake.handle(ev("sounds right, go ahead with it", prompt_id="pid-2"), classifier=clf)
+    assert free == [True] and "Execute the plan" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_shadow_compare_classifier_runs_without_the_lock(data_dir, monkeypatch):
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", "1")
+    intake.handle(ev("add a user model"), shadow=True)
+    free = []
+    def clf(payload):
+        free.append(_lock_is_free()); return dec(label="queue")
+    intake.handle(ev("later: email verification"), classifier=clf, shadow=True)
+    assert free == [True]
+
+
+def _write_if_free(sid="s1"):
+    """``store.locked`` only when nobody holds the lock: the test fails
+    instead of deadlocking when intake classifies under the lock."""
+    assert _lock_is_free(sid), "intake holds the store lock during classification"
+    return store.locked(sid)
+
+
+def test_a_store_write_during_classification_is_not_lost(data_dir):
+    intake.handle(ev("add a user model"))
+    def clf(payload):
+        with _write_if_free() as s:        # another hook (interrupt, dispatch, /queue) writes meanwhile
+            s.paused = True
+        return dec(label="queue")
+    intake.handle(ev("add password reset as well"), classifier=clf)
+    s = store.load("s1"); assert s.paused is True and s.get("p2").status == "queued"
+
+
+def test_a_state_change_during_classification_asks_again(data_dir):
+    intake.handle(ev("add a user model"))
+    calls = []
+    def clf(payload):
+        calls.append(payload["state"])
+        if len(calls) == 1:
+            with _write_if_free() as s:      # a Stop moved the turn on: p1 done, p2 being planned
+                s.get("p1").status = "done"; s.new_task("b", ["p1"], "pid-1")
+                s.state = "planning"; s.pending_task = "p2"; s.running_task = None
+        return dec(label="queue")
+    out = intake.handle(ev("add password reset as well"), classifier=clf)
+    assert calls == ["running", "planning"] and out["decision"] == "block"
+    assert store.load("s1").get("p3").depends_on == ["p2"]
+
+
+def test_a_store_that_keeps_moving_fails_open(data_dir):
+    intake.handle(ev("add a user model"))
+    calls = []
+    def clf(payload):
+        calls.append(1)
+        with _write_if_free() as s:
+            s.current_prompt_id = s.current_prompt_id + "x"   # never the same twice; no longer mid-turn either
+        return dec(label="queue")
+    intake.handle(ev("add password reset as well", prompt_id="pid-1"), classifier=clf)
+    assert len(calls) == 1          # the turn moved on: the message is a new turn, no second classification
+
+
+def test_classifier_retry_is_bounded(data_dir):
+    intake.handle(ev("add a user model"))
+    calls = []
+    def clf(payload):
+        calls.append(1)
+        with _write_if_free() as s:
+            s.running_task = None if s.running_task else "p1"  # flips every call; state stays mid-turn
+        return dec(label="queue")
+    out = intake.handle(ev("add password reset as well"), classifier=clf)
+    assert len(calls) == 2 and out is None                      # fail open: steer, passes through
+    s = store.load("s1"); assert len(s.tasks) == 1
