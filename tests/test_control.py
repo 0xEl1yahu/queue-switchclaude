@@ -278,3 +278,24 @@ def test_help_names_every_control_word_as_a_whole_word_on_one_line():
         assert re.search(rf"(^|[ |]){w}( |$)", text), w
     assert "resume [pN]" in text and "show pN" in text
     assert set(rules.CONTROL_WORDS) == set(control.COMMANDS)
+
+
+# --- 2026-10-20 review: cancel and drop rewire dependants and say so ---------
+
+def test_cancel_reply_names_the_rewired_dependant():
+    s = store.Store("s1")
+    a = s.new_task("a", [], None); a.status = "running"; s.running_task = "p1"
+    s.new_task("b", ["p1"], None); s.new_task("c", ["p2"], None)
+    out = control.run(s, "cancel p2")
+    assert out.startswith("cancelled p2") and "p3 now after p1" in out and "\n" not in out
+    assert s.get("p3").depends_on == ["p1"]
+
+
+def test_drop_rewires_a_planned_task_waiting_on_a_dropped_one():
+    s = store.Store("s1")
+    a = s.new_task("a", [], None); a.status = "done"
+    s.new_task("b", ["p1"], None)
+    c = s.new_task("c", ["p2"], None); c.status = "planned"
+    out = control.run(s, "drop")
+    assert "dropped 1 task: p2" in out and "p3 now after p1" in out
+    assert s.get("p3").depends_on == ["p1"]

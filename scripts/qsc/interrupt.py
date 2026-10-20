@@ -2,9 +2,9 @@
 
 Intake sets ``Store.interrupt`` when the user says "stop" mid-turn. The
 next tool boundary is the first place the turn can be ended, so this
-handler runs on every tool call: when the flag is set it clears it, marks
-the running task ``interrupted`` and ends the turn with ``continue: false``.
-The Stop hook does not fire after that.
+handler runs on every tool call: when the flag is set it resets the turn
+(``reset_turn``, the same reset intake applies after Esc) and ends it with
+``continue: false``. The Stop hook does not fire after that.
 
 Registered on ``PreToolUse`` only (M3, decision D6): a ``PostToolUse``
 boundary is always followed by the next ``PreToolUse`` or by ``Stop``, and
@@ -16,8 +16,12 @@ that turn is already waiting on the user.
 """
 from __future__ import annotations
 
-from . import log, store
+import contextlib
+from typing import NamedTuple
 
+from . import hookio, log, paths, store
+
+SHADOW_QUEUED = "shadow_queued"
 STOP_REASON = "queue-switchclaude: stopped as requested"
 HOOK_EVENT = "PreToolUse"
 
@@ -27,34 +31,73 @@ HOOK_EVENT = "PreToolUse"
 SKIP_TOOLS = frozenset({"AskUserQuestion"})
 
 
-def reset_after_interrupt(s: store.Store) -> tuple[str | None, list[store.Task]]:
-    """Clear the flag and put the store back to idle.
+class Reset(NamedTuple):
+    """What ``reset_turn`` did: the task it interrupted, the tasks it
+    dropped, the task it put back in the queue, and the tasks it rewired
+    past the ones it interrupted or dropped."""
 
-    Returns the interrupted task id and the queued tasks that were dropped.
-    An explicit "stop" is the user's Esc, so decision D5 applies: queued and
-    ready tasks are dropped rather than left stranded behind an interrupted
-    dependency; parked and done items survive. Shared with dispatch, which
-    can see the flag when the turn ended without another tool call.
+    interrupted: str | None
+    dropped: list[store.Task]
+    requeued: str | None
+    rewired: list[store.Task]
+
+
+def reset_turn(s: store.Store) -> Reset:
+    """Cut the current turn short and leave the store idle.
+
+    The one reset for both ways a user ends a turn: "stop" (the interrupt
+    flag, honoured here at the next tool call or by dispatch at Stop) and
+    Esc (intake sees a new ``prompt_id`` while the store still says
+    ``running`` or ``planning``). By state:
+
+    * ``running``: the running task becomes ``interrupted`` (a paused one
+      stays paused) and every ``queued`` and ``shadow_queued`` task is
+      ``dropped`` rather than left behind the interrupted work (D5).
+    * ``planning``: the user cut planning, not work, so nothing is dropped;
+      the task being planned goes back to ``queued`` with its half-written
+      plan file deleted, and dispatch plans it afresh later. A pending task
+      the user cancelled, parked or dropped meanwhile is left as it is.
+
+    Either way a ``planned`` task (a plan waiting for approval that an
+    unrelated turn deferred) keeps its status and its plan, and dispatch
+    presents it again; ``parked``, ``paused``, ``failed_verify`` and ``done``
+    tasks are untouched. Tasks that depended on the interrupted or dropped
+    ones are rewired past them (``Store.rewire``). The flag is cleared and
+    the running and pending slots are emptied.
     """
-    task_id = s.running_task
-    task = s.get(task_id) if task_id else None
-    if task is not None:
-        task.status = "interrupted"
-    dropped = [t for t in s.tasks if t.status in ("queued", "planned")]
-    for t in dropped:
-        t.status = "dropped"
+    interrupted = None
+    requeued = None
+    dropped: list[store.Task] = []
+    if s.state == "planning":
+        task = s.get(s.pending_task) if s.pending_task else None
+        if task is not None and task.status == "queued":
+            task.attempts = 0
+            with contextlib.suppress(OSError):
+                paths.plan_path(s.session_id, task.id).unlink()
+            requeued = task.id
+    elif s.state == "running" or s.running_task:
+        task = s.get(s.running_task) if s.running_task else None
+        if task is not None and task.status == "running":
+            task.status = "interrupted"
+            interrupted = task.id
+        dropped = [t for t in s.tasks if t.status in ("queued", SHADOW_QUEUED)]
+        for t in dropped:
+            t.status = "dropped"
+    rewired = s.rewire()
     s.interrupt = False
     s.state = "idle"
     s.running_task = None
-    s.pending_task = None  # a task being planned or awaiting approval is dropped above
-    return task_id, dropped
+    s.pending_task = None
+    return Reset(interrupted, dropped, requeued, rewired)
 
 
-def stop_reason(dropped: list[store.Task]) -> str:
-    if not dropped:
-        return STOP_REASON
-    listed = ", ".join(f"{t.id} ({t.text})" for t in dropped)
-    return f"{STOP_REASON}; dropped queued tasks: {listed}"
+def stop_reason(reset: Reset) -> str:
+    parts = [STOP_REASON]
+    if reset.dropped:
+        parts.append("dropped queued tasks: " + ", ".join(f"{t.id} ({t.text})" for t in reset.dropped))
+    if reset.requeued:
+        parts.append(f"{reset.requeued} is queued again")
+    return "; ".join(parts)
 
 
 def handle(event: dict) -> dict | None:
@@ -76,7 +119,8 @@ def handle(event: dict) -> dict | None:
     with store.locked(session_id) as s:
         if not s.interrupt:
             return None
-        task_id, dropped = reset_after_interrupt(s)
-    log.record(session_id, "interrupt", task=task_id, dropped=[t.id for t in dropped],
+        reset = reset_turn(s)
+    log.record(session_id, "interrupt", hook_ms=hookio.hook_ms(event), task=reset.interrupted, dropped=[t.id for t in reset.dropped],
+               requeued=reset.requeued, rewired=[t.id for t in reset.rewired],
                via=event.get("hook_event_name"))
-    return {"continue": False, "stopReason": stop_reason(dropped)}
+    return {"continue": False, "stopReason": stop_reason(reset)}

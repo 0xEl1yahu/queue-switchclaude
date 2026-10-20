@@ -373,3 +373,46 @@ def test_ready_excludes_planned_and_failed_verify(data_dir):
 def test_task_kind_defaults_and_survives_roundtrip(data_dir):
     s = store.load("s1"); s.new_task("typed", [], None, kind="prompt"); s.new_task("queued", [], None); store.save(s)
     s = store.load("s1"); assert s.get("p1").kind == "prompt" and s.get("p2").kind == "task" and s.continuations == 0
+
+
+# --- 2026-10-20 review: a cancelled or dropped dependency never strands its dependants ---
+
+def test_cancel_rewires_dependants_to_the_cancelled_tasks_own_deps(data_dir):
+    s = store.load("s1")
+    a = s.new_task("a", [], None); s.new_task("b", ["p1"], None); s.new_task("c", ["p2"], None)
+    s.cancel("p2")
+    assert s.get("p3").depends_on == ["p1"] and s.get("p2").depends_on == ["p1"]
+    a.status = "done"
+    assert [t.id for t in s.ready()] == ["p3"]
+
+
+def test_cancel_rewires_planned_and_parked_dependants(data_dir):
+    s = store.load("s1")
+    s.new_task("a", [], None)
+    b = s.new_task("b", ["p1"], None); b.status = "planned"
+    s.new_task("c", ["p1"], None, status="parked")
+    s.cancel("p1")
+    assert s.get("p2").depends_on == [] and s.get("p3").depends_on == []
+
+
+def test_dependants_lists_live_tasks_waiting_on_any_of_the_ids(data_dir):
+    s = store.load("s1")
+    s.new_task("a", [], None); s.new_task("b", ["p1"], None); c = s.new_task("c", ["p1"], None); c.status = "done"
+    s.new_task("d", ["p2"], None)
+    assert [t.id for t in s.dependants(["p1"])] == ["p2"]
+    assert [t.id for t in s.dependants(["p1", "p2"])] == ["p4"]
+
+
+def test_live_deps_drops_unknown_ids_and_resolves_dead_ones(data_dir):
+    s = store.load("s1")
+    s.new_task("a", [], None); b = s.new_task("b", ["p1"], None); b.status = "dropped"
+    c = s.new_task("c", ["p2"], None); c.status = "interrupted"
+    assert s.live_deps(["p9", "p3", "p1"]) == ["p1"]
+    assert s.live_deps([]) == []
+
+
+def test_live_deps_survives_a_cycle_of_dead_tasks(data_dir):
+    s = store.load("s1")
+    a = s.new_task("a", ["p2"], None); b = s.new_task("b", ["p1"], None)
+    a.status = "cancelled"; b.status = "cancelled"
+    assert s.live_deps(["p1"]) == []

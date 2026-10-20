@@ -637,3 +637,68 @@ def test_verify_failed_handback_without_output_has_no_tail(data_dir):
         a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "exit 1"; s.running_task = "p1"; s.state = "running"
     ctx = dispatch.handle(stop())["hookSpecificOutput"]["additionalContext"]
     assert ctx == "queue-switchclaude: task p1 failed its verify command (exit 1). Fix it, then stop."
+
+
+# --- 2026-10-20 review fix 1: a failed_verify task names what waits on it -------
+
+def test_failed_verify_message_names_the_blocked_dependants(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "false"; a.attempts = dispatch.MAX_ATTEMPTS
+        s.running_task = "p1"; s.state = "running"
+        s.new_task("b", ["p1"], "pid")
+    out = dispatch.handle(stop())
+    assert "failed_verify" in out["systemMessage"] and "p2 waits on it" in out["systemMessage"]
+
+
+# --- 2026-10-20 review fix 6: retry handbacks respect the continuation budget ---
+
+def _running_at_budget(s, verify=None):
+    t = s.new_task("a", [], "pid"); t.status = "running"; t.verify = verify
+    s.running_task = "p1"; s.state = "running"; s.continuations = dispatch.MAX_CONTINUATIONS - 1
+
+
+def test_verify_failed_handback_is_withheld_when_the_budget_is_spent(data_dir):
+    with store.locked("s1") as s:
+        _running_at_budget(s, verify="false")
+    out = dispatch.handle(stop(active=True))
+    assert "hookSpecificOutput" not in out and "paused the automatic chain" in out["systemMessage"]
+    assert "p1 failed its verify command" in out["systemMessage"]
+    s = store.load("s1")
+    assert s.state == "awaiting_answer" and s.pending_task == "p1" and s.get("p1").status == "running"
+    assert s.get("p1").attempts == 0 and s.running_task is None
+
+
+def test_not_done_handback_is_withheld_when_the_budget_is_spent(data_dir, monkeypatch):
+    monkeypatch.setattr(done, "judge", judge_as("not_done"))
+    with store.locked("s1") as s:
+        _running_at_budget(s)
+    out = dispatch.handle(stop(active=True))
+    assert "hookSpecificOutput" not in out and "p1 does not look finished" in out["systemMessage"]
+    s = store.load("s1"); assert s.state == "awaiting_answer" and s.get("p1").attempts == 0
+
+
+def test_a_message_after_a_withheld_handback_resumes_the_task(data_dir, monkeypatch):
+    from qsc import intake
+    monkeypatch.setattr(done, "judge", judge_as("not_done"))
+    with store.locked("s1") as s:
+        _running_at_budget(s)
+    dispatch.handle(stop(active=True))
+    intake.handle({"hook_event_name": "UserPromptSubmit", "session_id": "s1", "prompt_id": "pid-2",
+                   "prompt": "please carry on with it", "transcript_path": None})
+    s = store.load("s1"); assert s.state == "running" and s.running_task == "p1" and s.current_prompt_id == "pid-2"
+
+
+def test_planning_retry_is_withheld_when_the_budget_is_spent(data_dir):
+    with store.locked("s1") as s:
+        s.new_task("b", [], "pid"); s.state = "planning"; s.pending_task = "p1"
+        s.continuations = dispatch.MAX_CONTINUATIONS - 1
+    out = dispatch.handle(stop(active=True))           # no plan file, budget spent: no retry
+    assert "hookSpecificOutput" not in out and "paused the automatic chain" in out["systemMessage"]
+    s = store.load("s1"); assert s.get("p1").status == "queued" and s.state == "idle" and s.pending_task is None
+
+
+def test_handbacks_under_the_budget_are_unchanged(data_dir):
+    with store.locked("s1") as s:
+        _running_at_budget(s, verify="false"); s.continuations = dispatch.MAX_CONTINUATIONS - 2
+    out = dispatch.handle(stop(active=True))
+    assert "failed its verify command" in out["hookSpecificOutput"]["additionalContext"]

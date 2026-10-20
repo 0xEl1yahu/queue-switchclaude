@@ -67,6 +67,14 @@ first in every state. ``_waiting`` then sorts the message:
   else is the answer, the task resumes ``running`` and the message passes
   through untouched, since Claude asked the question.
 
+The classifier never runs under the store lock (2026-10-20 review): the
+locked pass stops where it needs the model, the lock is released for the
+call, and the pass runs again on a fresh load. The answer is used only if
+the state, ``current_prompt_id``, running and pending task are unchanged;
+otherwise the model is asked once more, and a store that moved again fails
+open. Writes other hooks made meanwhile are kept, since the second pass
+starts from the file they saved.
+
 Every branch fails open: anything unresolved is ``steer`` and the message
 passes through untouched. The return value is the hook's JSON output, or
 ``None`` for pass-through.
@@ -93,7 +101,7 @@ import time
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
-from . import classify, control, dispatch, done, hookio, log, match, paths, procs, rules, store, transcript
+from . import classify, control, dispatch, done, hookio, interrupt, log, match, paths, procs, rules, store, transcript
 
 HOOK_EVENT = "UserPromptSubmit"
 PREFIX = "queue-switchclaude"
@@ -117,6 +125,13 @@ DEDUPE_FINISHED_STATUSES = ("done", "shadow_dispatched")
 DEDUPE_MARKER_RULES = ("queue_marker", "parked_marker")
 
 Classifier = Callable[[dict], Optional[classify.Decision]]
+# What the locked pass calls instead of the classifier: ``ask(payload,
+# swallow=False) -> (decision, latency_ms)`` (``_asker``).
+Ask = Callable[..., tuple[Optional[classify.Decision], Optional[int]]]
+
+# Classifier calls one message may cost when the store keeps changing
+# underneath it; after that the message fails open as steer.
+MAX_CLASSIFY_CALLS = 2
 
 # Store states in which the user's message is sorted by ``_waiting`` first.
 WAITING_STATES = ("awaiting_approval", "awaiting_answer")
@@ -234,6 +249,22 @@ def _write_pointer(session_id: str, cwd: object = None) -> None:
             pass
 
 
+def _write_last_prompt(session_id: str, prompt_id: object) -> None:
+    """Record ``prompt_id`` at ``paths.last_prompt_path``, best effort.
+
+    ``queue_cli.py approve`` reads it to make the turn it runs in the
+    current one, as ``_control`` does with the prompt it has. A slash
+    command passes through here without touching the store, so this file
+    is the only trace of its ``prompt_id``.
+    """
+    if not isinstance(prompt_id, str) or not prompt_id:
+        return
+    try:
+        _write_atomic(paths.last_prompt_path(session_id), prompt_id + "\n")
+    except Exception:
+        pass
+
+
 def _esc_notice(dropped: list[store.Task]) -> Notice | None:
     """The notice for an Esc-interrupted turn; None when nothing was queued."""
     if not dropped:
@@ -251,26 +282,6 @@ def _planning_notice(task_id: str) -> Notice:
         f"{PREFIX}: the planning turn for {task_id} was interrupted; it is queued again",
         f"{task_id} is queued again",
     )
-
-
-def _interrupt_planning(s: store.Store) -> str | None:
-    """Esc during planning: give the task being planned back to the queue.
-
-    Returns the id of the task requeued, or ``None`` when nothing was really
-    being planned (no pending task, or one the user cancelled, parked or
-    dropped meanwhile: control works in every state, and ``_after_planning``
-    makes the same exception, so a cancelled task is never resurrected).
-    The half-written plan file goes with it; dispatch asks for a fresh plan
-    when a later Stop finds the task ready again.
-    """
-    task = s.get(s.pending_task) if s.pending_task else None
-    if task is None or task.status != "queued":
-        return None
-    task.status = "queued"
-    task.attempts = 0
-    with contextlib.suppress(OSError):
-        paths.plan_path(s.session_id, task.id).unlink()
-    return task.id
 
 
 def _new_turn(
@@ -328,33 +339,17 @@ def _reset_turn_details(s: store.Store) -> tuple[Notice | None, str | None, list
     user pressed Esc. Returns ``(notice, interrupted id, dropped tasks,
     interrupted planning id)`` and leaves the store idle.
 
-    Running: no Stop fired for the task that was running, so the turn was
-    cut by Esc (D5): the task is interrupted and queued tasks are dropped.
-    Planning: the user interrupted planning, not work, so D5's drop does not
-    apply; the task being planned rejoins the queue.
+    The reset itself is ``interrupt.reset_turn``, the one "stop" uses too:
+    running, the task is interrupted and queued tasks are dropped (D5);
+    planning, the task being planned rejoins the queue and nothing is
+    dropped; a plan waiting for approval is kept either way.
     """
-    notice = None
-    interrupted = None
-    interrupted_planning = None
-    dropped: list[store.Task] = []
-    if s.state == "running":
-        running = s.get(s.running_task) if s.running_task else None
-        if running is not None and running.status == "running":
-            running.status = "interrupted"
-            interrupted = running.id
-        dropped = [t for t in s.tasks if t.status in ("queued", SHADOW_QUEUED)]
-        for t in dropped:
-            t.status = "dropped"
-        notice = _esc_notice(dropped)
-    elif s.state == "planning":
-        interrupted_planning = _interrupt_planning(s)
-        if interrupted_planning is not None:
-            notice = _planning_notice(interrupted_planning)
-    s.state = "idle"
-    s.running_task = None
-    s.pending_task = None
-    s.interrupt = False
-    return notice, interrupted, dropped, interrupted_planning
+    reset = interrupt.reset_turn(s)
+    if reset.requeued is not None:
+        notice = _planning_notice(reset.requeued)
+    else:
+        notice = _esc_notice(reset.dropped)
+    return notice, reset.interrupted, reset.dropped, reset.requeued
 
 
 def _reset_turn(s: store.Store) -> Notice | None:
@@ -365,15 +360,29 @@ def _reset_turn(s: store.Store) -> Notice | None:
     return notice
 
 
-def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
-    # While a plan or a question waits, the pending task is what the message
-    # is about (the prompt's context E shows it as ``running_task``).
+# Statuses the payload's ``queue`` shows the model.
+PAYLOAD_QUEUE_STATUSES = ("queued", "parked", "paused")
+
+
+def _payload_tasks(s: store.Store) -> tuple[store.Task | None, list[store.Task]]:
+    """The tasks the payload shows as ``running_task`` and ``queue``.
+
+    While a plan or a question waits, the pending task is what the message
+    is about (the prompt's context E shows it as ``running_task``). The
+    prompt numbers new split parts after the highest id in these two, so
+    ``_next_visible_id`` reads the same set.
+    """
     current = s.running_task or s.pending_task
     running = s.get(current) if current else None
+    return running, [t for t in s.tasks if t.status in PAYLOAD_QUEUE_STATUSES]
+
+
+def _classifier_payload(s: store.Store, event: dict, text: str) -> dict:
+    running, queued = _payload_tasks(s)
     running_dict = {"id": running.id, "text": running.text} if running else None
     queue = [
         {"id": t.id, "text": t.text, "status": t.status, "depends_on": list(t.depends_on)}
-        for t in s.tasks if t.status in ("queued", "parked", "paused")
+        for t in queued
     ]
     recent = transcript.recent(event.get("transcript_path"))
     return classify.payload(
@@ -423,6 +432,54 @@ def _timed(classifier: Classifier, payload: dict, swallow: bool = False) -> tupl
             raise
         decision = None
     return decision, int(round((time.monotonic() - started) * 1000))
+
+
+class _NeedClassifier(Exception):
+    """Raised by the locked pass at the point it needs the model's answer.
+
+    The exception leaves ``store.locked`` without saving and releases the
+    lock; ``handle`` classifies ``payload`` unlocked and runs the pass again.
+    No branch writes a log line or calls out before asking, so nothing of
+    the abandoned pass survives it.
+    """
+
+    def __init__(self, fingerprint: tuple, payload: dict, swallow: bool) -> None:
+        super().__init__("classifier needed")
+        self.fingerprint = fingerprint
+        self.payload = payload
+        self.swallow = swallow
+
+
+class _Answer(NamedTuple):
+    fingerprint: tuple
+    decision: classify.Decision | None
+    latency_ms: int
+
+
+def _fingerprint(s: store.Store) -> tuple:
+    """What a classifier answer is only valid for: the turn and what it runs."""
+    return (s.state, s.current_prompt_id, s.running_task, s.pending_task)
+
+
+def _asker(s: store.Store, answer: _Answer | None, last: bool) -> Ask:
+    """The ``ask`` the locked pass gets.
+
+    An answer obtained for this same fingerprint is replayed. Otherwise the
+    pass is abandoned with ``_NeedClassifier`` so the model is asked without
+    the lock, unless this is the ``last`` pass, where the message fails open
+    (no decision, steer) rather than asking again.
+    """
+    fingerprint = _fingerprint(s)
+
+    def ask(payload: dict, swallow: bool = False) -> tuple[classify.Decision | None, int | None]:
+        if answer is not None and answer.fingerprint == fingerprint:
+            return answer.decision, answer.latency_ms
+        if last:
+            _record(s.session_id, "intake", decision="classifier_stale", state=s.state)
+            return None, answer.latency_ms if answer is not None else None
+        raise _NeedClassifier(fingerprint, payload, swallow)
+
+    return ask
 
 
 def _chain_deps(s: store.Store) -> list[str]:
@@ -487,7 +544,11 @@ def _queue(
     parked: bool,
     shadow: bool,
 ) -> str:
-    deps = list(depends_on) if depends_on else _chain_deps(s)
+    # The model's ids are filtered to tasks that exist and will still run
+    # (``Store.live_deps``); nothing left means the chain rule decides.
+    deps = s.live_deps(list(depends_on)) if depends_on else []
+    if not deps:
+        deps = _chain_deps(s)
     status = SHADOW_QUEUED if shadow else ("parked" if parked else "queued")
     t = s.new_task(text, deps, prompt_id, status=status)
     if parked:
@@ -531,11 +592,12 @@ def _amend(
         return f"would amend {target.id}", target.id
 
     if decision.note == "cancel":
+        waiting = s.dependants([target.id])
         cancelled = s.cancel(target.id)
         if cancelled is None:
             # Running (or done): not a queue edit; let Claude handle the message.
             return None, target.id
-        return f"cancelled {cancelled.id}: {cancelled.text}", target.id
+        return f"cancelled {cancelled.id}: {cancelled.text}{control.rewired_note(waiting)}", target.id
 
     if decision.note == "pause":
         # Only meaningful on the running task: the turn keeps going, and the
@@ -543,8 +605,9 @@ def _amend(
         target.status = "paused"
         return f"paused {target.id}", target.id
 
-    if named and list(decision.depends_on) != list(target.depends_on):
-        target.depends_on = list(decision.depends_on)
+    wanted = [d for d in s.live_deps(list(decision.depends_on)) if d != target.id]
+    if named and wanted != list(target.depends_on):
+        target.depends_on = wanted
         ids = ", ".join(target.depends_on) if target.depends_on else "nothing"
         return f"{target.id} now depends on {ids}", target.id
 
@@ -598,12 +661,15 @@ def _next_visible_id(s: store.Store) -> int:
     """The number of the first id the model will assign to a new split part.
 
     The prompt tells the model that new tasks are numbered after the highest
-    id it can see, and the payload shows it only the live tasks
-    (``s.candidates()``). The store may hold newer ids it was never shown
-    (cancelled, dropped, done, interrupted), so the model's prediction and
-    ``s.next_id`` can differ; ``_split`` maps one onto the other.
+    id visible in ``running_task`` and ``queue``, and those are exactly
+    ``_payload_tasks``. The store may hold newer ids it was never shown
+    (planned, failed_verify, cancelled, dropped, done, interrupted), so the
+    model's prediction and ``s.next_id`` can differ; ``_split`` maps one onto
+    the other.
     """
-    return max([_id_number(t.id) for t in s.candidates()] + [0]) + 1
+    running, queued = _payload_tasks(s)
+    shown = queued + ([running] if running is not None else [])
+    return max([_id_number(t.id) for t in shown] + [0]) + 1
 
 
 def _part_label(p: classify.Part) -> str:
@@ -627,17 +693,32 @@ def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = Fa
         return None
     prompt_id = event.get("prompt_id")
     _write_pointer(session_id, event.get("cwd"))
+    _write_last_prompt(session_id, prompt_id)
 
     v = rules.decide(prompt)
     if v.label == "pass" and not _pass_may_wait(v, prompt, session_id):
         return None
 
-    with store.locked(session_id) as s:
-        if v.label == "control":
-            return _control(s, v, prompt, prompt_id, shadow)
-        if s.state in WAITING_STATES:
-            return _waiting(s, event, v, prompt, prompt_id, classifier, shadow)
-        return _turn(s, event, v, prompt, prompt_id, classifier, shadow)
+    # The classifier can take 15 s; holding the store lock that long would
+    # make every other hook wait, PreToolUse's 5 s interrupt check included,
+    # so a "stop" could be late or lost. The locked pass stops where it needs
+    # the model (``_NeedClassifier``), the model is asked unlocked, and the
+    # pass runs again on a freshly loaded store, using the answer only when
+    # the turn has not moved on meanwhile (``_fingerprint``).
+    answer: _Answer | None = None
+    for calls in range(MAX_CLASSIFY_CALLS + 1):
+        try:
+            with store.locked(session_id) as s:
+                ask = _asker(s, answer, last=calls == MAX_CLASSIFY_CALLS)
+                if v.label == "control":
+                    return _control(s, v, prompt, prompt_id, shadow)
+                if s.state in WAITING_STATES:
+                    return _waiting(s, event, v, prompt, prompt_id, ask, shadow)
+                return _turn(s, event, v, prompt, prompt_id, ask, shadow)
+        except _NeedClassifier as need:
+            decision, latency_ms = _timed(classifier, need.payload, swallow=need.swallow)
+            answer = _Answer(need.fingerprint, decision, latency_ms)
+    return None  # unreachable: the last pass never asks
 
 
 def _pass_may_wait(v: rules.Verdict, prompt: str, session_id: str) -> bool:
@@ -697,7 +778,7 @@ def _turn(
     v: rules.Verdict,
     prompt: str,
     prompt_id: str | None,
-    classifier: Classifier,
+    ask: Ask,
     shadow: bool,
 ) -> dict | None:
     """The M0/M1 path once the store is locked and nothing waits on the user."""
@@ -737,7 +818,7 @@ def _turn(
                 return out
         return _new_turn(s, event, prompt, prompt_id, notice=notice, shadow=shadow)
 
-    return _mid_turn(s, event, v, prompt, prompt_id, classifier, shadow)
+    return _mid_turn(s, event, v, prompt, prompt_id, ask, shadow)
 
 
 def _dedupe_text(dup: store.Task) -> str:
@@ -843,7 +924,7 @@ def _mid_turn(
     v: rules.Verdict,
     prompt: str,
     prompt_id: str | None,
-    classifier: Classifier,
+    ask: Ask,
     shadow: bool,
 ) -> dict | None:
     session_id = s.session_id
@@ -852,7 +933,7 @@ def _mid_turn(
     latency_ms: int | None = None
     parked = v.parked
     if v.label == "undecided":
-        decision, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text))
+        decision, latency_ms = ask(_classifier_payload(s, event, v.text))
         label = "steer"
         if decision is not None and _confident(decision):
             if decision.label == "steer" and decision.interrupt:
@@ -869,7 +950,7 @@ def _mid_turn(
                 # Shadow comparison: also ask the model about a message the
                 # rules already decided, so the log holds both answers. The
                 # acted label stays the rule's; ``compared`` is never acted on.
-                compared, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text), swallow=True)
+                compared, latency_ms = ask(_classifier_payload(s, event, v.text), swallow=True)
             else:
                 # Active mode: the same comparison, but detached (scripts/
                 # compare.py) so the rule path keeps its speed; the model's
@@ -1058,7 +1139,7 @@ def _waiting(
     v: rules.Verdict,
     prompt: str,
     prompt_id: str | None,
-    classifier: Classifier,
+    ask: Ask,
     shadow: bool,
 ) -> dict | None:
     """Sort a message that arrived while the store waits on the user."""
@@ -1072,10 +1153,10 @@ def _waiting(
                    task=s.pending_task, prompt_id=prompt_id)
         s.state = "idle"
         s.pending_task = None
-        return _turn(s, event, v, prompt, prompt_id, classifier, shadow)
+        return _turn(s, event, v, prompt, prompt_id, ask, shadow)
     if s.state == "awaiting_answer":
         return _answer_state(s, event, v, t, prompt, prompt_id, shadow)
-    return _approval_state(s, event, v, t, prompt, prompt_id, classifier, shadow)
+    return _approval_state(s, event, v, t, prompt, prompt_id, ask, shadow)
 
 
 def _rule_while_waiting(
@@ -1235,7 +1316,7 @@ def _approval_state(
     t: store.Task,
     prompt: str,
     prompt_id: str | None,
-    classifier: Classifier,
+    ask: Ask,
     shadow: bool,
 ) -> dict | None:
     if rules.is_approval(prompt):
@@ -1251,7 +1332,7 @@ def _approval_state(
     if handled:
         return output
 
-    decision, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text))
+    decision, latency_ms = ask(_classifier_payload(s, event, v.text))
     confident = decision is not None and _confident(decision)
     kw = dict(classifier=decision, latency_ms=latency_ms)
 

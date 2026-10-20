@@ -68,7 +68,7 @@ def test_queue_cli_empty_command_lists(data_dir):
 def test_queue_cli_edits_store_under_lock(data_dir):
     intake.handle(ev("add a user model")); intake.handle(ev("later: email verification")); intake.handle(ev("maybe later we can add social login"))
     r = run_cli(data_dir, "cancel", "p2")
-    assert r.returncode == 0 and r.stdout.strip() == "cancelled p2: email verification"
+    assert r.returncode == 0 and r.stdout.strip() == "cancelled p2: email verification; p3 now after p1"
     assert store.load("s1").get("p2").status == "cancelled"
     r = run_cli(data_dir, "promote", "p3")
     assert r.returncode == 0 and r.stdout.strip() == "promoted p3 to the queue"
@@ -178,3 +178,37 @@ def test_cli_in_a_subdirectory_resolves_to_the_enclosing_session(data_dir, tmp_p
     assert queue_cli.resolve_session(None, cwd=str(proj)) == "s-proj"
     r = run_cli(data_dir, "list", cwd=str(sub))
     assert r.returncode == 0 and "c" in r.stdout
+
+
+# --- 2026-10-20 review fix 5: the approve handover and the turn it runs in ---
+
+def _awaiting_approval():
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        b = s.new_task("add login", ["p1"], "pid-1"); b.status = "planned"; s.get("p1").status = "done"
+        s.state = "awaiting_approval"; s.pending_task = "p2"; s.running_task = None; s.interrupt = True
+
+
+def test_queue_cli_approve_puts_the_handover_on_its_own_line(data_dir):
+    _awaiting_approval()
+    r = run_cli(data_dir, "approve")
+    lines = r.stdout.splitlines()
+    assert any(l.startswith("queue-switchclaude: task p2 is approved") for l in lines)
+
+
+def test_queue_cli_approve_adopts_the_turns_prompt_id_and_clears_interrupt(data_dir):
+    _awaiting_approval()
+    # The slash command's own prompt reached intake (a pass-through) before Claude ran the CLI.
+    intake.handle(ev("/compact", prompt_id="pid-7"))
+    run_cli(data_dir, "approve")
+    s = store.load("s1"); assert s.current_prompt_id == "pid-7" and s.interrupt is False and s.state == "running"
+    # A message typed during the execution is mid-turn, not an Esc.
+    out = intake.handle(ev("later: add logout", prompt_id="pid-7"))
+    s = store.load("s1"); assert out["decision"] == "block" and s.get("p2").status == "running"
+
+
+def test_queue_cli_approve_without_a_recorded_prompt_keeps_the_current_one(data_dir):
+    _awaiting_approval()
+    paths.last_prompt_path("s1").unlink(missing_ok=True)
+    run_cli(data_dir, "approve")
+    s = store.load("s1"); assert s.current_prompt_id == "pid-1" and s.interrupt is False

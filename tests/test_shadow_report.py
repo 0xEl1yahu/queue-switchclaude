@@ -30,7 +30,9 @@ def test_shadow_report_rule_vs_model_counts(data_dir):
     log.record("s2", "intake", decision="new_turn", task="p1")   # not a decision line
     r = run(data_dir)
     assert r.returncode == 0
-    assert "rule-decided: 1" in r.stdout and "model-decided: 2" in r.stdout and "disagreements: 0" in r.stdout
+    # 2026-10-20 review: model-decided means a model call was made; the
+    # paste_guard line handed nothing to the model, so the rules settled it.
+    assert "rule-decided: 2" in r.stdout and "model-decided: 1" in r.stdout and "disagreements: 0" in r.stdout
 
 
 def test_shadow_report_m0_rows_without_rule_label(data_dir):
@@ -241,3 +243,62 @@ def test_report_counts_background_comparisons(data_dir):
     r = subprocess.run([sys.executable, str(ROOT / "eval" / "shadow_report.py")], capture_output=True, text=True,
                        env={**os.environ, "CLAUDE_PLUGIN_DATA": str(data_dir)})
     assert "1 intake decision" in r.stdout and "disagreements: 1 of 1 compared" in r.stdout and "4100 ms" in r.stdout
+
+
+# --- 2026-10-20 review fix 5: wiring between the hooks and the report ---------
+
+from qsc import interrupt  # noqa: E402
+
+
+def test_interrupt_logs_hook_ms_from_the_stamp(data_dir):
+    with store.locked("s1") as s:
+        s.interrupt = True
+    interrupt.handle({"hook_event_name": "PreToolUse", "session_id": "s1", "_hook_started": time.monotonic() - 0.25})
+    row = rows()[-1]
+    assert row["event"] == "interrupt" and 240 <= row["hook_ms"] < 5000
+
+
+def test_report_shows_interrupt_latency(data_dir):
+    log.record("s1", "interrupt", task="p1", hook_ms=12)
+    r = run(data_dir)
+    assert "interrupt p50 12 ms  p95 12 ms  (1 line(s), no model call)" in r.stdout
+
+
+def test_dispatch_logs_the_judges_latency(data_dir, monkeypatch):
+    monkeypatch.setattr(done, "judge", judge_as("done"))
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; s.running_task = "p1"; s.state = "running"
+    dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": "done"})
+    dispatch_rows = [r for r in rows() if r["event"] == "dispatch"]
+    assert len([r for r in dispatch_rows if isinstance(r.get("latency_ms"), int)]) == 1
+
+
+def test_dispatch_logs_verify_time_apart_from_model_latency(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "true"; s.running_task = "p1"; s.state = "running"
+    dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": "done", "cwd": str(ROOT)})
+    dispatch_rows = [r for r in rows() if r["event"] == "dispatch"]
+    assert any(isinstance(r.get("verify_ms"), int) for r in dispatch_rows)
+    assert not any("latency_ms" in r for r in dispatch_rows)
+
+
+def test_a_prompt_turn_logs_no_model_latency(data_dir):
+    intake.handle(ev("add a file"))
+    dispatch.handle({"hook_event_name": "Stop", "session_id": "s1", "last_assistant_message": "done"})
+    assert not any("latency_ms" in r for r in rows() if r["event"] == "dispatch")
+
+
+def test_report_dispatch_model_bucket_is_filled_by_judge_latency(data_dir):
+    log.record("s1", "dispatch", next=None, latency_ms=2500, hook_ms=2600)
+    r = run(data_dir)
+    assert "dispatch p50 2600 ms  p95 2600 ms  (1 line(s), model called; judge p50 2500 ms" in r.stdout
+
+
+def test_an_approval_word_is_rule_decided(data_dir):
+    # "lgtm" while a plan waits: the rule table says undecided, but no model was called.
+    log.record("s1", "intake", decision="approve", label="steer", rule=None, rule_label="undecided",
+               classifier=None, latency_ms=None)
+    log.record("s1", "intake", label="queue", rule="queue_marker", rule_label="queue",
+               classifier={"label": "queue"}, latency_ms=900)   # shadow comparison: still the rule's call
+    r = run(data_dir)
+    assert "rule-decided: 2" in r.stdout and "model-decided: 0" in r.stdout and "compared (rule and model both logged): 1" in r.stdout

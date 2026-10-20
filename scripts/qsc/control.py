@@ -17,10 +17,12 @@ Commands (first word, case-insensitive):
                   ``; handoff: <path>`` when those files exist for the
                   session, ``; verify: <cmd>`` when set, ``; auto`` when set
     cancel pN     a queued, parked, paused, planned or failed-verify task
-                  becomes ``cancelled``
+                  becomes ``cancelled``; a task that waited on it now waits
+                  on what it waited on, and the reply says so
     promote pN    a parked, paused or failed-verify task becomes ``queued``
     park pN       a queued task becomes ``parked``
-    drop          every queued and parked task becomes ``dropped``
+    drop          every queued and parked task becomes ``dropped``; the
+                  tasks that waited on them are rewired the same way
     pause         ``Store.paused = True``: dispatch runs nothing
     resume        ``Store.paused = False``
     resume pN     a paused task becomes ``queued`` (same as promote)
@@ -138,17 +140,27 @@ def _live(s: store.Store, task_id: str) -> "store.Task | str":
     return t
 
 
+def rewired_note(tasks: list[store.Task]) -> str:
+    """``; p3 now after p1`` for each task ``Store.rewire`` moved, or ``""``."""
+    return "".join(
+        f"; {t.id} now after {', '.join(t.depends_on) if t.depends_on else 'nothing'}"
+        for t in tasks
+    )
+
+
 def _cancel(s: store.Store, task_id: str) -> str:
     t = s.get(task_id)
     if t is None:
         return f"no task {task_id}"
+    waiting = s.dependants([task_id])
     if t.status == SHADOW_QUEUED:
         t.status = "cancelled"
-        return f"cancelled {t.id}: {t.text}"
+        s.rewire()
+        return f"cancelled {t.id}: {t.text}{rewired_note(waiting)}"
     t = s.cancel(task_id)
     if t is None:
         return f"{task_id} is not queued, parked, paused, planned or failed_verify"
-    return f"cancelled {t.id}: {t.text}"
+    return f"cancelled {t.id}: {t.text}{rewired_note(waiting)}"
 
 
 def _promote(s: store.Store, task_id: str) -> str:
@@ -172,13 +184,15 @@ def _park(s: store.Store, task_id: str) -> str:
 
 def _drop(s: store.Store) -> str:
     dropped = [t for t in s.tasks if t.status in ("queued", "parked", SHADOW_QUEUED)]
+    waiting = s.dependants([t.id for t in dropped])
     for t in dropped:
         t.status = "dropped"
+    s.rewire()
     n = len(dropped)
     noun = "task" if n == 1 else "tasks"
     if not dropped:
         return f"dropped 0 {noun}"
-    return f"dropped {n} {noun}: " + ", ".join(t.id for t in dropped)
+    return f"dropped {n} {noun}: " + ", ".join(t.id for t in dropped) + rewired_note(waiting)
 
 
 def _verify(s: store.Store, task_id: str, command: str) -> str:

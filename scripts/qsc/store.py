@@ -48,6 +48,12 @@ CANCELLABLE = ("queued", "parked", "paused", "planned", "failed_verify")
 PROMOTABLE = ("parked", "paused", "failed_verify")
 # Statuses that make a task a live candidate for amend targets and listings.
 CANDIDATE_STATUSES = ("queued", "parked", "paused", "running", "planned", "failed_verify")
+# Statuses of a task that will never run again. A dependency on one is
+# rewired (``Store.rewire``) to that task's own dependencies, so nothing
+# waits forever on work that is gone. ``failed_verify`` is not here: it can
+# be promoted, and its dependants stay blocked until it is (plan review
+# focus 3) or cancelled.
+DEAD_STATUSES = ("cancelled", "dropped", "interrupted")
 # Statuses find_recent() never matches: the task is gone, so resubmitting
 # the same text is a fresh request, not a duplicate.
 _NOT_RECENT = ("dropped", "cancelled")
@@ -240,12 +246,68 @@ class Store:
 
     def cancel(self, task_id: str) -> Task | None:
         """Mark a queued, parked, paused, planned or failed_verify task
-        ``cancelled``; else ``None``."""
+        ``cancelled``; else ``None``. Its dependants are rewired
+        (``rewire``)."""
         task = self.get(task_id)
         if task is None or task.status not in CANCELLABLE:
             return None
         task.status = "cancelled"
+        self.rewire()
         return task
+
+    def live_deps(self, ids: list[str]) -> list[str]:
+        """``ids`` with unknown ids left out and each dead task (``DEAD_STATUSES``)
+        replaced by its own dependencies, resolved the same way; order kept,
+        duplicates dropped.
+
+        A dependency is an ordering: "after p2" where p2 was cancelled means
+        after whatever p2 itself waited for. The model's ``depends_on`` goes
+        through here too, so it can never name a task that does not exist.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        pending = list(ids)
+        while pending:
+            dep = pending.pop(0)
+            if dep in seen:
+                continue
+            seen.add(dep)
+            task = self.get(dep)
+            if task is None:
+                continue
+            if task.status in DEAD_STATUSES:
+                pending[:0] = task.depends_on
+                continue
+            out.append(dep)
+        return out
+
+    def rewire(self) -> list[Task]:
+        """Point every task that is not dead past its dead dependencies
+        (``live_deps``). Returns the tasks whose ``depends_on`` changed.
+
+        Called whenever a task is cancelled, dropped or interrupted: without
+        it ``ready()`` and dispatch's planned check, which accept only
+        ``done`` dependencies, would leave a dependant waiting forever.
+        Dead and done tasks keep their dependencies as history.
+        """
+        changed = []
+        for task in self.tasks:
+            if task.status in DEAD_STATUSES or task.status == "done" or not task.depends_on:
+                continue
+            deps = self.live_deps(task.depends_on)
+            if deps != task.depends_on:
+                task.depends_on = deps
+                changed.append(task)
+        return changed
+
+    def dependants(self, ids: list[str]) -> list[Task]:
+        """Tasks that are not dead, not in ``ids`` and depend on one of ``ids``."""
+        wanted = set(ids)
+        return [
+            t for t in self.tasks
+            if t.id not in wanted and t.status not in DEAD_STATUSES
+            and t.status != "done" and wanted & set(t.depends_on)
+        ]
 
     def promote(self, task_id: str) -> Task | None:
         """Move a parked, paused or failed_verify task back to the queue;
