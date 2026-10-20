@@ -1265,12 +1265,21 @@ def test_visible_ids_match_the_payload(data_dir):
 
 # --- 2026-10-20 review fix 2: the classifier runs without the store lock ------
 
-import fcntl  # noqa: E402
-
-
 def _lock_is_free(sid="s1"):
+    """Try the store lock without waiting: fcntl on POSIX, msvcrt byte 0 on Windows."""
     lock = paths.store_path(sid).with_name(paths.store_path(sid).name + ".lock")
     with open(lock, "a+") as fh:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return False
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            return True
+        import fcntl
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
