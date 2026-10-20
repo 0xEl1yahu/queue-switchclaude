@@ -4,7 +4,7 @@ A plugin for Claude Code, Anthropic's terminal coding agent, that sorts the mess
 
 > **Experimental software, built in two days and tested on one machine.** It hooks into every prompt you send, every tool call Claude makes and every time Claude stops. When it misjudges a message it can hold back something you meant to be delivered now (you see a notice and the text comes back into the input box), end a turn you wanted to keep going, or keep Claude working for a few more turns than you expected. It spends model calls from your own Claude account (about one small call per message the rules cannot sort, and one per queued task closed without a test command). It never writes into the repository Claude is working in; everything it stores lives in one directory under `~/.claude` that you can delete at any time to reset. The author is not responsible for lost work, surprise turns or spent quota. If a session misbehaves, uninstall with the two commands under "Install" and the hooks are gone.
 
-## Status (2026-10-19, version 0.4.1)
+## Status (2026-10-20, version 0.5.0)
 
 What is real, what is partial, and what does not exist. Every "real" row was exercised live in Claude Code 2.1.302 and the transcript of that run is in `docs/`.
 
@@ -25,7 +25,7 @@ What is real, what is partial, and what does not exist. Every "real" row was exe
 | Offline, or no `claude` on `PATH` | Degrades without a message: a message the rules cannot sort passes through as steer after a wait of up to 15 s, and every queued task is closed as done when Claude stops (`judge unavailable; fail open`), so its dependants start. Verify commands still work | `scripts/qsc/model.py`, `done.py` |
 | A hook that crashes | Exits 0 with no output, which Claude Code treats as "no plugin"; nothing tells you. On Windows a `python3` that is the Microsoft Store stub has the same effect: the script never starts (see Requirements) | `scripts/intake.py`, `dispatch.py`, `interrupt.py` |
 | Native Windows | Partial: supported in the code (the store lock is `msvcrt.locking`, a verify command runs under `cmd.exe` and its process tree is killed with `taskkill`, `claude.cmd` from npm is found on `PATH`) and the suite passes on Windows in CI, but no live Claude Code session on Windows has run it yet. Needs a real `python3` on `PATH` | Requirements, `.github/workflows/test.yml` |
-| Automated tests | 665 tests (a few run on one platform only), standard library only, a fake `claude` binary stands in for the model; CI runs them on Python 3.10, 3.12 and 3.14 on Ubuntu and on Python 3.12 on Windows, where a `claude.cmd` launcher around a Python fake stands in. CI does not run the golden-set eval or `claude plugin validate` | `.github/workflows/test.yml` |
+| Automated tests | 708 tests (a few run on one platform only), standard library only, a fake `claude` binary stands in for the model; CI runs them on Python 3.10, 3.12 and 3.14 on Ubuntu and on Python 3.12 on Windows, where a `claude.cmd` launcher around a Python fake stands in. CI does not run the golden-set eval or `claude plugin validate` | `.github/workflows/test.yml` |
 
 Hard numbers that shape daily use, measured on the development machine (an Apple M4 Mac, Claude Code 2.1.302):
 
@@ -224,7 +224,7 @@ claude plugin validate queue-switchclaude
 claude --plugin-dir queue-switchclaude
 ```
 
-Tests: `python3 -m pytest -q` (stdlib-only code under `scripts/` and `eval/`; the fake `claude` in `tests/fakes/` stands in for the model). CI runs the suite on Python 3.10, 3.12 and 3.14 (`.github/workflows/test.yml`). Golden-set eval: `python3 eval/run_golden.py --rules-only` and `python3 eval/run_golden.py --report eval/reports/<name>.md`; the model answers are cached under `eval/cache/`, so a fresh clone reproduces the 44 of 47 gate without a live call as long as some executable sits at `--claude` (`python3 eval/run_golden.py --claude tests/fakes/claude`; `tests\fakes\claude.cmd` on Windows); with no `claude` on `PATH` the runner falls back to rules only and the gate fails. `--no-cache` spends real calls.
+Tests: `python3 -m pytest -q` (stdlib-only code under `scripts/` and `eval/`; the fake `claude` in `tests/fakes/` stands in for the model). CI runs the suite on Python 3.10, 3.12 and 3.14 on Ubuntu and on Python 3.12 on Windows (`.github/workflows/test.yml`). Golden-set eval: `python3 eval/run_golden.py --rules-only` and `python3 eval/run_golden.py --report eval/reports/<name>.md`; the model answers are cached under `eval/cache/`, so a fresh clone reproduces the 44 of 47 gate without a live call as long as some executable sits at `--claude` (`python3 eval/run_golden.py --claude tests/fakes/claude`; `tests\fakes\claude.cmd` on Windows); with no `claude` on `PATH` the runner falls back to rules only and the gate fails. `--no-cache` spends real calls.
 
 ## Where the data lives
 
@@ -299,7 +299,7 @@ When the report reads well, turn **Shadow mode** off (keep or drop the second sw
 
 Nothing is scheduled. The next decision is made from data: a week of the background comparison in real sessions (the "Daily use" steps), then the report says whether the rules need widening, the prompt needs cases, or the model needs raising. Two structural limits cannot be fixed inside classic hooks and are the reason the in-process "mod" route is kept as the documented upgrade path in [`docs/libraries.md`](docs/libraries.md): held text cannot be cleared from the input box, and a turn can only be stopped at a tool boundary. Small items left open: the mid-run notice is not forced to one line for multi-line markers, and the notice's rendering is timing-dependent.
 
-Milestones so far: M0 vertical slice (0.1.0), M1 trustworthy (0.2.0), M2 plan flow, M3 hardening (0.3.0) and M4 daily-use polish (0.4.0), each with a live record under `docs/`; then the background comparison (0.4.1), checked by hand only. Details in [`CHANGELOG.md`](CHANGELOG.md).
+Milestones so far: M0 vertical slice (0.1.0), M1 trustworthy (0.2.0), M2 plan flow, M3 hardening (0.3.0) and M4 daily-use polish (0.4.0), each with a live record under `docs/`; then the background comparison (0.4.1), checked by hand only; then native Windows support and the 2026-10-20 review fixes (0.5.0), covered by tests and CI only. Details in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Pointers
 

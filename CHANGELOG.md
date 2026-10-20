@@ -2,9 +2,13 @@
 
 One section per milestone, newest first. Each milestone was accepted live in Claude Code 2.1.302 and the record is linked from its section. Versions are the `version` field of `.claude-plugin/plugin.json`; M2 shipped on the M1 version number.
 
-## Unreleased: review fixes (2026-10-20)
+## 0.5.0, native Windows and review fixes (2026-10-20)
 
-Fixes from the 2026-10-20 code review, each with a test that failed first. No live acceptance run yet.
+No live acceptance run for this release: everything below is covered by the test suite (CI on Ubuntu and Windows), not by a recorded session.
+
+### Review fixes
+
+Fixes from the 2026-10-20 code review, each with a test that failed first.
 
 - **Dependants are no longer stranded.** A task that waited on one that was cancelled, dropped or interrupted now waits on what that task waited on (`Store.rewire`): `queue: cancel p2` with `p3` after `p2` after `p1` leaves `p3` after `p1`, and the reply says `p3 now after p1`; `queue: drop`, an amend that cancels, Esc and `stop` rewire the same way. The model's `depends_on` is filtered to tasks that exist and will still run. A `failed_verify` task still holds its dependants until it is promoted or cancelled, and its notice now names them (`p3 waits on it`).
 - **The classifier no longer runs under the store lock.** Intake builds the payload under the lock, releases it for the `claude -p` call, then reruns on a fresh load and uses the answer only if the state, `current_prompt_id`, running and pending task are unchanged; otherwise it asks once more, then fails open. The interrupt check on `PreToolUse` (5 s timeout) no longer waits behind a 15 s classification, and writes other hooks make meanwhile are kept.
@@ -13,7 +17,7 @@ Fixes from the 2026-10-20 code review, each with a test that failed first. No li
 - **Retry handbacks respect the continuation budget.** With 6 continuations spent, a "fix it" or "finish it" handback is withheld (the task waits on the user; any message resumes it, `ok` confirms it done) and a planning retry is not sent (the task is queued again), so six continuations plus two retries can no longer reach Claude Code's cap of 8.
 - **Report wiring.** The interrupt hook logs `hook_ms` and the report lists it; dispatch logs the judge's `latency_ms` (a verify command's `verify_ms`) so the Stop hook's "model called" bucket is filled; a line counts as model-decided only when a model call was made for a message the rules left open. `/queue approve` prints the execution handover on its own line, as `commands/queue.md` says, and makes the turn it runs in the current one (intake records the last `prompt_id` per session) with the interrupt flag cleared.
 
-## Unreleased: native Windows
+### Native Windows
 
 - Runs on native Windows, not only WSL. Before this every hook exited silently on Windows, because the store imported `fcntl` at the top. The store lock is now `msvcrt.locking` on byte 0 of the `.lock` file there (polled, so a writer waits as long as it would on `flock`), and a save retries the rename for up to a second while another process has the store open. macOS and Linux keep `fcntl` and the same code paths as before.
 - A verify command runs under `cmd.exe` on Windows, in its own process group, and on timeout its whole tree is killed with `taskkill /F /T`. Before, the missing `os.killpg` raised an error that crashed the Stop hook.
