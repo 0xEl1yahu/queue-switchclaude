@@ -67,6 +67,14 @@ first in every state. ``_waiting`` then sorts the message:
   else is the answer, the task resumes ``running`` and the message passes
   through untouched, since Claude asked the question.
 
+The classifier never runs under the store lock (2026-10-20 review): the
+locked pass stops where it needs the model, the lock is released for the
+call, and the pass runs again on a fresh load. The answer is used only if
+the state, ``current_prompt_id``, running and pending task are unchanged;
+otherwise the model is asked once more, and a store that moved again fails
+open. Writes other hooks made meanwhile are kept, since the second pass
+starts from the file they saved.
+
 Every branch fails open: anything unresolved is ``steer`` and the message
 passes through untouched. The return value is the hook's JSON output, or
 ``None`` for pass-through.
@@ -117,6 +125,13 @@ DEDUPE_FINISHED_STATUSES = ("done", "shadow_dispatched")
 DEDUPE_MARKER_RULES = ("queue_marker", "parked_marker")
 
 Classifier = Callable[[dict], Optional[classify.Decision]]
+# What the locked pass calls instead of the classifier: ``ask(payload,
+# swallow=False) -> (decision, latency_ms)`` (``_asker``).
+Ask = Callable[..., tuple[Optional[classify.Decision], Optional[int]]]
+
+# Classifier calls one message may cost when the store keeps changing
+# underneath it; after that the message fails open as steer.
+MAX_CLASSIFY_CALLS = 2
 
 # Store states in which the user's message is sorted by ``_waiting`` first.
 WAITING_STATES = ("awaiting_approval", "awaiting_answer")
@@ -403,6 +418,54 @@ def _timed(classifier: Classifier, payload: dict, swallow: bool = False) -> tupl
     return decision, int(round((time.monotonic() - started) * 1000))
 
 
+class _NeedClassifier(Exception):
+    """Raised by the locked pass at the point it needs the model's answer.
+
+    The exception leaves ``store.locked`` without saving and releases the
+    lock; ``handle`` classifies ``payload`` unlocked and runs the pass again.
+    No branch writes a log line or calls out before asking, so nothing of
+    the abandoned pass survives it.
+    """
+
+    def __init__(self, fingerprint: tuple, payload: dict, swallow: bool) -> None:
+        super().__init__("classifier needed")
+        self.fingerprint = fingerprint
+        self.payload = payload
+        self.swallow = swallow
+
+
+class _Answer(NamedTuple):
+    fingerprint: tuple
+    decision: classify.Decision | None
+    latency_ms: int
+
+
+def _fingerprint(s: store.Store) -> tuple:
+    """What a classifier answer is only valid for: the turn and what it runs."""
+    return (s.state, s.current_prompt_id, s.running_task, s.pending_task)
+
+
+def _asker(s: store.Store, answer: _Answer | None, last: bool) -> Ask:
+    """The ``ask`` the locked pass gets.
+
+    An answer obtained for this same fingerprint is replayed. Otherwise the
+    pass is abandoned with ``_NeedClassifier`` so the model is asked without
+    the lock, unless this is the ``last`` pass, where the message fails open
+    (no decision, steer) rather than asking again.
+    """
+    fingerprint = _fingerprint(s)
+
+    def ask(payload: dict, swallow: bool = False) -> tuple[classify.Decision | None, int | None]:
+        if answer is not None and answer.fingerprint == fingerprint:
+            return answer.decision, answer.latency_ms
+        if last:
+            _record(s.session_id, "intake", decision="classifier_stale", state=s.state)
+            return None, answer.latency_ms if answer is not None else None
+        raise _NeedClassifier(fingerprint, payload, swallow)
+
+    return ask
+
+
 def _chain_deps(s: store.Store) -> list[str]:
     """M0 dependency rule: the last queued task, else the running task, else nothing.
 
@@ -619,12 +682,26 @@ def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = Fa
     if v.label == "pass" and not _pass_may_wait(v, prompt, session_id):
         return None
 
-    with store.locked(session_id) as s:
-        if v.label == "control":
-            return _control(s, v, prompt, prompt_id, shadow)
-        if s.state in WAITING_STATES:
-            return _waiting(s, event, v, prompt, prompt_id, classifier, shadow)
-        return _turn(s, event, v, prompt, prompt_id, classifier, shadow)
+    # The classifier can take 15 s; holding the store lock that long would
+    # make every other hook wait, PreToolUse's 5 s interrupt check included,
+    # so a "stop" could be late or lost. The locked pass stops where it needs
+    # the model (``_NeedClassifier``), the model is asked unlocked, and the
+    # pass runs again on a freshly loaded store, using the answer only when
+    # the turn has not moved on meanwhile (``_fingerprint``).
+    answer: _Answer | None = None
+    for calls in range(MAX_CLASSIFY_CALLS + 1):
+        try:
+            with store.locked(session_id) as s:
+                ask = _asker(s, answer, last=calls == MAX_CLASSIFY_CALLS)
+                if v.label == "control":
+                    return _control(s, v, prompt, prompt_id, shadow)
+                if s.state in WAITING_STATES:
+                    return _waiting(s, event, v, prompt, prompt_id, ask, shadow)
+                return _turn(s, event, v, prompt, prompt_id, ask, shadow)
+        except _NeedClassifier as need:
+            decision, latency_ms = _timed(classifier, need.payload, swallow=need.swallow)
+            answer = _Answer(need.fingerprint, decision, latency_ms)
+    return None  # unreachable: the last pass never asks
 
 
 def _pass_may_wait(v: rules.Verdict, prompt: str, session_id: str) -> bool:
@@ -684,7 +761,7 @@ def _turn(
     v: rules.Verdict,
     prompt: str,
     prompt_id: str | None,
-    classifier: Classifier,
+    ask: Ask,
     shadow: bool,
 ) -> dict | None:
     """The M0/M1 path once the store is locked and nothing waits on the user."""
@@ -724,7 +801,7 @@ def _turn(
                 return out
         return _new_turn(s, event, prompt, prompt_id, notice=notice, shadow=shadow)
 
-    return _mid_turn(s, event, v, prompt, prompt_id, classifier, shadow)
+    return _mid_turn(s, event, v, prompt, prompt_id, ask, shadow)
 
 
 def _dedupe_text(dup: store.Task) -> str:
@@ -830,7 +907,7 @@ def _mid_turn(
     v: rules.Verdict,
     prompt: str,
     prompt_id: str | None,
-    classifier: Classifier,
+    ask: Ask,
     shadow: bool,
 ) -> dict | None:
     session_id = s.session_id
@@ -839,7 +916,7 @@ def _mid_turn(
     latency_ms: int | None = None
     parked = v.parked
     if v.label == "undecided":
-        decision, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text))
+        decision, latency_ms = ask(_classifier_payload(s, event, v.text))
         label = "steer"
         if decision is not None and _confident(decision):
             if decision.label == "steer" and decision.interrupt:
@@ -856,7 +933,7 @@ def _mid_turn(
                 # Shadow comparison: also ask the model about a message the
                 # rules already decided, so the log holds both answers. The
                 # acted label stays the rule's; ``compared`` is never acted on.
-                compared, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text), swallow=True)
+                compared, latency_ms = ask(_classifier_payload(s, event, v.text), swallow=True)
             else:
                 # Active mode: the same comparison, but detached (scripts/
                 # compare.py) so the rule path keeps its speed; the model's
@@ -1045,7 +1122,7 @@ def _waiting(
     v: rules.Verdict,
     prompt: str,
     prompt_id: str | None,
-    classifier: Classifier,
+    ask: Ask,
     shadow: bool,
 ) -> dict | None:
     """Sort a message that arrived while the store waits on the user."""
@@ -1059,10 +1136,10 @@ def _waiting(
                    task=s.pending_task, prompt_id=prompt_id)
         s.state = "idle"
         s.pending_task = None
-        return _turn(s, event, v, prompt, prompt_id, classifier, shadow)
+        return _turn(s, event, v, prompt, prompt_id, ask, shadow)
     if s.state == "awaiting_answer":
         return _answer_state(s, event, v, t, prompt, prompt_id, shadow)
-    return _approval_state(s, event, v, t, prompt, prompt_id, classifier, shadow)
+    return _approval_state(s, event, v, t, prompt, prompt_id, ask, shadow)
 
 
 def _rule_while_waiting(
@@ -1222,7 +1299,7 @@ def _approval_state(
     t: store.Task,
     prompt: str,
     prompt_id: str | None,
-    classifier: Classifier,
+    ask: Ask,
     shadow: bool,
 ) -> dict | None:
     if rules.is_approval(prompt):
@@ -1238,7 +1315,7 @@ def _approval_state(
     if handled:
         return output
 
-    decision, latency_ms = _timed(classifier, _classifier_payload(s, event, v.text))
+    decision, latency_ms = ask(_classifier_payload(s, event, v.text))
     confident = decision is not None and _confident(decision)
     kw = dict(classifier=decision, latency_ms=latency_ms)
 

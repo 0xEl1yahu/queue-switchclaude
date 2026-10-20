@@ -1258,3 +1258,108 @@ def test_visible_ids_match_the_payload(data_dir):
     assert intake._next_visible_id(s) == max(int(i[1:]) for i in shown) + 1 == 5
     s.get("p4").status = "done"
     assert intake._next_visible_id(s) == 3
+
+
+# --- 2026-10-20 review fix 2: the classifier runs without the store lock ------
+
+import fcntl  # noqa: E402
+
+
+def _lock_is_free(sid="s1"):
+    lock = paths.store_path(sid).with_name(paths.store_path(sid).name + ".lock")
+    with open(lock, "a+") as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return True
+
+
+def test_mid_turn_classifier_runs_without_the_lock(data_dir):
+    intake.handle(ev("add a user model"))
+    free = []
+    def clf(payload):
+        free.append(_lock_is_free()); return dec(label="queue")
+    out = intake.handle(ev("add password reset as well"), classifier=clf)
+    assert free == [True] and out["decision"] == "block" and store.load("s1").get("p2").status == "queued"
+
+
+def test_approval_classifier_runs_without_the_lock(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"
+        b = s.new_task("add login", ["p1"], "pid-1"); b.status = "planned"
+        s.state = "awaiting_approval"; s.pending_task = "p2"; s.running_task = None
+    free = []
+    def clf(payload):
+        free.append(_lock_is_free()); return dec(label="steer", note="approve")
+    out = intake.handle(ev("sounds right, go ahead with it", prompt_id="pid-2"), classifier=clf)
+    assert free == [True] and "Execute the plan" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_shadow_compare_classifier_runs_without_the_lock(data_dir, monkeypatch):
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SHADOW_COMPARE", "1")
+    intake.handle(ev("add a user model"), shadow=True)
+    free = []
+    def clf(payload):
+        free.append(_lock_is_free()); return dec(label="queue")
+    intake.handle(ev("later: email verification"), classifier=clf, shadow=True)
+    assert free == [True]
+
+
+def _write_if_free(sid="s1"):
+    """``store.locked`` only when nobody holds the lock: the test fails
+    instead of deadlocking when intake classifies under the lock."""
+    assert _lock_is_free(sid), "intake holds the store lock during classification"
+    return store.locked(sid)
+
+
+def test_a_store_write_during_classification_is_not_lost(data_dir):
+    intake.handle(ev("add a user model"))
+    def clf(payload):
+        with _write_if_free() as s:        # another hook (interrupt, dispatch, /queue) writes meanwhile
+            s.paused = True
+        return dec(label="queue")
+    intake.handle(ev("add password reset as well"), classifier=clf)
+    s = store.load("s1"); assert s.paused is True and s.get("p2").status == "queued"
+
+
+def test_a_state_change_during_classification_asks_again(data_dir):
+    intake.handle(ev("add a user model"))
+    calls = []
+    def clf(payload):
+        calls.append(payload["state"])
+        if len(calls) == 1:
+            with _write_if_free() as s:      # a Stop moved the turn on: p1 done, p2 being planned
+                s.get("p1").status = "done"; s.new_task("b", ["p1"], "pid-1")
+                s.state = "planning"; s.pending_task = "p2"; s.running_task = None
+        return dec(label="queue")
+    out = intake.handle(ev("add password reset as well"), classifier=clf)
+    assert calls == ["running", "planning"] and out["decision"] == "block"
+    assert store.load("s1").get("p3").depends_on == ["p2"]
+
+
+def test_a_store_that_keeps_moving_fails_open(data_dir):
+    intake.handle(ev("add a user model"))
+    calls = []
+    def clf(payload):
+        calls.append(1)
+        with _write_if_free() as s:
+            s.current_prompt_id = s.current_prompt_id + "x"   # never the same twice; no longer mid-turn either
+        return dec(label="queue")
+    intake.handle(ev("add password reset as well", prompt_id="pid-1"), classifier=clf)
+    assert len(calls) == 1          # the turn moved on: the message is a new turn, no second classification
+
+
+def test_classifier_retry_is_bounded(data_dir):
+    intake.handle(ev("add a user model"))
+    calls = []
+    def clf(payload):
+        calls.append(1)
+        with _write_if_free() as s:
+            s.running_task = None if s.running_task else "p1"  # flips every call; state stays mid-turn
+        return dec(label="queue")
+    out = intake.handle(ev("add password reset as well"), classifier=clf)
+    assert len(calls) == 2 and out is None                      # fail open: steer, passes through
+    s = store.load("s1"); assert len(s.tasks) == 1
