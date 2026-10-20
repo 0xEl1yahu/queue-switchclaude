@@ -91,6 +91,16 @@ def handoff_path(session_id: str, task_id: str) -> Path:
     return session_dir(session_id) / "handoffs" / f"{safe_id(task_id)}.md"
 
 
+def last_prompt_path(session_id: str) -> Path:
+    """``sessions/<sid>/last_prompt_id``: the ``prompt_id`` intake saw last.
+
+    Written on every prompt, slash commands included, so ``queue_cli.py``
+    (which runs as a Bash call with no hook payload) can tell which turn it
+    runs in: messages typed during a turn carry that turn's ``prompt_id``.
+    """
+    return session_dir(session_id) / "last_prompt_id"
+
+
 def pointer_path() -> Path:
     """The file holding the id of the session intake saw last.
 

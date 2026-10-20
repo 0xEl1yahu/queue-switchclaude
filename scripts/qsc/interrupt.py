@@ -120,7 +120,7 @@ def handle(event: dict) -> dict | None:
         if not s.interrupt:
             return None
         reset = reset_turn(s)
-    log.record(session_id, "interrupt", task=reset.interrupted, dropped=[t.id for t in reset.dropped],
+    log.record(session_id, "interrupt", hook_ms=hookio.hook_ms(event), task=reset.interrupted, dropped=[t.id for t in reset.dropped],
                requeued=reset.requeued, rewired=[t.id for t in reset.rewired],
                via=event.get("hook_event_name"))
     return {"continue": False, "stopReason": stop_reason(reset)}

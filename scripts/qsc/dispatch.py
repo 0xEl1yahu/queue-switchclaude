@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,6 +71,13 @@ _WAITING = ("awaiting_approval", "awaiting_answer")
 # --- envelopes and handover texts --------------------------------------------
 
 
+# How long this Stop's done check took: ``latency_ms`` when the judge was
+# called (a model call), ``verify_ms`` for a verify command. Set once the
+# verdict is known and carried by the first ``dispatch`` line the Stop
+# writes, so the report counts each check once (2026-10-20 review).
+_timing: dict = {}
+
+
 def _record(session_id: str, event_name: str, **fields) -> None:
     """``log.record`` plus ``hook_ms``, the time since the hook script started.
 
@@ -77,8 +85,12 @@ def _record(session_id: str, event_name: str, **fields) -> None:
     running ``handle``, whichever module's it is: intake confirms a task
     through ``dispatch.write_handoff`` and ``dispatch.choose_next``, and
     their lines must count from the same start as intake's own (M4 review;
-    a module-level copy of the event went stale and read 0 there).
+    a module-level copy of the event went stale and read 0 there). The
+    first ``dispatch`` line also takes the pending ``_timing``.
     """
+    if event_name == "dispatch" and _timing:
+        fields = {**_timing, **fields}
+        _timing.clear()
     log.record(session_id, event_name, hook_ms=hookio.hook_ms(), **fields)
 
 
@@ -274,6 +286,7 @@ def _close_running(
     shadow: bool,
     claude: str,
     verdict: done.Verdict | None = None,
+    timing: dict | None = None,
 ) -> tuple[dict | None, bool]:
     """Decide the running task's fate. Returns ``(output, proceed)``.
 
@@ -294,7 +307,8 @@ def _close_running(
     closing = event.get("last_assistant_message")
     closing = closing if isinstance(closing, str) else ""
     if verdict is None:
-        verdict = _verdict_for(s, running, event, claude)
+        verdict, timing = _verdict_for(s, running, event, claude)
+    _timing.update(timing or {})
 
     if shadow:
         # Observe only: the verdict is filed and logged, never acted on
@@ -362,29 +376,43 @@ def _close_running(
     return None, True
 
 
-def _verdict_for(s: store.Store, task: store.Task, event: dict, claude: str) -> done.Verdict:
+def _verdict_for(s: store.Store, task: store.Task, event: dict, claude: str) -> tuple[done.Verdict, dict]:
     """The verdict for ``task``: its verify command, the judge for harness
-    tasks, and ``stopped`` for a turn the user typed (no model call)."""
-    if task.verify or task.kind != "prompt":
-        return done.decide(task, event, _plan_excerpt(s, task), claude=claude)
-    return done.Verdict("stopped", "prompt turn ended")
+    tasks, and ``stopped`` for a turn the user typed (no model call).
+
+    Also returns the check's timing for the log: ``{"verify_ms": n}``,
+    ``{"latency_ms": n}`` when the judge was asked, or ``{}``.
+    """
+    if not (task.verify or task.kind != "prompt"):
+        return done.Verdict("stopped", "prompt turn ended"), {}
+    started = time.monotonic()
+    verdict = done.decide(task, event, _plan_excerpt(s, task), claude=claude)
+    ms = int(round((time.monotonic() - started) * 1000))
+    if task.verify:
+        return verdict, {"verify_ms": ms}
+    closing = event.get("last_assistant_message")
+    judged = isinstance(closing, str) and bool(closing.strip())  # done.decide skips the judge otherwise
+    return verdict, ({"latency_ms": ms} if judged else {})
 
 
-def _precompute_verdict(session_id: str, event: dict, claude: str) -> tuple[str | None, str | None, done.Verdict | None]:
+def _precompute_verdict(
+    session_id: str, event: dict, claude: str,
+) -> tuple[str | None, str | None, done.Verdict | None, dict]:
     """Decide the running task's fate before taking the store lock.
 
     A verify command can run for 120 s and the judge for 15 s; holding the
     lock that long makes intake wait and lets a mid-run message through
-    unsorted. Returns ``(task id, verify command, verdict)`` so the locked
-    stage can check the store did not change underneath.
+    unsorted. Returns ``(task id, verify command, verdict, timing)`` so the
+    locked stage can check the store did not change underneath; ``timing``
+    is the check's, from ``_verdict_for``.
     """
     s = store.load(session_id)
     if s.interrupt or s.state != "running" or not s.running_task:
-        return None, None, None
+        return None, None, None, {}
     task = s.get(s.running_task)
     if task is None or task.status == "paused":
-        return None, None, None
-    return task.id, task.verify, _verdict_for(s, task, event, claude)
+        return None, None, None, {}
+    return (task.id, task.verify, *_verdict_for(s, task, event, claude))
 
 
 # --- stage B: after a planning turn -----------------------------------------
@@ -620,13 +648,21 @@ def _issue(s: store.Store, out: dict | None, stop_hook_active: bool) -> dict | N
 def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | None:
     """Run the stages that apply to the store's state; return the Stop output."""
     hookio.start_clock(event)
+    _timing.clear()
+    try:
+        return _handle(event, shadow, claude)
+    finally:
+        _timing.clear()
+
+
+def _handle(event: dict, shadow: bool, claude: str) -> dict | None:
     session_id = event.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return None
     active = bool(event.get("stop_hook_active"))
     # The verify command or judge runs before the lock is taken (review
     # should-fix: a 120 s verify held the session lock and made intake wait).
-    pre_id, pre_verify, pre_verdict = _precompute_verdict(session_id, event, claude)
+    pre_id, pre_verify, pre_verdict, pre_timing = _precompute_verdict(session_id, event, claude)
     with store.locked(session_id) as s:
         _maybe_gc(s)
         s.continuations = s.continuations + 1 if active else 0
@@ -652,7 +688,8 @@ def handle(event: dict, shadow: bool = False, claude: str = "claude") -> dict | 
         elif s.state == "running" or s.running_task:
             running = s.get(s.running_task) if s.running_task else None
             same = running is not None and running.id == pre_id and running.verify == pre_verify
-            out, proceed = _close_running(s, event, shadow, claude, verdict=pre_verdict if same else None)
+            out, proceed = _close_running(s, event, shadow, claude, verdict=pre_verdict if same else None,
+                                          timing=pre_timing if same else None)
             if not proceed:
                 return out
             extra = out  # a systemMessage to carry (failed_verify), or None

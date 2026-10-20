@@ -273,10 +273,10 @@ CLAUDE_PLUGIN_DATA=~/.claude/plugins/data/queue-switchclaude-queue-switchclaude 
 What the lines mean:
 
 - `shadow report: N intake decision(s) in F log file(s)`: how many mid-run messages were sorted, over how many sessions.
-- `rule-decided` / `model-decided`: how many the rule table settled alone (fast, free) and how many went to the classifier.
+- `rule-decided` / `model-decided`: how many were settled without a model call (fast, free) and how many a classifier call decided. An approval word such as `lgtm` counts as rule-decided, and so does a rule-decided message that was also sent to the model for comparison.
 - `compared` and `disagreements`: of the rule-decided messages that were also sent to the model, how many times the model would have sorted the message differently. The `recent disagreements` lines that follow show the message text with both labels; a disagreement is a candidate for a new rule, a rule to loosen, or a golden-set case.
 - `mean classifier latency`: the average `claude -p` round trip, the price of every message the rules cannot decide.
-- `hook latency`: p50 and p95 of `hook_ms` for the intake and Stop hooks, with and without a model call, measured from the first Python statement of the hook to its log line; `python3 start-up` is the interpreter's own cost (the median of five `python3 -c pass` runs on this machine), which comes on top of `hook_ms` and which the plugin cannot reduce.
+- `hook latency`: p50 and p95 of `hook_ms` for the intake, Stop and interrupt hooks, with and without a model call (the classifier's or the done judge's own `latency_ms` beside it; a verify command's time is logged as `verify_ms`), measured from the first Python statement of the hook to its log line; `python3 start-up` is the interpreter's own cost (the median of five `python3 -c pass` runs on this machine), which comes on top of `hook_ms` and which the plugin cannot reduce.
 - `decisions`: a count per intake decision (`new_turn`, `control`, `dedupe`, `approve`, `parked_idle`, `noop`, …), which shows what the harness is actually used for.
 
 When the report reads well, turn **Shadow mode** off (keep or drop the second switch) and the harness acts on its decisions.

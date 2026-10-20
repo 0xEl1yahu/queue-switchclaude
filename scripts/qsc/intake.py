@@ -249,6 +249,22 @@ def _write_pointer(session_id: str, cwd: object = None) -> None:
             pass
 
 
+def _write_last_prompt(session_id: str, prompt_id: object) -> None:
+    """Record ``prompt_id`` at ``paths.last_prompt_path``, best effort.
+
+    ``queue_cli.py approve`` reads it to make the turn it runs in the
+    current one, as ``_control`` does with the prompt it has. A slash
+    command passes through here without touching the store, so this file
+    is the only trace of its ``prompt_id``.
+    """
+    if not isinstance(prompt_id, str) or not prompt_id:
+        return
+    try:
+        _write_atomic(paths.last_prompt_path(session_id), prompt_id + "\n")
+    except Exception:
+        pass
+
+
 def _esc_notice(dropped: list[store.Task]) -> Notice | None:
     """The notice for an Esc-interrupted turn; None when nothing was queued."""
     if not dropped:
@@ -677,6 +693,7 @@ def handle(event: dict, classifier: Classifier = classify.run, shadow: bool = Fa
         return None
     prompt_id = event.get("prompt_id")
     _write_pointer(session_id, event.get("cwd"))
+    _write_last_prompt(session_id, prompt_id)
 
     v = rules.decide(prompt)
     if v.label == "pass" and not _pass_may_wait(v, prompt, session_id):

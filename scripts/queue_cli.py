@@ -115,7 +115,7 @@ def _cwd_chain(cwd: str) -> list[str]:
 def main(argv: list[str]) -> str:
     """Run the command and return the text to print."""
     try:
-        from qsc import control, hookio, log, store
+        from qsc import control, hookio, log, paths, store
 
         explicit, command = parse_args(argv)
         session_id = resolve_session(explicit)
@@ -134,8 +134,13 @@ def main(argv: list[str]) -> str:
             if approved:
                 # The slash command runs inside a Claude turn: the printed
                 # reply is what Claude reads, so the execution handover rides
-                # on it (commands/queue.md tells Claude to follow it).
-                reply = f"{reply}. {dispatch.start(s, s.get(s.running_task))}"
+                # on it, on a line of its own (commands/queue.md tells Claude
+                # to follow the line starting "queue-switchclaude: task").
+                # As in intake's approve, that turn becomes the current one,
+                # so messages typed during the execution are mid-turn.
+                reply = f"{reply}\n{dispatch.start(s, s.get(s.running_task))}"
+                s.current_prompt_id = _read_pointer(paths.last_prompt_path(session_id)) or s.current_prompt_id
+                s.interrupt = False
         log.record(session_id, "control", command=command or "list", via="queue_cli",
                    approved=s.running_task if approved else None,
                    hook_ms=hookio.hook_ms({"_hook_started": _T0}))

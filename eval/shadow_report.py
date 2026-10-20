@@ -4,15 +4,18 @@
 Reads every ``log/*.jsonl`` under the plugin data dir (``$CLAUDE_PLUGIN_DATA``,
 else ``~/.claude/queue-switchclaude``) and prints:
 
-- how many intake decisions the rules made alone and how many went to the model
+- how many intake decisions the rules made alone and how many a model call
+  decided (``decided_by``)
 - the rule/model disagreement rate where both answers are logged (shadow mode
   with the ``shadow_compare`` option on, M1 Task 10)
 - the mean wall-clock latency of the ``claude -p`` call where ``latency_ms`` is logged
 - the ten most recent disagreements with their message text
 - hook latency (M3): p50 and p95 of ``hook_ms`` (the time from the hook
-  script's first statement to the log line, M4) for ``intake`` and
-  ``dispatch`` lines, split by whether a model call was made, with the
-  classifier's own ``latency_ms`` percentiles alongside, and the python3
+  script's first statement to the log line, M4) for ``intake``,
+  ``dispatch`` and ``interrupt`` lines, split by whether a model call was
+  made, with the model's own ``latency_ms`` percentiles alongside (the
+  classifier for intake, the done judge for dispatch; a verify command's
+  time is logged as ``verify_ms`` and is not a model call), and the python3
   start-up cost measured at report time (M4), which ``hook_ms`` excludes
 - a count of every intake ``decision`` value (``new_turn``, ``control``,
   ``dedupe``, ``approve``, ``revise``, ``defer_approval``, ``answer``,
@@ -44,7 +47,9 @@ from qsc import paths  # noqa: E402
 
 RECENT = 10
 TEXT_WIDTH = 80
-LATENCY_EVENTS = ("intake", "dispatch")
+LATENCY_EVENTS = ("intake", "dispatch", "interrupt")
+# The model each event's ``latency_ms`` times; an event not listed never calls one.
+MODEL_NAMES = {"intake": "classifier", "dispatch": "judge"}
 PERCENTILES = (50, 95)
 STARTUP_RUNS = 5
 STARTUP_COMMAND = ("python3", "-c", "pass")
@@ -99,8 +104,17 @@ def rule_label(row: dict) -> str | None:
 
 
 def decided_by(row: dict) -> str:
-    """``"rule"`` when the rule table decided alone, else ``"model"``."""
-    return "model" if rule_label(row) in _RULE_UNDECIDED else "rule"
+    """``"model"`` when a model call was made (``model_called``) for a message
+    the rules left open, else ``"rule"``.
+
+    The rule label alone overcounts the model: "lgtm" while a plan waits is
+    ``undecided`` to the rule table yet approved without a call. A rule-decided
+    line that also carries the model's answer is a shadow comparison, not a
+    model decision, so it stays ``"rule"``.
+    """
+    if model_called(row) and rule_label(row) in _RULE_UNDECIDED:
+        return "model"
+    return "rule"
 
 
 def model_label(row: dict) -> str | None:
@@ -239,14 +253,15 @@ def latency_lines(rows: list[dict]) -> list[str]:
     """
     lines = ["hook latency (hook_ms from the hook script's first statement to the log line):"]
     for event in LATENCY_EVENTS:
-        for with_model in (False, True):
+        model = MODEL_NAMES.get(event)
+        for with_model in (False, True) if model else (False,):
             group = [r for r in rows if r.get("event") == event and model_called(r) is with_model]
             hook = [v for v in (_number(r.get("hook_ms")) for r in group) if v is not None]
             label = "model called" if with_model else "no model call"
             text = f"  {event} {_pct_text(hook)}  ({len(hook)} line(s), {label}"
             if with_model:
                 clf = [v for v in (_number(r.get("latency_ms")) for r in group) if v is not None]
-                text += f"; classifier {_pct_text(clf)}"
+                text += f"; {model} {_pct_text(clf)}"
             lines.append(text + ")")
     return lines
 
