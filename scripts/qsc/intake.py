@@ -487,7 +487,11 @@ def _queue(
     parked: bool,
     shadow: bool,
 ) -> str:
-    deps = list(depends_on) if depends_on else _chain_deps(s)
+    # The model's ids are filtered to tasks that exist and will still run
+    # (``Store.live_deps``); nothing left means the chain rule decides.
+    deps = s.live_deps(list(depends_on)) if depends_on else []
+    if not deps:
+        deps = _chain_deps(s)
     status = SHADOW_QUEUED if shadow else ("parked" if parked else "queued")
     t = s.new_task(text, deps, prompt_id, status=status)
     if parked:
@@ -531,11 +535,12 @@ def _amend(
         return f"would amend {target.id}", target.id
 
     if decision.note == "cancel":
+        waiting = s.dependants([target.id])
         cancelled = s.cancel(target.id)
         if cancelled is None:
             # Running (or done): not a queue edit; let Claude handle the message.
             return None, target.id
-        return f"cancelled {cancelled.id}: {cancelled.text}", target.id
+        return f"cancelled {cancelled.id}: {cancelled.text}{control.rewired_note(waiting)}", target.id
 
     if decision.note == "pause":
         # Only meaningful on the running task: the turn keeps going, and the
@@ -543,8 +548,9 @@ def _amend(
         target.status = "paused"
         return f"paused {target.id}", target.id
 
-    if named and list(decision.depends_on) != list(target.depends_on):
-        target.depends_on = list(decision.depends_on)
+    wanted = [d for d in s.live_deps(list(decision.depends_on)) if d != target.id]
+    if named and wanted != list(target.depends_on):
+        target.depends_on = wanted
         ids = ", ".join(target.depends_on) if target.depends_on else "nothing"
         return f"{target.id} now depends on {ids}", target.id
 

@@ -68,7 +68,7 @@ def test_queue_cli_empty_command_lists(data_dir):
 def test_queue_cli_edits_store_under_lock(data_dir):
     intake.handle(ev("add a user model")); intake.handle(ev("later: email verification")); intake.handle(ev("maybe later we can add social login"))
     r = run_cli(data_dir, "cancel", "p2")
-    assert r.returncode == 0 and r.stdout.strip() == "cancelled p2: email verification"
+    assert r.returncode == 0 and r.stdout.strip() == "cancelled p2: email verification; p3 now after p1"
     assert store.load("s1").get("p2").status == "cancelled"
     r = run_cli(data_dir, "promote", "p3")
     assert r.returncode == 0 and r.stdout.strip() == "promoted p3 to the queue"

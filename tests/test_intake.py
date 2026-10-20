@@ -1168,3 +1168,60 @@ def test_shadow_compare_still_inline_in_shadow_mode(data_dir, monkeypatch):
     assert spawned == []
     row = [json.loads(l) for l in paths.log_path("s1").read_text().splitlines()][-1]
     assert row["rule_label"] == "queue" and row["classifier"]["label"] == "steer"
+
+
+# --- 2026-10-20 review fix 1: stuck dependants ---------------------------------
+
+def test_model_depends_on_an_unknown_id_is_filtered_out(data_dir):
+    intake.handle(ev("add a user model"))
+    out = intake.handle(ev("add password reset as well"), classifier=lambda p: dec(label="queue", depends_on=["p9"]))
+    assert out["decision"] == "block"
+    # p9 does not exist: the dependency falls back to the chain rule (after the running task).
+    assert store.load("s1").get("p2").depends_on == ["p1"]
+
+
+def test_model_depends_on_a_cancelled_task_is_resolved(data_dir):
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("later: email verification"))
+    intake.handle(ev("queue: cancel p2"))
+    intake.handle(ev("add password reset as well"), classifier=lambda p: dec(label="queue", depends_on=["p2", "p1"]))
+    assert store.load("s1").get("p3").depends_on == ["p1"]
+
+
+def test_model_depends_on_is_filtered_while_a_plan_waits(data_dir):
+    intake.handle(ev("add a user model"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"
+        b = s.new_task("add login", ["p1"], "pid-1"); b.status = "planned"
+        s.state = "awaiting_approval"; s.pending_task = "p2"; s.running_task = None
+    out = intake.handle(ev("add a logout button too", prompt_id="pid-2"),
+                        classifier=lambda p: dec(label="queue", depends_on=["p2", "p7"]))
+    assert out["decision"] == "block" and store.load("s1").get("p3").depends_on == ["p2"]
+
+
+def test_amend_rewire_to_unknown_ids_keeps_only_known_ones(data_dir):
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("later: email verification"))
+    out = intake.handle(ev("make the email one wait for nothing in particular"),
+                        classifier=lambda p: dec(label="amend", target="p2", depends_on=["p1", "p8"]))
+    assert store.load("s1").get("p2").depends_on == ["p1"]
+
+
+def test_amend_cancel_rewires_dependants_and_says_so(data_dir):
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("later: email verification"))
+    intake.handle(ev("later: password reset"))
+    out = intake.handle(ev("forget the email verification"),
+                        classifier=lambda p: dec(label="amend", target="p2", note="cancel"))
+    assert out["decision"] == "block" and "cancelled p2" in out["reason"] and "p3 now after p1" in out["reason"]
+    s = store.load("s1"); assert s.get("p3").depends_on == ["p1"]
+
+
+def test_idle_later_runs_after_a_cancel_unblocks_the_queue(data_dir):
+    intake.handle(ev("add a user model"))
+    intake.handle(ev("later: email verification"))
+    intake.handle(ev("later: password reset"))
+    with store.locked("s1") as s:
+        s.get("p1").status = "done"; s.state = "idle"; s.running_task = None
+    intake.handle(ev("queue: cancel p2", prompt_id="pid-2"))
+    s = store.load("s1"); assert [t.id for t in s.ready()] == ["p3"]

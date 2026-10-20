@@ -631,3 +631,14 @@ def test_verify_failed_handback_without_output_has_no_tail(data_dir):
         a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "exit 1"; s.running_task = "p1"; s.state = "running"
     ctx = dispatch.handle(stop())["hookSpecificOutput"]["additionalContext"]
     assert ctx == "queue-switchclaude: task p1 failed its verify command (exit 1). Fix it, then stop."
+
+
+# --- 2026-10-20 review fix 1: a failed_verify task names what waits on it -------
+
+def test_failed_verify_message_names_the_blocked_dependants(data_dir):
+    with store.locked("s1") as s:
+        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "false"; a.attempts = dispatch.MAX_ATTEMPTS
+        s.running_task = "p1"; s.state = "running"
+        s.new_task("b", ["p1"], "pid")
+    out = dispatch.handle(stop())
+    assert "failed_verify" in out["systemMessage"] and "p2 waits on it" in out["systemMessage"]

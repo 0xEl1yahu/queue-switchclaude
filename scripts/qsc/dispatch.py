@@ -91,10 +91,15 @@ def handback(text: str, system_message: str | None = None) -> dict:
     return out
 
 
-def _failed_verify_message(task: store.Task) -> str:
+def _failed_verify_message(s: store.Store, task: store.Task) -> str:
+    """Names the tasks blocked behind it: they stay blocked until it is
+    promoted and passes, or cancelled (which rewires them past it)."""
+    waiting = s.dependants([task.id])
+    blocked = f"; {', '.join(t.id for t in waiting)} waits on it" if waiting else ""
     return (
         f"{PREFIX}: {task.id} failed its verify command {MAX_ATTEMPTS} times and is set aside as "
         f"failed_verify (send 'queue: promote {task.id}' to retry it, 'queue: cancel {task.id}' to drop it)"
+        f"{blocked}"
     )
 
 
@@ -326,7 +331,7 @@ def _close_running(
         s.state = "idle"
         _record(sid, "dispatch", task=running.id, verdict="verify_failed", reason=verdict.reason,
                    failed_verify=True, next=None)
-        return {"systemMessage": _failed_verify_message(running)}, True
+        return {"systemMessage": _failed_verify_message(s, running)}, True
     if verdict.verdict == "not_done":
         # Attempts exhausted: close it rather than nag, and say so in the log
         # and the handoff.
