@@ -1,9 +1,10 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
-from qsc import classify, hookio, intake, paths, store
+from qsc import classify, hookio, intake, paths, procs, store
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "intake.py"
 
@@ -1146,7 +1147,9 @@ def test_active_compare_spawns_detached_and_keeps_rule_answer(data_dir, monkeypa
     assert out["decision"] == "block" and "queued p2" in out["systemMessage"]
     assert len(spawned) == 1
     cmd, kw = spawned[0]
-    assert cmd[1].endswith("scripts/compare.py") and cmd[2] == "s1" and kw["start_new_session"] is True
+    assert Path(cmd[1]).parts[-2:] == ("scripts", "compare.py") and cmd[2] == "s1"
+    assert {k: kw[k] for k in procs.detached_kwargs()} == procs.detached_kwargs()
+    assert os.name == "nt" or kw["start_new_session"] is True
     job = json.load(open(cmd[3]))
     assert job["rule"] == "queue_marker" and job["rule_label"] == "queue" and job["payload"]["message"] == "email verification"
 

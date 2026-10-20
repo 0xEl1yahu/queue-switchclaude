@@ -8,16 +8,27 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import fcntl
 import json
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
 from . import log, paths
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+# Windows: how often a waiting writer retries the lock byte, and how long
+# ``os.replace`` keeps retrying while a reader still has the store open
+# (Windows refuses to replace a file another process holds open).
+_LOCK_POLL = 0.02
+_REPLACE_TRIES = 50
 
 TASK_STATUSES = (
     "queued", "parked", "running", "paused", "done", "interrupted",
@@ -317,24 +328,72 @@ def _write(store: Store, path: Path) -> None:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        _replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
 
 
+def _replace(tmp: str, path: Path) -> None:
+    """``os.replace``, retried on Windows while another process has ``path`` open.
+
+    A reader (``load`` outside the lock, ``queue: list``) holds the file
+    only for a moment, so the retry is short; the last failure is raised.
+    """
+    if os.name != "nt":
+        os.replace(tmp, path)
+        return
+    for attempt in range(_REPLACE_TRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_TRIES - 1:
+                raise
+            time.sleep(_LOCK_POLL)
+
+
 @contextlib.contextmanager
 def _lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive ``fcntl.flock`` on ``<path>.lock`` for the block."""
+    """Hold an exclusive lock on ``<path>.lock`` for the block.
+
+    POSIX: ``fcntl.flock``. Windows: ``msvcrt.locking`` on byte 0 of the
+    lock file, polled with ``LK_NBLCK`` until it is free, so a writer waits
+    as long as it would on ``flock`` (``LK_LOCK`` gives up after 10 s).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
     with open(lock_path, "a+") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        if os.name == "nt":
+            _lock_byte(lock_fh.fileno())
+            try:
+                yield
+            finally:
+                os.lseek(lock_fh.fileno(), 0, os.SEEK_SET)
+                msvcrt.locking(lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def _lock_byte(fd: int) -> None:
+    """Windows: take the lock on byte 0 of ``fd``, waiting until it is free.
+
+    ``msvcrt.locking`` locks from the current position, and ``a+`` opens at
+    the end of the file, so the position is reset first. Locking past the
+    end of an empty file is allowed.
+    """
+    while True:
+        os.lseek(fd, 0, os.SEEK_SET)
         try:
-            yield
-        finally:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            time.sleep(_LOCK_POLL)
 
 
 def save(store: Store) -> None:

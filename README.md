@@ -23,9 +23,9 @@ What is real, what is partial, and what does not exist. Every "real" row was exe
 | Amend target matching | Partial: standard-library word similarity ranks the candidates, the model picks among the top three; the embeddings pass the original design wanted was never built | `scripts/qsc/match.py` |
 | Clearing held text from the input box after a block | Not possible from a hook; the text comes back and you clear it | Known limits |
 | Offline, or no `claude` on `PATH` | Degrades without a message: a message the rules cannot sort passes through as steer after a wait of up to 15 s, and every queued task is closed as done when Claude stops (`judge unavailable; fail open`), so its dependants start. Verify commands still work | `scripts/qsc/model.py`, `done.py` |
-| A hook that crashes | Exits 0 with no output, which Claude Code treats as "no plugin"; nothing tells you. On Windows this is what happens on every prompt, because the `fcntl` import fails | `scripts/intake.py`, `dispatch.py`, `interrupt.py` |
-| Windows | Not supported (the store lock is `fcntl`) | Requirements |
-| Automated tests | 658 tests, standard library only, a fake `claude` binary stands in for the model; CI runs them on Python 3.10, 3.12 and 3.14. CI does not run the golden-set eval or `claude plugin validate` | `.github/workflows/test.yml` |
+| A hook that crashes | Exits 0 with no output, which Claude Code treats as "no plugin"; nothing tells you. On Windows a `python3` that is the Microsoft Store stub has the same effect: the script never starts (see Requirements) | `scripts/intake.py`, `dispatch.py`, `interrupt.py` |
+| Native Windows | Partial: supported in the code (the store lock is `msvcrt.locking`, a verify command runs under `cmd.exe` and its process tree is killed with `taskkill`, `claude.cmd` from npm is found on `PATH`) and the suite passes on Windows in CI, but no live Claude Code session on Windows has run it yet. Needs a real `python3` on `PATH` | Requirements, `.github/workflows/test.yml` |
+| Automated tests | 665 tests (a few run on one platform only), standard library only, a fake `claude` binary stands in for the model; CI runs them on Python 3.10, 3.12 and 3.14 on Ubuntu and on Python 3.12 on Windows, where a `claude.cmd` launcher around a Python fake stands in. CI does not run the golden-set eval or `claude plugin validate` | `.github/workflows/test.yml` |
 
 Hard numbers that shape daily use, measured on the development machine (an Apple M4 Mac, Claude Code 2.1.302):
 
@@ -90,7 +90,7 @@ A message starting with `queue:` runs one command against the queue and is answe
 | `queue: pause` / `queue: resume` | Stop dispatching anything, or start again |
 | `queue: resume pN` | Same as `promote` |
 | `queue: drop` | Every queued and parked task becomes `dropped`; a planned task is left alone, cancel it by id |
-| `queue: verify pN <command>` | The rest of the line, verbatim, decides done for `pN`: exit 0 on Stop means done, anything else is handed back with the output tail (120 s timeout; the command's process group is killed if it runs over) |
+| `queue: verify pN <command>` | The rest of the line, verbatim, decides done for `pN`: exit 0 on Stop means done, anything else is handed back with the output tail (120 s timeout; the command's process group is killed if it runs over). On Windows the command runs under `cmd.exe`, so write it in cmd syntax |
 | `queue: auto pN` / `queue: manual pN` | Skip the approval gate for `pN` (its plan flows straight into execution), or wait for approval again |
 | `queue: approve` | Run the plan that is waiting for approval; same as typing `lgtm`. `queue: approve pN` names the task |
 | `queue: help` | The list above; so does any unknown word |
@@ -173,13 +173,15 @@ Rules that keep it this shape:
 - Only `qsc/model.py` calls the model, always with `--setting-sources "" --strict-mcp-config --tools ""` so the call cannot read your project, use tools, answer the message instead of classifying it, or trigger hooks recursively. Both prompts are in `prompts/`.
 - The store is read and written only under its lock, and saved by writing a temporary file and renaming it. The verify command and the judge run before the lock is taken, so a 120 s verify never makes your next message wait.
 - The plugin never writes into the working directory. Plans and handoffs go under the data directory (decision D7 in [`docs/decisions.md`](docs/decisions.md)).
-- No third-party package anywhere: the store lock is `fcntl`, matching is `difflib`, the model caller is `subprocess`.
+- No third-party package anywhere: the store lock is `fcntl` (`msvcrt.locking` on Windows), matching is `difflib`, the model caller is `subprocess`.
 - When documents disagree, the tests and the module docstrings (`scripts/qsc/intake.py`, `dispatch.py`, `gc.py` open with the real design notes) win over this README, and this README wins over `docs/`.
 
 ## Requirements
 
-- macOS or Linux. The per-session store is guarded by an `fcntl` lock, so Windows is out (WSL is fine).
-- Python 3.10 or later on `PATH` as `python3`. The hooks run `python3 <script>`; nothing is installed and no package is needed beyond the standard library.
+- macOS, Linux, or Windows (native or WSL). The per-session store is guarded by an `fcntl` lock on macOS and Linux and by `msvcrt.locking` on Windows. Native Windows passes the test suite in CI but has not been run in a live Claude Code session yet.
+- Python 3.10 or later on `PATH` as `python3`. The hooks run `python3 <script>` in exec form, with no shell; nothing is installed and no package is needed beyond the standard library.
+- On Windows, `python3` must start a real interpreter, because Claude Code spawns a hook's `command` directly and needs a real executable. The Python install manager from python.org and the Microsoft Store Python both provide a `python3` command; check with `python3 --version` in a new terminal. The older python.org installer provides only `python` and `py`, and the `python3` that Windows ships in `WindowsApps` is a stub that opens the Store: with either, the hooks never start and the plugin does nothing. The hooks cannot say `python` instead because macOS has no `python`, and one hooks file serves every platform; a plugin option naming the interpreter does not work either, because Claude Code 2.1.302 fails a hook that references an option the user never set, even when the option has a default.
+- On Windows, a verify command (`queue: verify pN <command>`) runs under `cmd.exe`: `npm test` and `pytest -q` work as on macOS, `&&` works, but `;` and `test -f` do not. The `claude` binary is found on `PATH`, so an npm install (`claude.cmd`) works; the classifier and the judge then pass the system prompt as a file and your message on stdin, so nothing you type is parsed by `cmd.exe`.
 - Claude Code 2.1.302, the only version the acceptance runs used; later versions are untested, and the on-screen behaviour of a blocked message is a version-specific observation. The classifier and the judge call the same `claude` binary with `-p`, so the plugin spends model calls from your own account: about one call per message the rules cannot decide, and one per queued task closed without a verify command.
 
 ## Install
@@ -222,7 +224,7 @@ claude plugin validate queue-switchclaude
 claude --plugin-dir queue-switchclaude
 ```
 
-Tests: `python3 -m pytest -q` (stdlib-only code under `scripts/` and `eval/`; the fake `claude` in `tests/fakes/` stands in for the model). CI runs the suite on Python 3.10, 3.12 and 3.14 (`.github/workflows/test.yml`). Golden-set eval: `python3 eval/run_golden.py --rules-only` and `python3 eval/run_golden.py --report eval/reports/<name>.md`; the model answers are cached under `eval/cache/`, so a fresh clone reproduces the 44 of 47 gate without a live call as long as some executable sits at `--claude` (`python3 eval/run_golden.py --claude tests/fakes/claude`); with no `claude` on `PATH` the runner falls back to rules only and the gate fails. `--no-cache` spends real calls.
+Tests: `python3 -m pytest -q` (stdlib-only code under `scripts/` and `eval/`; the fake `claude` in `tests/fakes/` stands in for the model). CI runs the suite on Python 3.10, 3.12 and 3.14 (`.github/workflows/test.yml`). Golden-set eval: `python3 eval/run_golden.py --rules-only` and `python3 eval/run_golden.py --report eval/reports/<name>.md`; the model answers are cached under `eval/cache/`, so a fresh clone reproduces the 44 of 47 gate without a live call as long as some executable sits at `--claude` (`python3 eval/run_golden.py --claude tests/fakes/claude`; `tests\fakes\claude.cmd` on Windows); with no `claude` on `PATH` the runner falls back to rules only and the gate fails. `--no-cache` spends real calls.
 
 ## Where the data lives
 
@@ -238,7 +240,7 @@ Inside it:
 
 ```
 sessions/<session_id>.json          the store (one per Claude Code session)
-sessions/<session_id>.json.lock     the fcntl lock
+sessions/<session_id>.json.lock     the lock file (fcntl; msvcrt on Windows)
 sessions/<session_id>/plans/pN.md   plans Claude wrote
 sessions/<session_id>/handoffs/pN.md  closing notes dispatch filed
 log/<session_id>.jsonl              the decision log, one JSON object per line

@@ -14,7 +14,7 @@ from qsc import classify  # noqa: E402
 
 G = {json.loads(l)["id"]: json.loads(l) for l in open(ROOT / "eval" / "golden_queue_intake.jsonl")}
 
-FAKE = str(ROOT / "tests" / "fakes" / "claude")
+from conftest import FAKE_CLAUDE as FAKE  # noqa: E402
 
 
 def dec(**kw):

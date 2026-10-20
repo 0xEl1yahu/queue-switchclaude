@@ -2,6 +2,15 @@
 
 One section per milestone, newest first. Each milestone was accepted live in Claude Code 2.1.302 and the record is linked from its section. Versions are the `version` field of `.claude-plugin/plugin.json`; M2 shipped on the M1 version number.
 
+## Unreleased: native Windows
+
+- Runs on native Windows, not only WSL. Before this every hook exited silently on Windows, because the store imported `fcntl` at the top. The store lock is now `msvcrt.locking` on byte 0 of the `.lock` file there (polled, so a writer waits as long as it would on `flock`), and a save retries the rename for up to a second while another process has the store open. macOS and Linux keep `fcntl` and the same code paths as before.
+- A verify command runs under `cmd.exe` on Windows, in its own process group, and on timeout its whole tree is killed with `taskkill /F /T`. Before, the missing `os.killpg` raised an error that crashed the Stop hook.
+- The classifier and the judge find `claude` on `PATH` with `shutil.which`, so an npm install (`claude.cmd`) works. On Windows the system prompt goes by `--system-prompt-file` and the payload on stdin: the command line stays under Windows' 32767-character cap, and nothing you type passes through `cmd.exe`. A call that times out kills the launcher's tree, not only `cmd.exe`. A batch launcher is refused if an argument holds a character `cmd.exe` would act on; the shipped schemas hold none.
+- The background comparison starts detached on Windows (`DETACHED_PROCESS`), hook stdin is decoded as UTF-8 there instead of the ANSI code page, the `/queue` output is printed as UTF-8, and pointer files fold the case of the working directory, so `C:\Proj` and `c:/proj` share one queue.
+- The hooks still run `python3` in exec form. On Windows that has to be a real interpreter (the Python install manager and the Store Python provide one; the `WindowsApps` stub does not); README Requirements has the details and why `python` or a plugin option cannot replace it. `/queue` gains a PowerShell form for Windows without Git Bash.
+- CI adds Python 3.12 on `windows-latest`. Tests that use sh syntax or POSIX process groups are skipped there; a `claude.cmd` launcher around a Python fake stands in for the model, and new tests cover the Windows command line, a killed grandchild, the lock probe and Windows path spellings. No live Claude Code session on Windows has run the plugin yet.
+
 ## 0.4.1 (2026-10-19)
 
 - **Shadow: also ask the model** now works while the plugin is active, not only in shadow mode. For a message the rules decided, intake starts `scripts/compare.py` detached; it asks the classifier and logs the answer as a `shadow_compare` line beside the `intake` line that acted. The rule path keeps its ~90 ms; the comparison costs one background `claude -p` call. `eval/shadow_report.py` counts these lines in "compared" and "disagreements". Checked by hand in the installed plugin (rule path 35 ms, the comparison line 4.6 s later); no written acceptance record.

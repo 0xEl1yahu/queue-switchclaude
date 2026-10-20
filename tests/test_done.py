@@ -2,22 +2,30 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from qsc import done, model, store
 
+from conftest import FAKE_CLAUDE as FAKE, PY, WINDOWS
+
 ROOT = Path(__file__).resolve().parent.parent
-FAKE = str(ROOT / "tests" / "fakes" / "claude")
+
+# Verify commands written to run the same under /bin/sh and cmd.exe.
+SLEEP_5 = f'{PY} -c "import time; time.sleep(5)"'
+
+posix_only = pytest.mark.skipif(WINDOWS, reason="sh syntax and POSIX process groups")
 
 
 # M2 Task 4 plan tests.
 
 def test_run_verify_ok_and_failed(tmp_path):
-    assert done.run_verify("true", str(tmp_path)).verdict == "verify_ok"
-    v = done.run_verify("echo boom; exit 3", str(tmp_path))
+    assert done.run_verify("exit 0", str(tmp_path)).verdict == "verify_ok"
+    v = done.run_verify(f"{PY} -c \"print('boom'); raise SystemExit(3)\"", str(tmp_path))
     assert v.verdict == "verify_failed" and v.reason == "exit 3" and "boom" in v.output_tail
 
 
 def test_run_verify_timeout(tmp_path):
-    t0 = time.time(); v = done.run_verify("sleep 5", str(tmp_path), timeout=0.5)
+    t0 = time.time(); v = done.run_verify(SLEEP_5, str(tmp_path), timeout=0.5)
     assert v.verdict == "verify_failed" and "timeout" in v.reason and time.time() - t0 < 3     # review focus 3
 
 
@@ -34,7 +42,7 @@ def test_judge_low_confidence_not_done_is_done(monkeypatch):
 
 
 def test_decide_prefers_verify(tmp_path):
-    t = store.Task(id="p1", text="x", verify="true")
+    t = store.Task(id="p1", text="x", verify="exit 0")
     assert done.decide(t, {"cwd": str(tmp_path), "last_assistant_message": "anything"}, "").verdict == "verify_ok"
 
 
@@ -70,7 +78,7 @@ def test_judge_prompt_file_exists():
 
 
 def test_run_verify_tail_is_capped_and_combined(tmp_path):
-    cmd = "python3 -c \"import sys; sys.stdout.write('o'*2000); sys.stdout.flush(); sys.stderr.write('E'*100); sys.exit(1)\""
+    cmd = f"{PY} -c \"import sys; sys.stdout.write('o'*2000); sys.stdout.flush(); sys.stderr.write('E'*100); sys.exit(1)\""
     v = done.run_verify(cmd, str(tmp_path))
     assert v.verdict == "verify_failed" and v.reason == "exit 1"
     assert len(v.output_tail) == 1500 and v.output_tail.endswith("E" * 100)
@@ -78,16 +86,16 @@ def test_run_verify_tail_is_capped_and_combined(tmp_path):
 
 def test_run_verify_runs_in_cwd(tmp_path):
     (tmp_path / "marker.txt").write_text("x")
-    assert done.run_verify("test -f marker.txt", str(tmp_path)).verdict == "verify_ok"
+    assert done.run_verify(f"{PY} -c \"import os, sys; sys.exit(not os.path.isfile('marker.txt'))\"", str(tmp_path)).verdict == "verify_ok"
 
 
 def test_run_verify_timeout_reason_names_the_timeout(tmp_path):
-    v = done.run_verify("sleep 5", str(tmp_path), timeout=0.2)
+    v = done.run_verify(SLEEP_5, str(tmp_path), timeout=0.2)
     assert v.reason == "timeout after 0.2 s"
 
 
 def test_run_verify_bad_cwd_is_verify_failed(tmp_path):
-    v = done.run_verify("true", str(tmp_path / "missing"))
+    v = done.run_verify("exit 0", str(tmp_path / "missing"))
     assert v.verdict == "verify_failed" and v.reason
 
 
@@ -160,6 +168,7 @@ def test_decide_missing_or_blank_closing_is_stopped(monkeypatch):
 
 # --- M3 Task 3: verify runs in its own process group; `confirmed` is a verdict
 
+@posix_only
 def test_run_verify_kills_process_group(tmp_path):
     marker = tmp_path / "alive"
     cmd = f"(sleep 30; touch {marker}) & sleep 30"
@@ -171,12 +180,14 @@ def test_run_verify_kills_process_group(tmp_path):
 
 # Additional tests beyond the plan's one.
 
+@posix_only
 def test_run_verify_starts_a_new_session(tmp_path):
     import os
     cmd = f"python3 -c \"import os, sys; sys.exit(0 if os.getpgid(0) != {os.getpgid(0)} else 1)\""
     assert done.run_verify(cmd, str(tmp_path)).verdict == "verify_ok"
 
 
+@posix_only
 def test_run_verify_background_child_dies_with_the_group(tmp_path):
     import os
     pidfile = tmp_path / "pid"
@@ -196,5 +207,24 @@ def test_run_verify_background_child_dies_with_the_group(tmp_path):
 
 
 def test_run_verify_timeout_keeps_partial_output(tmp_path):
-    v = done.run_verify("echo partial; sleep 5", str(tmp_path), timeout=0.5)
+    cmd = f"{PY} -c \"import time; print('partial', flush=True); time.sleep(5)\""
+    v = done.run_verify(cmd, str(tmp_path), timeout=1.0)
     assert v.verdict == "verify_failed" and "partial" in v.output_tail
+
+
+def test_run_verify_timeout_kills_a_grandchild(tmp_path):
+    # Both platforms: the shell starts python, which starts a second python
+    # that would write `late` after 3 s. Killing the tree on timeout stops it.
+    started, late = tmp_path / "started", tmp_path / "late"
+    (tmp_path / "child.py").write_text(f"import time\ntime.sleep(3)\nopen(r'{late}', 'w').close()\n")
+    (tmp_path / "parent.py").write_text(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, r'{tmp_path / 'child.py'}'])\n"
+        f"open(r'{started}', 'w').close()\n"
+        "time.sleep(30)\n")
+    cmd = f"{PY} parent.py"
+    t0 = time.time(); v = done.run_verify(cmd, str(tmp_path), timeout=2.0)
+    assert v.verdict == "verify_failed" and "timeout" in v.reason and time.time() - t0 < 6
+    assert started.exists()
+    time.sleep(2.5)
+    assert not late.exists()

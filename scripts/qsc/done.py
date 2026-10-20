@@ -14,13 +14,11 @@ which counts as done.
 from __future__ import annotations
 
 import contextlib
-import os
-import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import model, store
+from . import model, procs, store
 
 # Every verdict dispatch can file on a task (`Task.verdict`). `confirmed` is
 # filed by intake when the user confirms a task done ("ok, merge").
@@ -86,10 +84,13 @@ def run_verify(command: str, cwd: str | None, timeout: float = VERIFY_TIMEOUT) -
     ``cwd``, no shell) is also ``verify_failed`` so the task is handed back
     rather than silently closed.
 
-    The shell starts in its own session (``start_new_session=True``), so it
-    leads a fresh process group; on timeout that whole group is killed
-    (``os.killpg``), and a verify that spawned a server or a background job
-    does not outlive the Stop hook. Works on macOS and Linux.
+    The shell starts in its own process group (``procs.group_kwargs``); on
+    timeout the whole tree is killed (``procs.kill_tree``), so a verify that
+    spawned a server or a background job does not outlive the Stop hook. On
+    macOS and Linux the shell is ``/bin/sh`` in a new session and the group
+    dies by ``os.killpg``; on Windows the shell is ``cmd.exe`` (``COMSPEC``)
+    in a new process group and the tree dies by ``taskkill /F /T``, so a
+    verify command is written in cmd syntax there.
     """
     try:
         proc = subprocess.Popen(
@@ -101,14 +102,14 @@ def run_verify(command: str, cwd: str | None, timeout: float = VERIFY_TIMEOUT) -
             stdin=subprocess.DEVNULL,
             text=True,
             errors="replace",
-            start_new_session=True,
+            **procs.group_kwargs(),
         )
     except (OSError, ValueError) as exc:
         return Verdict("verify_failed", f"could not run: {type(exc).__name__}: {exc}")
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        _kill_group(proc)
+        procs.kill_tree(proc)
         # Reap the shell and collect what its group wrote before it died. A
         # process that escaped the group (its own setsid) could hold the
         # pipes open, so this wait is bounded too; then the partial output
@@ -120,19 +121,6 @@ def run_verify(command: str, cwd: str | None, timeout: float = VERIFY_TIMEOUT) -
     if proc.returncode == 0:
         return Verdict("verify_ok", "exit 0")
     return Verdict("verify_failed", f"exit {proc.returncode}", _tail(stdout, stderr))
-
-
-def _kill_group(proc: subprocess.Popen) -> None:
-    """SIGKILL the process group ``proc`` leads, then ``proc`` itself.
-
-    With ``start_new_session=True`` the child's pid is its group id. Every
-    failure is ignored: the group may already be gone, and the hook must
-    return either way.
-    """
-    with contextlib.suppress(OSError):
-        os.killpg(proc.pid, signal.SIGKILL)
-    with contextlib.suppress(OSError):
-        proc.kill()
 
 
 def _tail(stdout: object, stderr: object) -> str:

@@ -3,9 +3,13 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from qsc import classify
 
-FAKE = str(Path(__file__).parent / "fakes" / "claude")
+from conftest import FAKE_CLAUDE as FAKE, WINDOWS
+
+posix_only = pytest.mark.skipif(WINDOWS, reason="POSIX argv form; Windows uses model.windows_command")
 
 
 def v2(**kw):
@@ -44,6 +48,7 @@ def test_run_timeout_returns_none(monkeypatch):
     assert time.time() - t0 < 2
 
 
+@posix_only
 def test_command_has_isolation_flags(monkeypatch):
     seen = {}
     def fake_run(cmd, **kw): seen["cmd"] = cmd; raise FileNotFoundError
@@ -98,6 +103,7 @@ def test_payload_shape():
     assert json.dumps(p)
 
 
+@posix_only
 def test_command_passes_payload_json_last(monkeypatch):
     seen = {}
     def fake_run(cmd, **kw): seen["cmd"] = cmd; raise FileNotFoundError
