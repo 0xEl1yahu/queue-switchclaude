@@ -32,7 +32,9 @@ user's next message carries on. The guard covers the instruction handovers
 (planning, its retry, re-presenting a plan, execution). The "fix it" and
 "finish it" handbacks from ``_close_running`` are bounded by ``Task.attempts``
 instead: their second copy is by design, and ends in ``failed_verify`` or
-``gave_up``.
+``gave_up``. Every retry (those two and the planning retry) is also held to
+``MAX_CONTINUATIONS``: once the budget is spent the handback is not sent, so
+six continuations plus two retries cannot reach Claude Code's cap of 8.
 """
 from __future__ import annotations
 
@@ -303,6 +305,22 @@ def _close_running(
         return None, True
 
     if verdict.verdict in ("verify_failed", "not_done") and running.attempts < MAX_ATTEMPTS:
+        if s.continuations >= MAX_CONTINUATIONS:
+            # Another handback would be one continuation too many (Claude
+            # Code stops at 8). The task waits on the user as if it had asked
+            # something: any message resumes it, "ok" confirms it done. The
+            # attempt is not spent.
+            running.closing = closing
+            s.state = "awaiting_answer"
+            s.pending_task = running.id
+            s.running_task = None
+            _record(sid, "dispatch", task=running.id, verdict=verdict.verdict, reason=verdict.reason,
+                    next=None, waiting="awaiting_answer", continuation_budget=s.continuations)
+            if verdict.verdict == "verify_failed":
+                why = f"{running.id} failed its verify command ({verdict.reason})"
+            else:
+                why = f"{running.id} does not look finished: {verdict.reason}"
+            return {"systemMessage": f"{_budget_message(s.continuations)}; {why}"}, False
         running.attempts += 1
         _record(sid, "dispatch", task=running.id, verdict=verdict.verdict,
                    reason=verdict.reason, handback=True, attempts=running.attempts, next=None)
@@ -410,18 +428,24 @@ def _after_planning(s: store.Store) -> tuple[dict | None, bool]:
         _record(sid, "dispatch", planned=task.id, auto=False, next=None)
         return None, False
 
+    budget_spent = s.continuations >= MAX_CONTINUATIONS
     task.attempts += 1
-    if task.attempts < MAX_ATTEMPTS:
+    if task.attempts < MAX_ATTEMPTS and not budget_spent:
         _record(sid, "dispatch", next=task.id, plan_retry=task.attempts)
         return handback(_planning_text(s, task, retry=True)), False
 
     # Review focus 2: Claude stopped twice without a plan (asked something,
     # hit an error). Give the task back to the queue and end the turn; it is
     # planned again when a later Stop finds it ready.
+    # With the continuation budget spent, the retry is not sent either: the
+    # task goes back the same way, and the user's next message carries on.
     task.status = "queued"
-    task.attempts = 0
+    attempts, task.attempts = task.attempts, 0
     s.state = "idle"
     s.pending_task = None
+    if budget_spent:
+        _record(sid, "plan_failed", task=task.id, attempts=attempts, continuation_budget=s.continuations)
+        return {"systemMessage": _budget_message(s.continuations)}, False
     _record(sid, "plan_failed", task=task.id, attempts=MAX_ATTEMPTS)
     return None, False
 
