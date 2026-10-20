@@ -2,6 +2,17 @@
 
 One section per milestone, newest first. Each milestone was accepted live in Claude Code 2.1.302 and the record is linked from its section. Versions are the `version` field of `.claude-plugin/plugin.json`; M2 shipped on the M1 version number.
 
+## Unreleased: review fixes (2026-10-20)
+
+Fixes from the 2026-10-20 code review, each with a test that failed first. No live acceptance run yet.
+
+- **Dependants are no longer stranded.** A task that waited on one that was cancelled, dropped or interrupted now waits on what that task waited on (`Store.rewire`): `queue: cancel p2` with `p3` after `p2` after `p1` leaves `p3` after `p1`, and the reply says `p3 now after p1`; `queue: drop`, an amend that cancels, Esc and `stop` rewire the same way. The model's `depends_on` is filtered to tasks that exist and will still run. A `failed_verify` task still holds its dependants until it is promoted or cancelled, and its notice now names them (`p3 waits on it`).
+- **The classifier no longer runs under the store lock.** Intake builds the payload under the lock, releases it for the `claude -p` call, then reruns on a fresh load and uses the answer only if the state, `current_prompt_id`, running and pending task are unchanged; otherwise it asks once more, then fails open. The interrupt check on `PreToolUse` (5 s timeout) no longer waits behind a 15 s classification, and writes other hooks make meanwhile are kept.
+- **`stop` and Esc reset a turn the same way** (`interrupt.reset_turn`). While a task runs, it is interrupted and queued tasks are dropped (D5); while a plan is being written, that task is queued again and nothing is dropped. A plan waiting for approval is kept either way: a typed `stop` used to drop it.
+- **Split-part ids** are predicted from the same tasks the payload shows (`running_task` and `queue`), so a planned or failed-verify task the model never saw no longer shifts a part's dependency by one.
+- **Retry handbacks respect the continuation budget.** With 6 continuations spent, a "fix it" or "finish it" handback is withheld (the task waits on the user; any message resumes it, `ok` confirms it done) and a planning retry is not sent (the task is queued again), so six continuations plus two retries can no longer reach Claude Code's cap of 8.
+- **Report wiring.** The interrupt hook logs `hook_ms` and the report lists it; dispatch logs the judge's `latency_ms` (a verify command's `verify_ms`) so the Stop hook's "model called" bucket is filled; a line counts as model-decided only when a model call was made for a message the rules left open. `/queue approve` prints the execution handover on its own line, as `commands/queue.md` says, and makes the turn it runs in the current one (intake records the last `prompt_id` per session) with the interrupt flag cleared.
+
 ## 0.4.1 (2026-10-19)
 
 - **Shadow: also ask the model** now works while the plugin is active, not only in shadow mode. For a message the rules decided, intake starts `scripts/compare.py` detached; it asks the classifier and logs the answer as a `shadow_compare` line beside the `intake` line that acted. The rule path keeps its ~90 ms; the comparison costs one background `claude -p` call. `eval/shadow_report.py` counts these lines in "compared" and "disagreements". Checked by hand in the installed plugin (rule path 35 ms, the comparison line 4.6 s later); no written acceptance record.
