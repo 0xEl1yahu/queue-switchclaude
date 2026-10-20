@@ -1,3 +1,7 @@
+import os
+
+import pytest
+
 from qsc import paths
 
 
@@ -69,7 +73,7 @@ def test_cwd_pointer_path(data_dir):
     import hashlib
     p = paths.cwd_pointer_path("/proj/one")
     assert p.parent == data_dir / "pointers"
-    assert p.name == hashlib.sha1(b"/proj/one").hexdigest()[:16]
+    assert p.name == hashlib.sha1(paths.canonical_cwd("/proj/one").encode()).hexdigest()[:16]
     assert paths.cwd_pointer_path("/proj/one") == p
     assert paths.cwd_pointer_path("/proj/two") != p
 
@@ -82,4 +86,12 @@ def test_cwd_pointer_path_is_the_same_for_every_spelling_of_a_folder(data_dir, t
     link = tmp_path / "link"; link.symlink_to(real)
     assert paths.cwd_pointer_path(str(link)) == paths.cwd_pointer_path(str(real))
     assert paths.cwd_pointer_path(str(real) + "/") == paths.cwd_pointer_path(str(real))
-    assert paths.canonical_cwd("/proj/one") == "/proj/one"            # a missing path is left as it is
+    if os.name != "nt":
+        assert paths.canonical_cwd("/proj/one") == "/proj/one"        # a missing path is left as it is
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path spellings")
+def test_cwd_pointer_path_ignores_case_and_slashes_on_windows(data_dir, tmp_path):
+    real = tmp_path / "Real"; real.mkdir()
+    for spelling in (str(real).upper(), str(real).replace("\\", "/"), str(real).lower() + "\\"):
+        assert paths.cwd_pointer_path(spelling) == paths.cwd_pointer_path(str(real))

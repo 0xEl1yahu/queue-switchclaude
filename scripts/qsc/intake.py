@@ -93,7 +93,7 @@ import time
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
-from . import classify, control, dispatch, done, hookio, log, match, paths, rules, store, transcript
+from . import classify, control, dispatch, done, hookio, log, match, paths, procs, rules, store, transcript
 
 HOOK_EVENT = "UserPromptSubmit"
 PREFIX = "queue-switchclaude"
@@ -403,7 +403,7 @@ def _spawn_compare(s: store.Store, event: dict, v: rules.Verdict, prompt: str, p
         subprocess.Popen(
             [sys.executable, str(COMPARE_SCRIPT), s.session_id, path],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            **procs.detached_kwargs(),
         )
     except Exception:
         pass

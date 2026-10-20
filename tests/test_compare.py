@@ -14,7 +14,7 @@ FAKES = ROOT / "tests" / "fakes"
 def run_compare(data_dir, job, **env):
     jobs = data_dir / "compare"; jobs.mkdir(exist_ok=True)
     path = jobs / "job-1.json"; path.write_text(json.dumps(job))
-    full = {**os.environ, "CLAUDE_PLUGIN_DATA": str(data_dir), "PATH": f"{FAKES}:{os.environ.get('PATH', '')}"}
+    full = {**os.environ, "CLAUDE_PLUGIN_DATA": str(data_dir), "PATH": f"{FAKES}{os.pathsep}{os.environ.get('PATH', '')}"}
     full.update(env)
     r = subprocess.run([sys.executable, str(SCRIPT), "s1", str(path)], capture_output=True, text=True, env=full)
     return r, path

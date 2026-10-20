@@ -146,6 +146,8 @@ def main(argv: list[str]) -> str:
 
 if __name__ == "__main__":
     try:
+        if os.name == "nt":  # the console code page cannot print every task text
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         print(main(sys.argv[1:]))
     except BaseException:
         pass

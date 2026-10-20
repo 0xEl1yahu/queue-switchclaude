@@ -36,7 +36,7 @@ def read_event(expected: str | tuple[str, ...], started: float | None = None) ->
     if started is None:
         started = time.monotonic()
     try:
-        raw = sys.stdin.read()
+        raw = _read_stdin()
     except Exception:
         return None
     if not raw or not raw.strip():
@@ -56,6 +56,19 @@ def read_event(expected: str | tuple[str, ...], started: float | None = None) ->
         return None
     event["_hook_started"] = started
     return event
+
+
+def _read_stdin() -> str:
+    """All of stdin as text.
+
+    Claude Code writes the event as UTF-8. On Windows a piped stdin decodes
+    with the ANSI code page, which garbles (or rejects) any non-ASCII prompt,
+    so the bytes are decoded as UTF-8 there instead.
+    """
+    buffer = getattr(sys.stdin, "buffer", None)
+    if os.name == "nt" and buffer is not None:
+        return buffer.read().decode("utf-8")
+    return sys.stdin.read()
 
 
 def _stamp(event: object) -> float | None:

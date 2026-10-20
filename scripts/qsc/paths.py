@@ -128,10 +128,12 @@ def canonical_cwd(cwd: object) -> str:
     spell the same folder differently (``/tmp/x`` and ``/private/tmp/x`` on
     macOS, a symlinked home); hashing the raw string would give two pointers
     for one folder and the CLI would fall back to the newest session anywhere.
-    A path that does not exist is normalised without being resolved.
+    A path that does not exist is normalised without being resolved. On
+    Windows the result is also case-folded (``os.path.normcase``), since
+    ``C:\\Proj`` and ``c:/proj`` name one folder there; elsewhere that is a no-op.
     """
     text = str(cwd)
     try:
-        return os.path.realpath(text)
+        return os.path.normcase(os.path.realpath(text))
     except (OSError, ValueError):
         return text

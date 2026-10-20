@@ -1,9 +1,12 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
 from qsc import dispatch, done, paths, store
+
+from conftest import PY
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "dispatch.py"
@@ -339,7 +342,7 @@ def test_running_not_done_hands_back_then_closes(data_dir, monkeypatch):
 
 def test_verify_failed_handback_carries_output_tail(data_dir):
     with store.locked("s1") as s:
-        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "echo boom; exit 3"; s.running_task = "p1"; s.state = "running"
+        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = f"{PY} -c \"print('boom'); raise SystemExit(3)\""; s.running_task = "p1"; s.state = "running"
     ctx = dispatch.handle(stop())["hookSpecificOutput"]["additionalContext"]
     assert ctx.startswith("queue-switchclaude: task p1 failed its verify command (exit 3). Output tail: boom")
     assert ctx.endswith("Fix it, then stop.")
@@ -347,7 +350,7 @@ def test_verify_failed_handback_carries_output_tail(data_dir):
 
 def test_verify_ok_closes_with_verdict(data_dir):
     with store.locked("s1") as s:
-        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "true"; s.running_task = "p1"; s.state = "running"
+        a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = "exit 0"; s.running_task = "p1"; s.state = "running"
     assert dispatch.handle(stop()) is None
     t = store.load("s1").get("p1")
     assert t.status == "done" and t.verdict == "verify_ok" and t.closing == "I finished it and ran the tests."
@@ -491,8 +494,11 @@ def test_harness_task_is_judged(data_dir, monkeypatch):
 
 def test_verify_runs_without_holding_the_store_lock(data_dir):
     lock = str(paths.store_path("s1")) + ".lock"
-    probe = (f"python3 -c \"import fcntl,sys; f=open('{lock}','a+'); "
-             "fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(0)\"")
+    if os.name == "nt":
+        take = "import msvcrt; msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)"
+    else:
+        take = "import fcntl; fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB)"
+    probe = f"{PY} -c \"import sys; f=open(r'{lock}','a+'); f.seek(0); {take}; sys.exit(0)\""
     with store.locked("s1") as s:
         a = s.new_task("a", [], "pid"); a.status = "running"; a.verify = probe; s.running_task = "p1"; s.state = "running"
     assert dispatch.handle(stop()) is None

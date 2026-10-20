@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -5,6 +6,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+
+WINDOWS = os.name == "nt"
+
+# The fake `claude` CLI: a sh script on POSIX, a .cmd launcher (the shape of
+# an npm install) around a Python fake on Windows.
+FAKE_CLAUDE = str(ROOT / "tests" / "fakes" / ("claude.cmd" if WINDOWS else "claude"))
+
+# A shell-ready way to start this interpreter in a verify command:
+# ``python3`` is not on PATH on every Windows runner.
+PY = f'"{sys.executable}"'
 
 
 @pytest.fixture
